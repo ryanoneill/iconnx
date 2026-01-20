@@ -1,0 +1,61 @@
+[package]
+name = "iconnx"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ryan O'Neill <ryan.oneill@gmail.com>"]
+license = "MIT"
+description = "High-performance ONNX inference engine with CUDA GPU acceleration"
+repository = "https://github.com/ryanoneill/iconnx"
+homepage = "https://github.com/ryanoneill/iconnx"
+documentation = "https://docs.rs/iconnx"
+readme = "README.md"
+keywords = ["onnx", "inference", "gpu", "cuda", "machine-learning"]
+categories = ["science", "algorithms", "mathematics"]
+rust-version = "1.75"
+
+[dependencies]
+# ONNX parsing
+prost = "0.13"
+
+# CPU tensors
+ndarray = "0.16"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# FFT operations (for STFT operator)
+rustfft = "6.2"
+fftw = "0.8"
+
+[dependencies.cudarc]
+version = "0.17"
+features = ["cublas", "nvrtc", "cuda-12000"]
+optional = true
+
+[features]
+default = ["cuda"]
+# Enable CUDA GPU acceleration
+cuda = ["dep:cudarc"]
+# Enable GPU inference debugging: tensor validation, checkpoints, differential testing
+debug-inference = []
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+# Reference implementation for validation
+ort = { version = "2.0.0-rc.10", features = ["cuda", "half", "download-binaries"] }
+# Async runtime for tests
+tokio = { version = "1.0", features = ["full"] }
+# Temp files for testing
+tempfile = "3.8"
+# NumPy file parsing for test fixtures
+npyz = "0.8"
+# Serialization for test fixtures
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[package.metadata.docs.rs]
+# Build docs.rs without CUDA (since their build server likely doesn't have it)
+no-default-features = true
