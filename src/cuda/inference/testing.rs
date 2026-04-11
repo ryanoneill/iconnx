@@ -60,6 +60,9 @@ pub fn detect_fused_patterns_for_tests(
             outputs: n.outputs.clone(),
             attributes: n.attributes.clone(),
             precomputed_slice: None,
+            precomputed_reshape_shape: None,
+            precomputed_unsqueeze_axes: None,
+            precomputed_squeeze_axes: None,
         })
         .collect();
     detect_fused_patterns(&converted, weights, ctx)
