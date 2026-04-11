@@ -82,8 +82,8 @@ const FUSED_KERNEL_NAMES: &[&str] = &[
     "fused_div_mul_kernel",
     // Mul-Sin-Pow-Mul-Add: y = sin(x * w0)^p * w1 + b
     // Vocoder periodic activation (48 occurrences in Kokoro)
-    // NOTE: The broadcast variant is added in Task B3.
     "fused_mul_sin_pow_mul_add_kernel",
+    "fused_mul_sin_pow_mul_add_broadcast_kernel",
 ];
 
 /// CUDA source for fused kernels
@@ -319,6 +319,44 @@ extern "C" __global__ void fused_mul_sin_pow_mul_add_kernel(
             pow_val = powf(s, p);
         }
         out[i] = pow_val * w1[i] + b[i];
+    }
+}
+
+// Broadcast variant: w0, w1, and b may broadcast along the leading dimension
+// (they have shape [1, C] while x has shape [N, C]).
+// broadcast_stride is the number of elements per broadcast row (e.g., C when
+// broadcasting [1, C] over [N, C]).
+extern "C" __global__ void fused_mul_sin_pow_mul_add_broadcast_kernel(
+    float* out,
+    const float* x,
+    const float* w0,
+    const float* w1,
+    const float* b,
+    float p,
+    int p_is_int,
+    size_t n,
+    size_t broadcast_stride
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        size_t bi = i % broadcast_stride;
+        float s = sinf(x[i] * w0[bi]);
+        float pow_val;
+        if (p_is_int != 0) {
+            int ip = (int) p;
+            pow_val = 1.0f;
+            float base = s;
+            int exp = ip < 0 ? -ip : ip;
+            while (exp > 0) {
+                if (exp & 1) pow_val *= base;
+                base *= base;
+                exp >>= 1;
+            }
+            if (ip < 0) pow_val = 1.0f / pow_val;
+        } else {
+            pow_val = powf(s, p);
+        }
+        out[i] = pow_val * w1[bi] + b[bi];
     }
 }
 "#;

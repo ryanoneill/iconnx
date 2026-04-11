@@ -420,9 +420,57 @@ pub fn gpu_fused_mul_sin_pow_mul_add(
         return Ok(out);
     }
 
-    // Broadcast cases are added in Task B3.
+    // Broadcast case: w0, w1, b all share shape [1, C] or [..., 1, C] while
+    // x has shape [..., N, C]. The broadcast stride is the number of
+    // channels (last-axis length), computed as w0.len().
+    let w0_shape = w0.shape();
+    let w1_shape = w1.shape();
+    let b_shape = b.shape();
+
+    let broadcast_shapes_match = w0_shape == w1_shape && w1_shape == b_shape && !w0.is_empty();
+    let broadcast_stride = w0.len();
+    let x_len = x.len();
+
+    if broadcast_shapes_match && x_len.is_multiple_of(broadcast_stride) {
+        let n = x_len;
+        let mut out = pool.get_tensor_f32(ctx, shape.to_vec())?;
+
+        let func = cache
+            .get("fused_mul_sin_pow_mul_add_broadcast_kernel")
+            .ok_or_else(|| {
+                CudaError::Kernel(
+                    "fused_mul_sin_pow_mul_add_broadcast_kernel not found".into(),
+                )
+            })?;
+
+        let p_is_int: i32 = if p.fract() == 0.0 { 1 } else { 0 };
+
+        unsafe {
+            ctx.stream()
+                .launch_builder(func)
+                .arg(out.data_f32_mut()?)
+                .arg(x.data_f32()?)
+                .arg(w0.data_f32()?)
+                .arg(w1.data_f32()?)
+                .arg(b.data_f32()?)
+                .arg(&p)
+                .arg(&p_is_int)
+                .arg(&n)
+                .arg(&broadcast_stride)
+                .launch(elementwise_config(n))
+                .map_err(|e| {
+                    CudaError::Kernel(format!(
+                        "fused_mul_sin_pow_mul_add_broadcast launch failed: {}",
+                        e
+                    ))
+                })?;
+        }
+
+        return Ok(out);
+    }
+
     Err(CudaError::Kernel(format!(
-        "gpu_fused_mul_sin_pow_mul_add: broadcast variant not yet implemented \
+        "gpu_fused_mul_sin_pow_mul_add: unsupported shape combination \
          (x={:?}, w0={:?}, w1={:?}, b={:?})",
         x.shape(),
         w0.shape(),

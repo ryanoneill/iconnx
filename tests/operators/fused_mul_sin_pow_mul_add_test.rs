@@ -84,3 +84,51 @@ fn naive_vs_fused_matches_same_shape() {
 
     assert_close(&ctx, &fused, &reference, 1e-5);
 }
+
+#[test]
+fn broadcasting_w0_w1_b_per_channel() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+    let elem_cache = KernelCache::new(&ctx).expect("KernelCache");
+    let fused_cache = FusedKernelCache::new(&ctx).expect("FusedKernelCache");
+    let mut pool = GpuMemoryPool::new();
+
+    // x is [N, C], w0/w1/b are [1, C] broadcast along the leading dim.
+    let n_rows = 3usize;
+    let channels = 8usize;
+    let total = n_rows * channels;
+
+    let x_data: Vec<f32> = (0..total).map(|i| 0.01 * i as f32 + 0.2).collect();
+    let w0_row: Vec<f32> = (0..channels).map(|i| 0.5 + 0.05 * i as f32).collect();
+    let w1_row: Vec<f32> = (0..channels).map(|i| 1.0 - 0.03 * i as f32).collect();
+    let b_row: Vec<f32> = (0..channels).map(|i| 0.1 * i as f32).collect();
+
+    let x = upload(&ctx, x_data.clone(), vec![n_rows, channels]);
+    let w0 = upload(&ctx, w0_row.clone(), vec![1, channels]);
+    let w1 = upload(&ctx, w1_row.clone(), vec![1, channels]);
+    let b = upload(&ctx, b_row.clone(), vec![1, channels]);
+    let p: f32 = 2.0;
+
+    // Build the ground truth by tiling the broadcast rows to the full shape
+    // and running the unfused reference chain.
+    let mut w0_tiled = Vec::with_capacity(total);
+    let mut w1_tiled = Vec::with_capacity(total);
+    let mut b_tiled = Vec::with_capacity(total);
+    for _ in 0..n_rows {
+        w0_tiled.extend_from_slice(&w0_row);
+        w1_tiled.extend_from_slice(&w1_row);
+        b_tiled.extend_from_slice(&b_row);
+    }
+    let w0_full = upload(&ctx, w0_tiled, vec![n_rows, channels]);
+    let w1_full = upload(&ctx, w1_tiled, vec![n_rows, channels]);
+    let b_full = upload(&ctx, b_tiled, vec![n_rows, channels]);
+
+    let reference = unfused_reference(
+        &ctx, &elem_cache, &mut pool, &x, &w0_full, &w1_full, &b_full, p,
+    );
+    let fused = gpu_fused_mul_sin_pow_mul_add(
+        &ctx, &fused_cache, &mut pool, &x, &w0, &w1, &b, p,
+    )
+    .expect("gpu_fused_mul_sin_pow_mul_add broadcast");
+
+    assert_close(&ctx, &fused, &reference, 1e-5);
+}
