@@ -7,10 +7,10 @@
 
 /// Types of fused kernel patterns we can detect and optimize.
 ///
-/// These types are `pub` so test-only re-exports through
-/// `cuda::inference::testing` can return them. The containing
-/// `fusion` module itself is `pub(super)`, so external code can only
-/// reach these types via the intended re-export path.
+/// These types are `pub` so test-only re-exports through a future
+/// `cuda::inference::testing` facade can return them. The containing
+/// `fusion` module is currently private (`mod fusion;`), so external
+/// code can only reach these types via the intended re-export path.
 #[derive(Clone, Debug)]
 pub enum FusedPattern {
     /// Add -> Sqrt -> Div: y / sqrt(x + eps)
