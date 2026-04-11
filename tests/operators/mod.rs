@@ -18,6 +18,7 @@ mod floor_test;
 mod fused_mul_sin_pow_mul_add_test;
 mod gather_test;
 mod gemm_test;
+mod gpu_event_timer_test;
 mod greater_or_equal_test;
 mod layer_norm_test;
 mod leaky_relu_test;

@@ -45,6 +45,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 pub mod fusion;
+pub mod gpu_event_timer;
 pub mod testing;
 
 use self::fusion::{FusedPattern, FusedPatternInfo};
