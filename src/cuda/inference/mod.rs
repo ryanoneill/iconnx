@@ -230,28 +230,28 @@ pub struct GpuGraphExecutor {
 /// When Slice inputs (starts, ends, axes, steps) come from initializers,
 /// we can extract their values once and avoid D2H transfers entirely
 #[derive(Clone, Debug, Default)]
-pub(crate) struct PrecomputedSlice {
+pub(in crate::cuda::inference) struct PrecomputedSlice {
     /// Pre-computed starts values (if input is an initializer)
-    pub(crate) starts: Option<Vec<i64>>,
+    pub(in crate::cuda::inference) starts: Option<Vec<i64>>,
     /// Pre-computed ends values (if input is an initializer)
-    pub(crate) ends: Option<Vec<i64>>,
+    pub(in crate::cuda::inference) ends: Option<Vec<i64>>,
     /// Pre-computed axes values (if input is an initializer)
-    pub(crate) axes: Option<Vec<i64>>,
+    pub(in crate::cuda::inference) axes: Option<Vec<i64>>,
     /// Pre-computed steps values (if input is an initializer)
-    pub(crate) steps: Option<Vec<i64>>,
+    pub(in crate::cuda::inference) steps: Option<Vec<i64>>,
 }
 
 /// A node in the execution graph (fields used in future graph execution)
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-pub(crate) struct ExecutionNode {
-    pub(crate) name: String,
-    pub(crate) op_type: String,
-    pub(crate) inputs: Vec<String>,
-    pub(crate) outputs: Vec<String>,
-    pub(crate) attributes: NodeAttributes,
+pub(in crate::cuda::inference) struct ExecutionNode {
+    pub(in crate::cuda::inference) name: String,
+    pub(in crate::cuda::inference) op_type: String,
+    pub(in crate::cuda::inference) inputs: Vec<String>,
+    pub(in crate::cuda::inference) outputs: Vec<String>,
+    pub(in crate::cuda::inference) attributes: NodeAttributes,
     /// Pre-computed Slice parameters (only for Slice nodes with constant inputs)
-    pub(crate) precomputed_slice: Option<PrecomputedSlice>,
+    pub(in crate::cuda::inference) precomputed_slice: Option<PrecomputedSlice>,
 }
 
 impl GpuGraphExecutor {
