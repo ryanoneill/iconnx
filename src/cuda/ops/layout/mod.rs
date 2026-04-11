@@ -1025,6 +1025,7 @@ pub fn gpu_pad(
 }
 
 /// GPU Pad with constant value (original implementation)
+#[allow(clippy::too_many_arguments)] // Pad params are genuinely independent and grouping would obscure intent
 fn gpu_pad_constant(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
@@ -1158,6 +1159,7 @@ fn gpu_pad_constant(
 
 /// GPU Pad with reflect mode
 /// Reflects values at boundaries: [a, b, c, d] with pad 2 -> [c, b, a, b, c, d, c, b]
+#[allow(clippy::too_many_arguments)] // Pad params are genuinely independent
 fn gpu_pad_reflect(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
@@ -1246,6 +1248,7 @@ fn gpu_pad_reflect(
 
 /// GPU Pad with edge mode
 /// Replicates edge values: [a, b, c, d] with pad 2 -> [a, a, a, b, c, d, d, d]
+#[allow(clippy::too_many_arguments)] // Pad params are genuinely independent
 fn gpu_pad_edge(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
@@ -1345,48 +1348,33 @@ pub fn gpu_scatter_nd(
 }
 
 /// Coordinate transformation mode for Resize
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResizeCoordMode {
     /// asymmetric: input_coord = output_coord / scale
     Asymmetric = 0,
     /// half_pixel: input_coord = (output_coord + 0.5) / scale - 0.5
+    #[default]
     HalfPixel = 1,
 }
 
-impl Default for ResizeCoordMode {
-    fn default() -> Self {
-        ResizeCoordMode::HalfPixel // ONNX default
-    }
-}
-
 /// Nearest mode for rounding in Resize
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResizeNearestMode {
     /// floor: always round down
     Floor = 0,
     /// round_prefer_floor: round to nearest, ties go to floor (ONNX default)
+    #[default]
     RoundPreferFloor = 1,
 }
 
-impl Default for ResizeNearestMode {
-    fn default() -> Self {
-        ResizeNearestMode::RoundPreferFloor // ONNX default
-    }
-}
-
 /// Interpolation mode for Resize
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResizeMode {
     /// nearest: use nearest neighbor interpolation
+    #[default]
     Nearest = 0,
     /// linear: use linear/bilinear/trilinear interpolation
     Linear = 1,
-}
-
-impl Default for ResizeMode {
-    fn default() -> Self {
-        ResizeMode::Nearest // ONNX default
-    }
 }
 
 /// GPU Resize: Nearest-neighbor or linear interpolation
@@ -1399,6 +1387,7 @@ impl Default for ResizeMode {
 /// * `coord_mode` - Coordinate transformation mode (asymmetric or half_pixel)
 /// * `nearest_mode` - Rounding mode for integer conversion (floor or round_prefer_floor), only used for nearest mode
 /// * `mode` - Interpolation mode (nearest or linear)
+#[allow(clippy::too_many_arguments)] // Resize takes independent mode/coord/scale params
 pub fn gpu_resize(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
@@ -1738,6 +1727,7 @@ fn compute_strides(shape: &[usize]) -> Vec<usize> {
 /// - Handles negative steps (reverse slicing)
 /// - Clamps out-of-bounds indices
 /// - Supports Float32, Int64, and Int32 tensors
+#[allow(clippy::too_many_arguments)] // Slice takes independent starts/ends/axes/steps arrays
 pub fn gpu_slice_nd(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,

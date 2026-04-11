@@ -712,7 +712,7 @@ impl GpuGraphExecutor {
 
                 // Check if exponent is 3 (for GELU pattern)
                 let exp_input = &node.inputs[1];
-                let exp_is_three = self.weights.get(exp_input).map_or(false, |t| {
+                let exp_is_three = self.weights.get(exp_input).is_some_and(|t| {
                     if t.len() == 1 {
                         if let Ok(data) = t.to_host_f32(&self.ctx) {
                             (data[0] - 3.0).abs() < 1e-6
@@ -2213,7 +2213,7 @@ impl GpuGraphExecutor {
                     .unwrap_or(0.0f32);
 
                 // Get shape from cache or fetch via D2H (avoids device_ptr() overhead)
-                let shape_name = input_names.get(0).map(|s| s.as_str()).unwrap_or("");
+                let shape_name = input_names.first().map(|s| s.as_str()).unwrap_or("");
                 let target_shape: Vec<usize> = self
                     .get_or_fetch_i64(shape_name, inputs[0])?
                     .iter()
@@ -2798,7 +2798,7 @@ impl GpuGraphExecutor {
                     }
                     crate::cuda::tensor::DType::Int64 => {
                         // Get scalars from cache or fetch via D2H (avoids device_ptr() overhead)
-                        let start_name = input_names.get(0).map(|s| s.as_str()).unwrap_or("");
+                        let start_name = input_names.first().map(|s| s.as_str()).unwrap_or("");
                         let start = self.get_or_fetch_i64(start_name, inputs[0])?[0];
                         let limit_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
                         let limit = self.get_or_fetch_i64(limit_name, inputs[1])?[0];
