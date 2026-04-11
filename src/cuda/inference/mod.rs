@@ -108,17 +108,26 @@ pub struct ProfileData {
     pub total_us: u64,
     /// Per-operator-type timing: (total_us, count)
     pub op_times: BTreeMap<String, (u64, usize)>,
-    /// Per-op GPU-side timing from CUDA events (excludes launch overhead
-    /// and CPU-side dispatch bookkeeping).
+    /// Per-op GPU-side timing from CUDA events.
     ///
     /// Keys match `op_times` exactly: same op-type strings, same fused
     /// pattern labels. For any key present in `op_times` the same key is
-    /// present here, and the `count` values match. `total_us` here is
-    /// the GPU-measured elapsed time; `total_us` in `op_times` is CPU
-    /// wall-clock (includes launch overhead). The difference
-    /// `op_times[k].0 - gpu_op_times[k].0` approximates per-op launch
-    /// overhead. An entry may have `total_us == 0` when the GPU work
-    /// is effectively instantaneous (metadata-only ops).
+    /// present here, and the `count` values match.
+    ///
+    /// This is the actual GPU kernel wall time (measured via
+    /// `cudaEventElapsedTime` between paired events recorded on the stream
+    /// around each dispatch). It is orthogonal to `op_times`, which
+    /// measures CPU-side async enqueue overhead only (see `op_times`'
+    /// comment). The two maps together give you both halves of the picture:
+    /// `op_times[k]` is the launch/dispatch cost, `gpu_op_times[k]` is
+    /// the compute cost. There is no guaranteed magnitude relationship
+    /// between them -- `gpu_op_times[k]` is usually larger for non-trivial
+    /// ops (kernels execute longer than their dispatch cost) but may be
+    /// smaller for tiny metadata ops that finish faster than the
+    /// enqueue overhead.
+    ///
+    /// An entry may have `total_us == 0` when the GPU work is effectively
+    /// instantaneous (metadata-only ops, near-no-op kernels, etc.).
     pub gpu_op_times: BTreeMap<String, (u64, usize)>,
 }
 

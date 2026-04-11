@@ -80,10 +80,7 @@ fn kokoro_inputs(seq_len: usize) -> HashMap<String, Tensor> {
         "style".to_string(),
         Tensor::from_vec_f32(style, vec![1, 256]),
     );
-    inputs.insert(
-        "speed".to_string(),
-        Tensor::from_vec_f32(speed, vec![1]),
-    );
+    inputs.insert("speed".to_string(), Tensor::from_vec_f32(speed, vec![1]));
 
     inputs
 }
@@ -144,5 +141,89 @@ fn fusion_fires_on_full_kokoro_at_seq_len_5() {
     eprintln!(
         "✅ Fused_MulSinPowMulAdd fired {} times (expected ~48)",
         fused_calls
+    );
+
+    // === GPU-side timing assertions (Cycle 1.5a) ===
+
+    // The new gpu_op_times map must be populated whenever
+    // run_with_profiling is called.
+    assert!(
+        !profile.gpu_op_times.is_empty(),
+        "gpu_op_times must be populated when run_with_profiling is called. \
+         Got empty map; check that GpuEventTimer is wired into the execution loop."
+    );
+
+    // Key parity invariant: the two maps must have the exact same key set.
+    // Divergence breaks Leadline's CPU/GPU join silently.
+    let cpu_keys: std::collections::HashSet<&String> = profile.op_times.keys().collect();
+    let gpu_keys: std::collections::HashSet<&String> = profile.gpu_op_times.keys().collect();
+    assert_eq!(
+        cpu_keys,
+        gpu_keys,
+        "op_times and gpu_op_times keys must match exactly. \
+         cpu_only: {:?}, gpu_only: {:?}",
+        cpu_keys.difference(&gpu_keys).collect::<Vec<_>>(),
+        gpu_keys.difference(&cpu_keys).collect::<Vec<_>>()
+    );
+
+    // Count parity: every key's call count must match between the two maps.
+    // Note: there is no physical invariant between cpu_us and gpu_us because
+    // op_times measures CPU-side async enqueue time (launch overhead only,
+    // not wall-clock), while gpu_op_times measures actual GPU kernel
+    // execution time via CUDA events. These are orthogonal measurements --
+    // gpu_us > cpu_us is the normal case for non-trivial ops (kernels run
+    // longer than their dispatch cost). So we only assert call-count parity
+    // here, not any magnitude relationship.
+    for (key, (_cpu_us, cpu_count)) in &profile.op_times {
+        let (_gpu_us, gpu_count) = profile
+            .gpu_op_times
+            .get(key)
+            .copied()
+            .expect("key in op_times must also be in gpu_op_times (checked above)");
+        assert_eq!(
+            *cpu_count, gpu_count,
+            "call count for '{}' diverges: op_times={}, gpu_op_times={}",
+            key, cpu_count, gpu_count
+        );
+    }
+
+    // Diagnostic printout: top 10 ops by GPU kernel time, showing CPU
+    // enqueue overhead alongside GPU kernel wall time. These are orthogonal
+    // measurements:
+    //   cpu_us -- CPU-side async dispatch/enqueue time for this op
+    //              (pure launch overhead, measured via Instant::now()
+    //              around the dispatch call; does NOT include kernel
+    //              execution because dispatch is fire-and-forget async)
+    //   gpu_us -- GPU-side kernel wall time from CUDA events (the time
+    //              the kernel spent actually executing on the GPU)
+    //
+    // This is the core Leadline diagnostic: high cpu_us relative to gpu_us
+    // means the op is enqueue-bound (fusion or CUDA graph capture would
+    // help reduce launches); low cpu_us relative to gpu_us means the op
+    // is compute-bound (kernel micro-optimization would help more).
+    let mut rows: Vec<(String, u64, u64, usize)> = profile
+        .gpu_op_times
+        .iter()
+        .map(|(k, (gpu, count))| {
+            let cpu = profile.op_times.get(k).map(|(t, _)| *t).unwrap_or(0);
+            (k.clone(), cpu, *gpu, *count)
+        })
+        .collect();
+    // Sort by gpu_us descending so the biggest kernel-time consumers
+    // appear first.
+    rows.sort_by_key(|(_, _, gpu, _)| std::cmp::Reverse(*gpu));
+
+    eprintln!("\n=== Top 10 ops by GPU kernel time (us) ===");
+    eprintln!(
+        "  {:35} {:>12} {:>12} {:>6}",
+        "op", "cpu_enqueue", "gpu_kernel", "calls"
+    );
+    for (k, cpu, gpu, count) in rows.iter().take(10) {
+        eprintln!("  {:35} {:>12} {:>12} {:>6}", k, cpu, gpu, count);
+    }
+
+    eprintln!(
+        "\n✅ gpu_op_times populated with {} keys, key parity verified",
+        profile.gpu_op_times.len()
     );
 }
