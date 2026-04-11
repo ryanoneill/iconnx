@@ -372,6 +372,17 @@ pub fn gpu_fused_mul_sin_pow_mul_add(
     b: &GpuTensor,
     p: f32,
 ) -> Result<GpuTensor, CudaError> {
+    // Non-integer exponents would need `powf`, which in CUDA returns NaN for
+    // negative bases. We cannot prove at runtime that every `sin(x * w0)`
+    // intermediate will be non-negative, so we conservatively refuse
+    // fractional exponents and force the caller to use the unfused chain.
+    if p.fract() != 0.0 {
+        return Err(CudaError::Kernel(format!(
+            "gpu_fused_mul_sin_pow_mul_add: non-integer exponent {p} not supported \
+             (would require proving sin(x*w0) >= 0 for all lanes)"
+        )));
+    }
+
     // Same-shape fast path: all four tensors share one shape.
     let shape = x.shape();
     if w0.shape() == shape && w1.shape() == shape && b.shape() == shape {
