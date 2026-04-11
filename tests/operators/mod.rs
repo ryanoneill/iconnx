@@ -45,6 +45,7 @@ mod sigmoid_test;
 mod slice_test;
 mod softmax_test;
 mod sqrt_test;
+mod squeeze_precompute_test;
 mod squeeze_test;
 mod stft_test;
 mod sub_test;
