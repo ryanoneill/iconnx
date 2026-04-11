@@ -14,4 +14,4 @@ pub(super) mod patterns;
 pub(super) mod detection;
 
 pub(super) use patterns::{FusedPattern, FusedPatternInfo};
-// detect_fused_patterns re-export added in Task A3 when the function moves
+pub(super) use detection::detect_fused_patterns;
