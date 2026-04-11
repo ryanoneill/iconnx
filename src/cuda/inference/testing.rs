@@ -76,3 +76,32 @@ pub fn detect_fused_patterns_for_tests(
 pub fn is_mul_sin_pow_mul_add(info: &FusedPatternInfo) -> bool {
     matches!(info.pattern, FusedPattern::MulSinPowMulAdd { .. })
 }
+
+/// Snapshot of a node's precomputed shape-op parameters, for test
+/// inspection. Opaque to callers outside the testing facade — just a
+/// read-only view of the three `Option<Vec<i64>>` fields that Cycle 2
+/// adds to `ExecutionNode`.
+#[derive(Debug, Clone, Default)]
+pub struct NodePrecomputedSnapshot {
+    pub reshape_shape: Option<Vec<i64>>,
+    pub unsqueeze_axes: Option<Vec<i64>>,
+    pub squeeze_axes: Option<Vec<i64>>,
+}
+
+/// Look up a node in the executor's internal node list by name and return
+/// a snapshot of its precomputed shape-op fields. Returns `None` if no
+/// node with that name is registered.
+///
+/// This is a test-only helper — production code should never need to
+/// inspect the executor's internal node state directly.
+pub fn get_node_precomputed(
+    executor: &crate::cuda::inference::GpuGraphExecutor,
+    node_name: &str,
+) -> Option<NodePrecomputedSnapshot> {
+    let node = executor.nodes.iter().find(|n| n.name == node_name)?;
+    Some(NodePrecomputedSnapshot {
+        reshape_shape: node.precomputed_reshape_shape.clone(),
+        unsqueeze_axes: node.precomputed_unsqueeze_axes.clone(),
+        squeeze_axes: node.precomputed_squeeze_axes.clone(),
+    })
+}

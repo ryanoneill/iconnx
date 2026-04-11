@@ -49,5 +49,6 @@ mod stft_test;
 mod sub_test;
 mod transpose_test;
 mod trigonometry_test;
+mod unsqueeze_precompute_test;
 mod unsqueeze_test;
 mod where_test;

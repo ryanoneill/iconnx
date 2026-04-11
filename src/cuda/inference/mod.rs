@@ -245,7 +245,7 @@ pub struct GpuGraphExecutor {
     weights: HashMap<String, GpuTensor>,
 
     /// Execution nodes (same as CPU version)
-    nodes: Vec<ExecutionNode>,
+    pub(crate) nodes: Vec<ExecutionNode>,
 
     /// Cached topological sort order (avoids recomputing ~2.6ms per inference)
     sorted_nodes_cache: RefCell<Option<Vec<ExecutionNode>>>,
@@ -2256,7 +2256,13 @@ impl GpuGraphExecutor {
                 // Unsqueeze inserts dimensions of size 1 at specified axes
                 // Opset <= 12: axes from attribute
                 // Opset 13+: axes from second input tensor
-                let axes: Vec<i64> = if let Some(axes_attr) = attributes.get_ints("axes") {
+                //
+                // Precomputation path (Cycle 2): if the axes were resolved
+                // at graph-build time in try_precompute_unsqueeze_axes, use
+                // those values directly and skip the D2H fallback.
+                let axes: Vec<i64> = if let Some(precomp) = precomputed.unsqueeze_axes {
+                    precomp.clone()
+                } else if let Some(axes_attr) = attributes.get_ints("axes") {
                     axes_attr.to_vec()
                 } else if inputs.len() > 1 {
                     // Opset 13+: axes come from second input
