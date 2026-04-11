@@ -107,6 +107,18 @@ pub struct ProfileData {
     pub total_us: u64,
     /// Per-operator-type timing: (total_us, count)
     pub op_times: BTreeMap<String, (u64, usize)>,
+    /// Per-op GPU-side timing from CUDA events (excludes launch overhead
+    /// and CPU-side dispatch bookkeeping).
+    ///
+    /// Keys match `op_times` exactly: same op-type strings, same fused
+    /// pattern labels. For any key present in `op_times` the same key is
+    /// present here, and the `count` values match. `total_us` here is
+    /// the GPU-measured elapsed time; `total_us` in `op_times` is CPU
+    /// wall-clock (includes launch overhead). The difference
+    /// `op_times[k].0 - gpu_op_times[k].0` approximates per-op launch
+    /// overhead. An entry may have `total_us == 0` when the GPU work
+    /// is effectively instantaneous (metadata-only ops).
+    pub gpu_op_times: BTreeMap<String, (u64, usize)>,
 }
 
 impl ProfileData {
@@ -138,6 +150,21 @@ impl ProfileData {
                 "  {:20} {:>8} us ({:>4} calls, {:>6.1} us/call)",
                 op, time_us, count, avg
             );
+        }
+
+        if !self.gpu_op_times.is_empty() {
+            eprintln!("\n=== Top Operators by GPU-Side Time (CUDA events) ===");
+            let mut sorted_gpu: Vec<_> = self.gpu_op_times.iter().collect();
+            sorted_gpu.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+
+            for (op, (time_us, count)) in sorted_gpu.iter().take(15) {
+                let cpu_us = self.op_times.get(*op).map(|(t, _)| *t).unwrap_or(0);
+                let overhead = cpu_us.saturating_sub(*time_us);
+                eprintln!(
+                    "  {:20} gpu={:>8} us cpu={:>8} us overhead={:>8} us ({:>4} calls)",
+                    op, time_us, cpu_us, overhead, count
+                );
+            }
         }
     }
 }
