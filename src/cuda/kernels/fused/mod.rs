@@ -288,6 +288,9 @@ extern "C" __global__ void fused_div_mul_kernel(
 // Replaces: Mul -> Sin -> Pow -> Mul -> Add
 // ============================================================================
 
+// The host wrapper refuses fractional exponents, so only the integer
+// squaring loop is reachable here; `p` is always an integer value stored
+// in f32.
 extern "C" __global__ void fused_mul_sin_pow_mul_add_kernel(
     float* out,
     const float* x,
@@ -295,29 +298,22 @@ extern "C" __global__ void fused_mul_sin_pow_mul_add_kernel(
     const float* w1,
     const float* b,
     float p,
-    int p_is_int,
     size_t n
 ) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float s = sinf(x[i] * w0[i]);
-        float pow_val;
-        if (p_is_int != 0) {
-            // Integer exponent path: handles negative bases correctly
-            int ip = (int) p;
-            pow_val = 1.0f;
-            float base = s;
-            int exp = ip < 0 ? -ip : ip;
-            while (exp > 0) {
-                if (exp & 1) pow_val *= base;
-                base *= base;
-                exp >>= 1;
-            }
-            if (ip < 0) pow_val = 1.0f / pow_val;
-        } else {
-            // Float exponent path: caller guarantees base is non-negative
-            pow_val = powf(s, p);
+        // Integer exponent path: handles negative bases correctly.
+        int ip = (int) p;
+        float pow_val = 1.0f;
+        float base = s;
+        int exp = ip < 0 ? -ip : ip;
+        while (exp > 0) {
+            if (exp & 1) pow_val *= base;
+            base *= base;
+            exp >>= 1;
         }
+        if (ip < 0) pow_val = 1.0f / pow_val;
         out[i] = pow_val * w1[i] + b[i];
     }
 }
@@ -326,6 +322,8 @@ extern "C" __global__ void fused_mul_sin_pow_mul_add_kernel(
 // (they have shape [1, C] while x has shape [N, C]).
 // broadcast_stride is the number of elements per broadcast row (e.g., C when
 // broadcasting [1, C] over [N, C]).
+// Same integer-only exponent contract as the same-shape kernel above:
+// the host wrapper guarantees `p` is an integer value stored in f32.
 extern "C" __global__ void fused_mul_sin_pow_mul_add_broadcast_kernel(
     float* out,
     const float* x,
@@ -333,7 +331,6 @@ extern "C" __global__ void fused_mul_sin_pow_mul_add_broadcast_kernel(
     const float* w1,
     const float* b,
     float p,
-    int p_is_int,
     size_t n,
     size_t broadcast_stride
 ) {
@@ -341,21 +338,16 @@ extern "C" __global__ void fused_mul_sin_pow_mul_add_broadcast_kernel(
     if (i < n) {
         size_t bi = i % broadcast_stride;
         float s = sinf(x[i] * w0[bi]);
-        float pow_val;
-        if (p_is_int != 0) {
-            int ip = (int) p;
-            pow_val = 1.0f;
-            float base = s;
-            int exp = ip < 0 ? -ip : ip;
-            while (exp > 0) {
-                if (exp & 1) pow_val *= base;
-                base *= base;
-                exp >>= 1;
-            }
-            if (ip < 0) pow_val = 1.0f / pow_val;
-        } else {
-            pow_val = powf(s, p);
+        int ip = (int) p;
+        float pow_val = 1.0f;
+        float base = s;
+        int exp = ip < 0 ? -ip : ip;
+        while (exp > 0) {
+            if (exp & 1) pow_val *= base;
+            base *= base;
+            exp >>= 1;
         }
+        if (ip < 0) pow_val = 1.0f / pow_val;
         out[i] = pow_val * w1[bi] + b[bi];
     }
 }

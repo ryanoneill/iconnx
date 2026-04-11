@@ -378,12 +378,16 @@ pub fn gpu_fused_div_mul(
 /// Replaces the 5-op chain Mul -> Sin -> Pow -> Mul -> Add used in vocoder
 /// periodic activations (48 occurrences in Kokoro).
 ///
-/// All tensors must have the same shape. A broadcast variant is added in
-/// a separate task.
+/// Supports two shape layouts:
+/// 1. **Same-shape fast path:** `x`, `w0`, `w1`, and `b` all share one shape.
+/// 2. **Per-channel broadcast:** `w0`, `w1`, `b` have shape `[C]`, `[1, C]`,
+///    `[1, 1, C]`, etc., where `C` matches the last axis of `x`.
 ///
-/// `p` is passed as f32. Integer exponents (detected via `p.fract() == 0.0`)
-/// use a squaring loop that handles negative bases correctly; non-integer
-/// exponents use `powf` (and require non-negative bases).
+/// `p` is passed as f32 but must be integer-valued (`p.fract() == 0.0`).
+/// The kernel uses a squaring loop that handles negative bases correctly;
+/// fractional exponents would require proving `sin(x * w0) >= 0` for all
+/// lanes, so they are rejected up front and the caller is expected to fall
+/// back to the unfused chain.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_fused_mul_sin_pow_mul_add(
     ctx: &IconnxCudaContext,
@@ -418,8 +422,6 @@ pub fn gpu_fused_mul_sin_pow_mul_add(
                 CudaError::Kernel("fused_mul_sin_pow_mul_add_kernel not found".into())
             })?;
 
-        let p_is_int: i32 = if p.fract() == 0.0 { 1 } else { 0 };
-
         unsafe {
             ctx.stream()
                 .launch_builder(func)
@@ -429,7 +431,6 @@ pub fn gpu_fused_mul_sin_pow_mul_add(
                 .arg(w1.data_f32()?)
                 .arg(b.data_f32()?)
                 .arg(&p)
-                .arg(&p_is_int)
                 .arg(&n)
                 .launch(elementwise_config(n))
                 .map_err(|e| {
@@ -470,8 +471,6 @@ pub fn gpu_fused_mul_sin_pow_mul_add(
                 )
             })?;
 
-        let p_is_int: i32 = if p.fract() == 0.0 { 1 } else { 0 };
-
         unsafe {
             ctx.stream()
                 .launch_builder(func)
@@ -481,7 +480,6 @@ pub fn gpu_fused_mul_sin_pow_mul_add(
                 .arg(w1.data_f32()?)
                 .arg(b.data_f32()?)
                 .arg(&p)
-                .arg(&p_is_int)
                 .arg(&n)
                 .arg(&broadcast_stride)
                 .launch(elementwise_config(n))
