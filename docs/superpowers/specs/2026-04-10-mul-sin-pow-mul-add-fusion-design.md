@@ -13,7 +13,26 @@ iconnx is ~5x slower than ONNX Runtime on Kokoro v1.0 TTS at short sequence leng
 
 A refined Leadline analysis (received 2026-04-10) reorders the original priorities. It identified three high-value elementwise fusion patterns that collectively eliminate 360 kernel launches, plus a revised picture of the shape-only ops where Unsqueeze/Squeeze are already nearly free but Reshape and Gather-on-constants remain worthwhile. The top single win is a 5-op chain `Mul → Sin → Pow → Mul → Add` that appears 48 times in the Kokoro vocoder, eliminating 192 launches when fused.
 
-This cycle implements that one fusion pattern end-to-end. It is deliberately narrow so the change can be benchmarked and validated in isolation before moving to the next pattern.
+### Sequence-length sweep (2026-04-10)
+
+A second Leadline run swept sequence lengths 5 → 200. Three findings sharpen the picture and affect what success looks like for this cycle:
+
+| seq_len | iconnx | ORT    | ratio |
+|---------|--------|--------|-------|
+| 5       | 142.65 | 28.88  | 0.20× |
+| 10      | 137.11 | 30.00  | 0.22× |
+| 20      | 282.47 | 32.81  | 0.12× |
+| 50      | 315.58 | 64.97  | 0.21× |
+| 100     | 466.41 | 125.92 | 0.27× |
+| 200     | OOM    | —      | —     |
+
+The ratio stays near 0.2× across the entire sweep. This means iconnx is not just fixed-overhead-bound at short sequences — the overhead scales with tensor size, because the per-launch cost grows as intermediate tensors get larger (more DRAM traffic, more memory-pool pressure, more time spent in kernel setup for larger grids). Fusing a 5-op chain at seq_len=100 saves 20× more memory bandwidth per occurrence than at seq_len=5.
+
+iconnx OOMs at seq_len=200 while ORT would not. This strongly suggests iconnx allocates a fresh GPU buffer for every intermediate tensor in the un-fused chain. Fusing `Mul → Sin → Pow → Mul → Add` eliminates 4 intermediate tensors per occurrence × 48 occurrences = **192 fewer intermediate allocations per inference**. That is not merely a compute optimization — at long sequences it may be what makes the model fit at all.
+
+The seq_len=20 outlier (first run 507 ms, then settling to ~186 ms) exposes memory-pool thrashing: the first inference at a new tensor size misses the pool and allocates fresh, then later runs reuse those allocations. Reducing the number of distinct intermediate shapes (which fusion does, because the fused output has the final shape instead of 4 intermediate shapes) should ease the thrashing.
+
+This cycle implements one fusion pattern end-to-end. It is deliberately narrow so the change can be benchmarked and validated in isolation before moving to the next pattern. But the sweep data means success must be measured across multiple sequence lengths and must include memory-side metrics, not only wall-clock latency at seq_len=5.
 
 ## Goals
 
@@ -21,7 +40,7 @@ This cycle implements that one fusion pattern end-to-end. It is deliberately nar
 2. Extract fusion code from `src/cuda/inference/mod.rs` (currently 4,985 lines) into a dedicated `src/cuda/inference/fusion/` module as a targeted refactor scoped to the code this cycle touches.
 3. Preserve bit-compatible numerical output on Kokoro compared to the current implementation (and thus vs ONNX Runtime within existing test tolerances).
 4. Establish a repeatable TDD workflow for adding future fusion patterns — so cycles 2 and 3 (AddMulAddLeakyRelu and the AddMulAdd detection fix) can reuse the same structure.
-5. Show measurable improvement on the `leadline-bench` Kokoro comparison binary: the new fused pattern must appear in the per-operator breakdown with ~48 calls and total inference latency must decrease.
+5. Show measurable improvement on the `leadline-bench` Kokoro comparison binary across multiple sequence lengths: the new fused pattern must appear in the per-operator breakdown with ~48 calls, total inference latency must decrease at both seq_len=5 and seq_len=50, and memory pool allocation counts must drop by approximately 192 per inference.
 
 ## Non-Goals
 
@@ -249,17 +268,29 @@ Red confirmed — dispatch doesn't know the pattern.
 
 **E3.** Run `tests/kokoro_validation_test.rs` — iconnx's output on Kokoro must still match ORT within existing tolerance.
 
-**E4.** Rebuild and run `leadline-bench compare` against the Kokoro model per the reproduction steps in `docs/performance/2026-04-09-leadline-bench-findings.md`. Required outcomes:
+**E4.** Rebuild and run `leadline-bench compare` against the Kokoro model at **two sequence lengths** — `seq_len=5` (matches the original baseline) and `seq_len=50` (exposes tensor-size-dependent bandwidth effects). Use the reproduction steps in `docs/performance/2026-04-09-leadline-bench-findings.md`. Required outcomes at **each** sequence length:
 
 - The `Fused_MulSinPowMulAdd` line appears in the iconnx operator breakdown
 - Call count is ~48 (within ±5; some patterns may legitimately not match)
 - `Mul`, `Sin`, `Pow`, `Add` counts in the profile each drop by approximately 48
-- Total iconnx inference latency decreases (target: ≥2 ms; stretch: ≥5 ms)
 - Variance is no worse than current (currently 46%)
 
-**E5.** If the real Kokoro pattern shape differs from the design's assumption — for example, `w0` is a scalar rather than a tensor, or the operand order is flipped — update the detection walker to match and rerun E4. Do not declare completion until the 48 detected instances number is verified. The verification-before-completion discipline from the superpowers skill applies: evidence before assertions, always.
+Sequence-length-specific targets:
 
-**Commit E:** `perf(kokoro): validate MulSinPowMulAdd fusion fires in Kokoro`
+- **seq_len=5:** total iconnx latency decreases by ≥2 ms (target); ≥5 ms (stretch) from the 142.65 ms baseline
+- **seq_len=50:** total iconnx latency decreases by ≥10 ms (target); ≥25 ms (stretch) from the 315.58 ms baseline, reflecting the expected larger bandwidth savings at larger tensor sizes
+
+The seq_len=50 gains should be proportionally larger than seq_len=5. If they are not, the fusion is not actually keeping intermediates in registers — investigate the kernel implementation before declaring success.
+
+**E5. Memory-side validation.** Record `executor.pool_stats()` (total allocations, cache hits, hit rate) before and after the optimization at both sequence lengths. Required outcomes:
+
+- Allocation count drops by approximately 192 per inference (4 eliminated intermediates × 48 occurrences)
+- Pool hit rate at seq_len=50 does not regress
+- **Stretch goal:** rerun at seq_len=200. If it still OOMs, that is expected — cycles 2 and 3 plus likely memory-pool work are needed to fit that length. Report how far it gets. If it no longer OOMs, that is a strong signal and worth a commit message callout.
+
+**E6.** If the real Kokoro pattern shape differs from the design's assumption — for example, `w0` is a scalar rather than a tensor, or the operand order is flipped — update the detection walker to match and rerun E4 and E5. Do not declare completion until the 48 detected instances number is verified. The verification-before-completion discipline from the superpowers skill applies: evidence before assertions, always.
+
+**Commit E:** `perf(kokoro): validate MulSinPowMulAdd fusion across seq lengths`
 
 ## Validation Gates
 
@@ -270,20 +301,25 @@ Cycle 1 is complete when all of these are true:
 3. `cargo clippy --features cuda -- -D warnings` reports zero warnings.
 4. `cargo fmt --check` passes.
 5. `tests/kokoro_validation_test.rs` passes — Kokoro output still matches ORT.
-6. `leadline-bench compare` on Kokoro v1.0 shows:
-   - New `Fused_MulSinPowMulAdd` line with ~48 calls
-   - `Mul`, `Sin`, `Pow`, `Add` counts decreased by ~48 each
-   - Total latency improved (≥2 ms)
-7. `src/cuda/inference/mod.rs` is ~300 lines smaller than at the start of this cycle.
-8. New `src/cuda/inference/fusion/` module exists with `patterns.rs`, `detection.rs`, `mod.rs`, each under 1000 lines.
-9. `src/cuda/kernels/fused.rs` remains under 1000 lines.
-10. The latency improvement is reported in the Phase E commit message (actual numbers from the benchmark, not the expected numbers from this spec).
-11. Commits are signed per CLAUDE.md. If signing fails, stop and ask the user.
+6. `leadline-bench compare` on Kokoro v1.0 at **both seq_len=5 and seq_len=50** shows:
+   - New `Fused_MulSinPowMulAdd` line with ~48 calls at each sequence length
+   - `Mul`, `Sin`, `Pow`, `Add` counts each decreased by ~48 at each sequence length
+   - Total latency improved: ≥2 ms at seq_len=5, ≥10 ms at seq_len=50
+   - Variance no worse than current baseline
+7. Memory-side evidence from `executor.pool_stats()`:
+   - Allocation count per inference drops by approximately 192
+   - Pool hit rate does not regress
+   - seq_len=200 stretch-goal result reported (still-OOMs-but-further OR no-longer-OOMs)
+8. `src/cuda/inference/mod.rs` is ~300 lines smaller than at the start of this cycle.
+9. New `src/cuda/inference/fusion/` module exists with `patterns.rs`, `detection.rs`, `mod.rs`, each under 1000 lines.
+10. `src/cuda/kernels/fused.rs` remains under 1000 lines.
+11. The latency improvement and memory pool stats are reported in the Phase E commit message (actual numbers from the benchmark, not the expected numbers from this spec).
+12. Commits are signed per CLAUDE.md. If signing fails, stop and ask the user.
 
 ## Risks and Mitigations
 
 **Risk:** The real Kokoro graph doesn't have the exact `Mul → Sin → Pow → Mul → Add` shape I'm assuming (operand order, broadcasting, `Pow` exponent source).
-**Mitigation:** Phase E5 explicitly re-validates detection against the real graph. Before implementing C2, instrument the existing fusion detection temporarily to log nodes that look close to the pattern.
+**Mitigation:** Phase E6 explicitly re-validates detection against the real graph. Before implementing C2, instrument the existing fusion detection temporarily to log nodes that look close to the pattern.
 
 **Risk:** Adding the new pattern conflicts with an existing pattern's detection (e.g., the inner `Mul` at the start of the chain could also be the start of a different pattern).
 **Mitigation:** C3 runs the full test suite to catch regressions in existing patterns. Detection walks in a specific order, and any `Mul` already claimed by an earlier-detected pattern is in the skip set and won't be rewalked.
