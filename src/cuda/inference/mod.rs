@@ -13,7 +13,8 @@ use super::cudnn::{
 use super::cufft::StftKernelCache;
 use super::kernels::fused::{
     gpu_fused_add_mul, gpu_fused_add_mul_add, gpu_fused_div_mul, gpu_fused_div_rsqrt,
-    gpu_fused_gelu, gpu_fused_mul_add, gpu_fused_sub_mul, FusedKernelCache,
+    gpu_fused_gelu, gpu_fused_mul_add, gpu_fused_mul_sin_pow_mul_add, gpu_fused_sub_mul,
+    FusedKernelCache,
 };
 use super::kernels::{
     gpu_abs, gpu_add, gpu_ceil, gpu_clip, gpu_cos, gpu_div, gpu_exp, gpu_floor, gpu_leaky_relu,
@@ -42,6 +43,11 @@ use cudarc::driver::sys::CUdeviceptr;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+
+pub mod fusion;
+pub mod testing;
+
+use self::fusion::{FusedPattern, FusedPatternInfo};
 
 /// Log entry for a single node execution (for debugging shape mismatches)
 #[derive(Debug, Clone)]
@@ -222,103 +228,40 @@ pub struct GpuGraphExecutor {
     validator: RefCell<Option<super::validation::TensorValidator>>,
 }
 
-/// Pre-computed Slice parameters extracted at graph construction time
+/// Pre-computed Slice parameters extracted at graph construction time.
 /// When Slice inputs (starts, ends, axes, steps) come from initializers,
-/// we can extract their values once and avoid D2H transfers entirely
+/// we can extract their values once and avoid D2H transfers entirely.
+///
+/// Widened to `pub(crate)` so `ExecutionNode` (also `pub(crate)`) does
+/// not leak a less-visible field type.
 #[derive(Clone, Debug, Default)]
-struct PrecomputedSlice {
+pub(crate) struct PrecomputedSlice {
     /// Pre-computed starts values (if input is an initializer)
-    starts: Option<Vec<i64>>,
+    pub(crate) starts: Option<Vec<i64>>,
     /// Pre-computed ends values (if input is an initializer)
-    ends: Option<Vec<i64>>,
+    pub(crate) ends: Option<Vec<i64>>,
     /// Pre-computed axes values (if input is an initializer)
-    axes: Option<Vec<i64>>,
+    pub(crate) axes: Option<Vec<i64>>,
     /// Pre-computed steps values (if input is an initializer)
-    steps: Option<Vec<i64>>,
+    pub(crate) steps: Option<Vec<i64>>,
 }
 
-/// A node in the execution graph (fields used in future graph execution)
+/// A node in the execution graph (fields used in future graph execution).
+///
+/// Visibility is `pub(crate)` so `cuda::inference::fusion::detection` and
+/// the sibling `cuda::inference::testing` module can construct and read
+/// these nodes. No production code outside `cuda::inference` touches
+/// this type.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-struct ExecutionNode {
-    name: String,
-    op_type: String,
-    inputs: Vec<String>,
-    outputs: Vec<String>,
-    attributes: NodeAttributes,
+pub(crate) struct ExecutionNode {
+    pub(crate) name: String,
+    pub(crate) op_type: String,
+    pub(crate) inputs: Vec<String>,
+    pub(crate) outputs: Vec<String>,
+    pub(crate) attributes: NodeAttributes,
     /// Pre-computed Slice parameters (only for Slice nodes with constant inputs)
-    precomputed_slice: Option<PrecomputedSlice>,
-}
-
-/// Types of fused kernel patterns we can detect and optimize
-#[derive(Clone, Debug)]
-enum FusedPattern {
-    /// Add -> Sqrt -> Div: y / sqrt(x + eps)
-    /// Stores: (numerator_input, variance_input, eps_input, output_name)
-    DivRsqrt {
-        numerator_input: String,
-        variance_input: String,
-        eps_input: String,
-        output_name: String,
-    },
-    /// Add -> Mul -> Add: (x + a) * b + c
-    /// Stores: (x, a, b, c, output_name)
-    AddMulAdd {
-        x_input: String,
-        a_input: String,
-        b_input: String,
-        c_input: String,
-        output_name: String,
-    },
-    /// Full GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    /// Replaces 8 ops: Pow -> Mul -> Add -> Mul -> Tanh -> Add -> Mul -> Mul
-    Gelu {
-        x_input: String,
-        output_name: String,
-    },
-    /// Mul -> Add: y = a * b + c
-    /// Simple multiply-add pattern for scalar operations
-    MulAdd {
-        a_input: String,
-        b_input: String,
-        c_input: String,
-        output_name: String,
-    },
-    /// Add -> Mul: y = (a + b) * c
-    /// Simple add-multiply pattern for scalar operations
-    AddMul {
-        a_input: String,
-        b_input: String,
-        c_input: String,
-        output_name: String,
-    },
-    /// Sub -> Mul: y = (a - b) * c
-    /// Simple sub-multiply pattern
-    SubMul {
-        a_input: String,
-        b_input: String,
-        c_input: String,
-        output_name: String,
-    },
-    /// Div -> Mul: y = (a / b) * c
-    /// Simple div-multiply pattern
-    DivMul {
-        a_input: String,
-        b_input: String,
-        c_input: String,
-        output_name: String,
-    },
-}
-
-/// Information about a detected fused pattern
-#[derive(Clone, Debug)]
-struct FusedPatternInfo {
-    /// The pattern type and its inputs
-    pattern: FusedPattern,
-    /// Node names that are part of this pattern (to skip during execution)
-    nodes_to_skip: Vec<String>,
-    /// The first node name (head) that triggers execution of the fused kernel
-    head_node: String,
+    pub(crate) precomputed_slice: Option<PrecomputedSlice>,
 }
 
 impl GpuGraphExecutor {
@@ -531,520 +474,18 @@ impl GpuGraphExecutor {
         }
     }
 
-    /// Detect fuseable operator patterns in the graph
-    /// Called automatically before first execution
+    /// Detect fuseable operator patterns in the graph.
+    /// Called automatically before first execution.
     fn detect_fused_patterns(&self) {
-        // Skip if already detected
         if *self.patterns_detected.borrow() {
             return;
         }
 
-        // Build lookup maps
-        let output_to_node: HashMap<&str, &ExecutionNode> = self
-            .nodes
-            .iter()
-            .flat_map(|n| n.outputs.iter().map(move |o| (o.as_str(), n)))
-            .collect();
+        let (detected, skip_set) =
+            fusion::detect_fused_patterns(&self.nodes, &self.weights, &self.ctx);
 
-        // Count uses of each tensor output (for single-use check)
-        let mut output_uses: HashMap<&str, usize> = HashMap::new();
-        for node in &self.nodes {
-            for input in &node.inputs {
-                *output_uses.entry(input.as_str()).or_insert(0) += 1;
-            }
-        }
-
-        let mut fused_patterns = self.fused_patterns.borrow_mut();
-        let mut nodes_to_skip = self.nodes_to_skip.borrow_mut();
-
-        // Detect Add -> Sqrt -> Div pattern (normalization)
-        // Pattern: numerator / sqrt(variance + eps)
-        // Now supports broadcasting when variance has trailing 1 dimensions
-        for node in &self.nodes {
-            if node.op_type == "Add" {
-                let add_output = &node.outputs[0];
-                // Check if Add output is single-use
-                if output_uses.get(add_output.as_str()) != Some(&1) {
-                    continue;
-                }
-
-                // Find Sqrt that uses this Add's output
-                if let Some(sqrt_node) = output_to_node
-                    .iter()
-                    .find(|(_, n)| n.op_type == "Sqrt" && n.inputs.contains(add_output))
-                    .map(|(_, n)| *n)
-                {
-                    let sqrt_output = &sqrt_node.outputs[0];
-                    // Check if Sqrt output is single-use
-                    if output_uses.get(sqrt_output.as_str()) != Some(&1) {
-                        continue;
-                    }
-
-                    // Find Div where Sqrt output is the divisor (second input)
-                    if let Some(div_node) = output_to_node
-                        .iter()
-                        .find(|(_, n)| {
-                            n.op_type == "Div"
-                                && n.inputs.len() >= 2
-                                && &n.inputs[1] == sqrt_output
-                        })
-                        .map(|(_, n)| *n)
-                    {
-                        // Found pattern: numerator / sqrt(variance + eps)
-                        let pattern_info = FusedPatternInfo {
-                            pattern: FusedPattern::DivRsqrt {
-                                numerator_input: div_node.inputs[0].clone(),
-                                variance_input: node.inputs[0].clone(),
-                                eps_input: node.inputs[1].clone(),
-                                output_name: div_node.outputs[0].clone(),
-                            },
-                            nodes_to_skip: vec![sqrt_node.name.clone(), div_node.name.clone()],
-                            head_node: node.name.clone(),
-                        };
-
-                        // Register the pattern
-                        for skip_name in &pattern_info.nodes_to_skip {
-                            nodes_to_skip.insert(skip_name.clone());
-                        }
-                        fused_patterns.insert(node.name.clone(), pattern_info);
-                    }
-                }
-            }
-        }
-
-        // Detect Add -> Mul -> Add pattern (affine transform: (x + a) * b + c)
-        for node in &self.nodes {
-            if node.op_type == "Add" {
-                let add1_output = &node.outputs[0];
-                // Check if first Add output is single-use
-                if output_uses.get(add1_output.as_str()) != Some(&1) {
-                    continue;
-                }
-                // Skip if this node is already part of another pattern
-                if nodes_to_skip.contains(&node.name) {
-                    continue;
-                }
-
-                // Find Mul that uses this Add's output
-                if let Some(mul_node) = output_to_node
-                    .iter()
-                    .find(|(_, n)| n.op_type == "Mul" && n.inputs.contains(add1_output))
-                    .map(|(_, n)| *n)
-                {
-                    let mul_output = &mul_node.outputs[0];
-                    // Check if Mul output is single-use
-                    if output_uses.get(mul_output.as_str()) != Some(&1) {
-                        continue;
-                    }
-                    // Skip if Mul is already part of another pattern
-                    if nodes_to_skip.contains(&mul_node.name) {
-                        continue;
-                    }
-
-                    // Find second Add that uses Mul output
-                    if let Some(add2_node) = output_to_node
-                        .iter()
-                        .find(|(_, n)| n.op_type == "Add" && n.inputs.contains(mul_output))
-                        .map(|(_, n)| *n)
-                    {
-                        // Skip if second Add is already part of another pattern
-                        if nodes_to_skip.contains(&add2_node.name) {
-                            continue;
-                        }
-
-                        // Identify which input to Add1 is the main operand (x) and which is the addend (a)
-                        let (x_input, a_input) = (node.inputs[0].clone(), node.inputs[1].clone());
-
-                        // Identify the multiplier (b) - the input to Mul that isn't the Add1 output
-                        let b_input = if &mul_node.inputs[0] == add1_output {
-                            mul_node.inputs[1].clone()
-                        } else {
-                            mul_node.inputs[0].clone()
-                        };
-
-                        // Identify the final addend (c) - the input to Add2 that isn't the Mul output
-                        let c_input = if &add2_node.inputs[0] == mul_output {
-                            add2_node.inputs[1].clone()
-                        } else {
-                            add2_node.inputs[0].clone()
-                        };
-
-                        // Only fuse if b and c are weights (not computed values)
-                        // This ensures the affine transform pattern (gamma, beta are weights)
-                        if !self.weights.contains_key(&b_input) || !self.weights.contains_key(&c_input)
-                        {
-                            continue;
-                        }
-
-                        let pattern_info = FusedPatternInfo {
-                            pattern: FusedPattern::AddMulAdd {
-                                x_input,
-                                a_input,
-                                b_input,
-                                c_input,
-                                output_name: add2_node.outputs[0].clone(),
-                            },
-                            nodes_to_skip: vec![mul_node.name.clone(), add2_node.name.clone()],
-                            head_node: node.name.clone(),
-                        };
-
-                        // Register the pattern
-                        for skip_name in &pattern_info.nodes_to_skip {
-                            nodes_to_skip.insert(skip_name.clone());
-                        }
-                        fused_patterns.insert(node.name.clone(), pattern_info);
-                    }
-                }
-            }
-        }
-
-        // Detect full GELU pattern:
-        // x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        // Pattern: Pow(x,3) -> Mul(coeff) -> Add(x) -> Mul(sqrt2pi) -> Tanh -> Add(1) -> Mul(x*0.5)
-        // Plus parallel path: Mul(x, 0.5)
-        for node in &self.nodes {
-            if node.op_type == "Pow" {
-                let pow_output = &node.outputs[0];
-                // Skip if already part of another pattern
-                if nodes_to_skip.contains(&node.name) {
-                    continue;
-                }
-
-                // Check if exponent is 3 (for GELU pattern)
-                let exp_input = &node.inputs[1];
-                let exp_is_three = self.weights.get(exp_input).is_some_and(|t| {
-                    if t.len() == 1 {
-                        if let Ok(data) = t.to_host_f32(&self.ctx) {
-                            (data[0] - 3.0).abs() < 1e-6
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                });
-
-                if !exp_is_three {
-                    continue;
-                }
-
-                // The x input is the base of Pow (first input)
-                let x_input = node.inputs[0].clone();
-
-                // Step 1: Find Mul(pow, 0.044715 coeff)
-                let mul1 = output_to_node
-                    .iter()
-                    .find(|(_, n)| n.op_type == "Mul" && n.inputs.contains(pow_output))
-                    .map(|(_, n)| *n);
-                let Some(mul1_node) = mul1 else { continue };
-                let mul1_output = &mul1_node.outputs[0];
-
-                // Step 2: Find Add(x, mul1) - the inner sum x + x^3 * coeff
-                let add1 = output_to_node
-                    .iter()
-                    .find(|(_, n)| {
-                        n.op_type == "Add"
-                            && n.inputs.contains(mul1_output)
-                            && n.inputs.contains(&x_input)
-                    })
-                    .map(|(_, n)| *n);
-                let Some(add1_node) = add1 else { continue };
-                let add1_output = &add1_node.outputs[0];
-
-                // Step 3: Find Mul(add1, sqrt(2/pi)) - scaling for tanh
-                let mul2 = output_to_node
-                    .iter()
-                    .find(|(_, n)| n.op_type == "Mul" && n.inputs.contains(add1_output))
-                    .map(|(_, n)| *n);
-                let Some(mul2_node) = mul2 else { continue };
-                let mul2_output = &mul2_node.outputs[0];
-
-                // Step 4: Find Tanh
-                let tanh = output_to_node
-                    .iter()
-                    .find(|(_, n)| n.op_type == "Tanh" && n.inputs.contains(mul2_output))
-                    .map(|(_, n)| *n);
-                let Some(tanh_node) = tanh else { continue };
-                let tanh_output = &tanh_node.outputs[0];
-
-                // Step 5: Find Add(tanh, 1) - the 1 + tanh(...) part
-                let add2 = output_to_node
-                    .iter()
-                    .find(|(_, n)| n.op_type == "Add" && n.inputs.contains(tanh_output))
-                    .map(|(_, n)| *n);
-                let Some(add2_node) = add2 else { continue };
-                let add2_output = &add2_node.outputs[0];
-
-                // Step 6: Find Mul(x*0.5, add2) - the final multiply
-                // This Mul should take add2_output and the output of a Mul(x, 0.5)
-                let mul3 = output_to_node
-                    .iter()
-                    .find(|(_, n)| n.op_type == "Mul" && n.inputs.contains(add2_output))
-                    .map(|(_, n)| *n);
-                let Some(mul3_node) = mul3 else { continue };
-
-                // Find the other input to mul3 (should be x * 0.5)
-                let mul3_other_input = if &mul3_node.inputs[0] == add2_output {
-                    &mul3_node.inputs[1]
-                } else {
-                    &mul3_node.inputs[0]
-                };
-
-                // This other input should come from a Mul(x, 0.5)
-                let mul_half_node = match output_to_node.get(mul3_other_input.as_str()) {
-                    Some(n) if n.op_type == "Mul" && n.inputs.contains(&x_input) => *n,
-                    _ => continue,
-                };
-
-                // Verify all intermediate outputs are single-use (safe to fuse)
-                let all_single_use = [
-                    pow_output,
-                    mul1_output,
-                    add1_output,
-                    mul2_output,
-                    tanh_output,
-                    add2_output,
-                    &mul_half_node.outputs[0],
-                ]
-                .iter()
-                .all(|out| output_uses.get(out.as_str()) == Some(&1));
-
-                if !all_single_use {
-                    continue;
-                }
-
-                // Register the full GELU pattern
-                let nodes_in_pattern = vec![
-                    mul1_node.name.clone(),
-                    add1_node.name.clone(),
-                    mul2_node.name.clone(),
-                    tanh_node.name.clone(),
-                    add2_node.name.clone(),
-                    mul3_node.name.clone(),
-                    mul_half_node.name.clone(),
-                ];
-
-                // Skip if any node is already part of another pattern
-                if nodes_in_pattern.iter().any(|n| nodes_to_skip.contains(n)) {
-                    continue;
-                }
-
-                let pattern_info = FusedPatternInfo {
-                    pattern: FusedPattern::Gelu {
-                        x_input,
-                        output_name: mul3_node.outputs[0].clone(),
-                    },
-                    nodes_to_skip: nodes_in_pattern.clone(),
-                    head_node: node.name.clone(),
-                };
-
-                // Register the pattern
-                for skip_name in &nodes_in_pattern {
-                    nodes_to_skip.insert(skip_name.clone());
-                }
-                fused_patterns.insert(node.name.clone(), pattern_info);
-            }
-        }
-
-        // Detect Mul -> Add pattern (simple multiply-add: a * b + c)
-        // This is a simpler pattern than AddMulAdd, catching remaining Mul-Add pairs
-        // Only fuse when c is a weight (constant), ensuring it's available at execution time
-        for node in &self.nodes {
-            if node.op_type == "Mul" && !nodes_to_skip.contains(&node.name) {
-                let mul_output = &node.outputs[0];
-                // Check if Mul output is single-use
-                if output_uses.get(mul_output.as_str()) != Some(&1) {
-                    continue;
-                }
-
-                // Find Add that uses this Mul's output
-                if let Some(add_node) = self.nodes.iter().find(|n| {
-                    n.op_type == "Add"
-                        && n.inputs.contains(mul_output)
-                        && !nodes_to_skip.contains(&n.name)
-                }) {
-                    // Get the other Add input (c)
-                    let c_input = add_node
-                        .inputs
-                        .iter()
-                        .find(|i| i.as_str() != mul_output.as_str())
-                        .cloned()
-                        .unwrap_or_default();
-
-                    // Only fuse if c is a weight (constant) to ensure shape compatibility
-                    // Fused kernels don't support broadcasting, so we can't use computed values
-                    // that might have different shapes requiring broadcast
-                    if !self.weights.contains_key(&c_input) {
-                        continue;
-                    }
-
-                    let pattern_info = FusedPatternInfo {
-                        pattern: FusedPattern::MulAdd {
-                            a_input: node.inputs[0].clone(),
-                            b_input: node.inputs[1].clone(),
-                            c_input,
-                            output_name: add_node.outputs[0].clone(),
-                        },
-                        nodes_to_skip: vec![add_node.name.clone()],
-                        head_node: node.name.clone(),
-                    };
-
-                    // Register the pattern
-                    nodes_to_skip.insert(add_node.name.clone());
-                    fused_patterns.insert(node.name.clone(), pattern_info);
-                }
-            }
-        }
-
-        // Detect Add -> Mul pattern (simple add-multiply: (a + b) * c)
-        // Complement pattern to Mul-Add
-        // Only fuse when c is a weight (constant), ensuring it's available at execution time
-        for node in &self.nodes {
-            if node.op_type == "Add" && !nodes_to_skip.contains(&node.name) {
-                let add_output = &node.outputs[0];
-                // Check if Add output is single-use
-                if output_uses.get(add_output.as_str()) != Some(&1) {
-                    continue;
-                }
-
-                // Find Mul that uses this Add's output
-                if let Some(mul_node) = self.nodes.iter().find(|n| {
-                    n.op_type == "Mul"
-                        && n.inputs.contains(add_output)
-                        && !nodes_to_skip.contains(&n.name)
-                }) {
-                    // Get the other Mul input (c)
-                    let c_input = mul_node
-                        .inputs
-                        .iter()
-                        .find(|i| i.as_str() != add_output.as_str())
-                        .cloned()
-                        .unwrap_or_default();
-
-                    // Only fuse if c is a weight (constant) to ensure shape compatibility
-                    // Fused kernels don't support broadcasting
-                    if !self.weights.contains_key(&c_input) {
-                        continue;
-                    }
-
-                    let pattern_info = FusedPatternInfo {
-                        pattern: FusedPattern::AddMul {
-                            a_input: node.inputs[0].clone(),
-                            b_input: node.inputs[1].clone(),
-                            c_input,
-                            output_name: mul_node.outputs[0].clone(),
-                        },
-                        nodes_to_skip: vec![mul_node.name.clone()],
-                        head_node: node.name.clone(),
-                    };
-
-                    // Register the pattern
-                    nodes_to_skip.insert(mul_node.name.clone());
-                    fused_patterns.insert(node.name.clone(), pattern_info);
-                }
-            }
-        }
-
-        // Detect Sub -> Mul pattern (simple sub-multiply: (a - b) * c)
-        // Similar to Add -> Mul but with subtraction
-        for node in &self.nodes {
-            if node.op_type == "Sub" && !nodes_to_skip.contains(&node.name) {
-                let sub_output = &node.outputs[0];
-                // Check if Sub output is single-use
-                if output_uses.get(sub_output.as_str()) != Some(&1) {
-                    continue;
-                }
-
-                // Find Mul that uses this Sub's output
-                if let Some(mul_node) = self.nodes.iter().find(|n| {
-                    n.op_type == "Mul"
-                        && n.inputs.contains(sub_output)
-                        && !nodes_to_skip.contains(&n.name)
-                }) {
-                    // Get the other Mul input (c)
-                    let c_input = mul_node
-                        .inputs
-                        .iter()
-                        .find(|i| i.as_str() != sub_output.as_str())
-                        .cloned()
-                        .unwrap_or_default();
-
-                    // Only fuse if c is a weight (constant) to ensure shape compatibility
-                    // Fused kernels don't support broadcasting
-                    if !self.weights.contains_key(&c_input) {
-                        continue;
-                    }
-
-                    let pattern_info = FusedPatternInfo {
-                        pattern: FusedPattern::SubMul {
-                            a_input: node.inputs[0].clone(),
-                            b_input: node.inputs[1].clone(),
-                            c_input,
-                            output_name: mul_node.outputs[0].clone(),
-                        },
-                        nodes_to_skip: vec![mul_node.name.clone()],
-                        head_node: node.name.clone(),
-                    };
-
-                    // Register the pattern
-                    nodes_to_skip.insert(mul_node.name.clone());
-                    fused_patterns.insert(node.name.clone(), pattern_info);
-                }
-            }
-        }
-
-        // Detect Div -> Mul pattern (simple div-multiply: (a / b) * c)
-        // Similar to Add -> Mul but with division
-        for node in &self.nodes {
-            if node.op_type == "Div" && !nodes_to_skip.contains(&node.name) {
-                let div_output = &node.outputs[0];
-                // Check if Div output is single-use
-                if output_uses.get(div_output.as_str()) != Some(&1) {
-                    continue;
-                }
-
-                // Find Mul that uses this Div's output
-                if let Some(mul_node) = self.nodes.iter().find(|n| {
-                    n.op_type == "Mul"
-                        && n.inputs.contains(div_output)
-                        && !nodes_to_skip.contains(&n.name)
-                }) {
-                    // Get the other Mul input (c)
-                    let c_input = mul_node
-                        .inputs
-                        .iter()
-                        .find(|i| i.as_str() != div_output.as_str())
-                        .cloned()
-                        .unwrap_or_default();
-
-                    // Only fuse if c is a weight (constant) to ensure shape compatibility
-                    // Fused kernels don't support broadcasting
-                    if !self.weights.contains_key(&c_input) {
-                        continue;
-                    }
-
-                    let pattern_info = FusedPatternInfo {
-                        pattern: FusedPattern::DivMul {
-                            a_input: node.inputs[0].clone(),
-                            b_input: node.inputs[1].clone(),
-                            c_input,
-                            output_name: mul_node.outputs[0].clone(),
-                        },
-                        nodes_to_skip: vec![mul_node.name.clone()],
-                        head_node: node.name.clone(),
-                    };
-
-                    // Register the pattern
-                    nodes_to_skip.insert(mul_node.name.clone());
-                    fused_patterns.insert(node.name.clone(), pattern_info);
-                }
-            }
-        }
-
-        // NOTE: Transpose absorption into MatMul (trans_a/trans_b flags) is a potential
-        // optimization but requires deeper changes to the run() execution loop.
-        // Deferred for Phase 4.
-
+        *self.fused_patterns.borrow_mut() = detected;
+        *self.nodes_to_skip.borrow_mut() = skip_set;
         *self.patterns_detected.borrow_mut() = true;
     }
 
@@ -1255,6 +696,73 @@ impl GpuGraphExecutor {
                     })?;
 
                 gpu_fused_div_mul(&self.ctx, &self.fused_kernels, &mut pool, a, b, c)
+            }
+            FusedPattern::MulSinPowMulAdd {
+                x_input,
+                w0_input,
+                w1_input,
+                b_input,
+                p_input,
+                ..
+            } => {
+                let x = values
+                    .get(x_input)
+                    .or_else(|| self.weights.get(x_input))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused MulSinPowMulAdd: x '{}' not found",
+                            x_input
+                        ))
+                    })?;
+                let w0 = values
+                    .get(w0_input)
+                    .or_else(|| self.weights.get(w0_input))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused MulSinPowMulAdd: w0 '{}' not found",
+                            w0_input
+                        ))
+                    })?;
+                let w1 = values
+                    .get(w1_input)
+                    .or_else(|| self.weights.get(w1_input))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused MulSinPowMulAdd: w1 '{}' not found",
+                            w1_input
+                        ))
+                    })?;
+                let b = values
+                    .get(b_input)
+                    .or_else(|| self.weights.get(b_input))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused MulSinPowMulAdd: b '{}' not found",
+                            b_input
+                        ))
+                    })?;
+                let p_tensor = values
+                    .get(p_input)
+                    .or_else(|| self.weights.get(p_input))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused MulSinPowMulAdd: p '{}' not found",
+                            p_input
+                        ))
+                    })?;
+                // p is a scalar exponent — fetch its single value.
+                let p = p_tensor.to_host_f32(&self.ctx)?[0];
+
+                gpu_fused_mul_sin_pow_mul_add(
+                    &self.ctx,
+                    &self.fused_kernels,
+                    &mut pool,
+                    x,
+                    w0,
+                    w1,
+                    b,
+                    p,
+                )
             }
         }
     }
@@ -3134,6 +2642,9 @@ impl GpuGraphExecutor {
                     FusedPattern::DivMul { output_name, .. } => {
                         values.insert(output_name.clone(), output);
                     }
+                    FusedPattern::MulSinPowMulAdd { output_name, .. } => {
+                        values.insert(output_name.clone(), output);
+                    }
                 }
                 continue;
             }
@@ -3591,6 +3102,7 @@ impl GpuGraphExecutor {
                     FusedPattern::AddMul { output_name, .. } => output_name.clone(),
                     FusedPattern::SubMul { output_name, .. } => output_name.clone(),
                     FusedPattern::DivMul { output_name, .. } => output_name.clone(),
+                    FusedPattern::MulSinPowMulAdd { output_name, .. } => output_name.clone(),
                 };
 
                 // Validate fused output
@@ -3856,6 +3368,7 @@ impl GpuGraphExecutor {
                     FusedPattern::AddMul { output_name, .. } => output_name.clone(),
                     FusedPattern::SubMul { output_name, .. } => output_name.clone(),
                     FusedPattern::DivMul { output_name, .. } => output_name.clone(),
+                    FusedPattern::MulSinPowMulAdd { output_name, .. } => output_name.clone(),
                 };
 
                 // Capture checkpoint
@@ -4681,6 +4194,10 @@ impl GpuGraphExecutor {
                     FusedPattern::DivMul { output_name, .. } => {
                         values.insert(output_name.clone(), output);
                         "Fused_DivMul"
+                    }
+                    FusedPattern::MulSinPowMulAdd { output_name, .. } => {
+                        values.insert(output_name.clone(), output);
+                        "Fused_MulSinPowMulAdd"
                     }
                 };
 

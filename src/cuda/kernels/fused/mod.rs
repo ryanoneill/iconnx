@@ -9,14 +9,22 @@
 //! - add_sqrt_div: y / sqrt(x + eps) - normalization denominator (65 occurrences)
 //! - add_mul_add: (x + a) * b + c - affine transform (73 occurrences)
 //! - gelu: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) - GELU activation (12 occurrences)
+//!
+//! This module is split across two files:
+//! - `mod.rs` (this file): the `FusedKernelCache` struct, the CUDA source
+//!   raw string, the kernel name list, and shared helpers used by the host
+//!   wrappers (`elementwise_config`, `compute_broadcast_stride`).
+//! - `wrappers.rs`: the `gpu_fused_*` host wrapper functions, re-exported
+//!   through `pub use wrappers::*` so external callers see a flat namespace.
 
 use crate::cuda::context::{CudaError, IconnxCudaContext};
-use crate::cuda::memory_pool::GpuMemoryPool;
-use crate::cuda::tensor::GpuTensor;
-use cudarc::driver::{CudaFunction, CudaModule, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, CudaModule, LaunchConfig};
 use cudarc::nvrtc::compile_ptx;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+pub(super) mod wrappers;
+pub use wrappers::*;
 
 /// Cache for fused kernels
 pub struct FusedKernelCache {
@@ -72,6 +80,11 @@ const FUSED_KERNEL_NAMES: &[&str] = &[
     "fused_sub_mul_kernel",
     // Div-Mul: y = (a / b) * c (fused div-multiply)
     "fused_div_mul_kernel",
+    // Mul-Sin-Pow-Mul-Add: y = sin(x * w0)^p * w1 + b
+    // Vocoder periodic activation (48 occurrences in Kokoro)
+    "fused_mul_sin_pow_mul_add_kernel",
+    "fused_mul_sin_pow_mul_add_broadcast_kernel",
+    "fused_mul_sin_pow_mul_add_per_channel_scale_kernel",
 ];
 
 /// CUDA source for fused kernels
@@ -269,94 +282,123 @@ extern "C" __global__ void fused_div_mul_kernel(
         out[i] = (a[i] / b[i]) * c[i];
     }
 }
+
+// ============================================================================
+// Fused mul_sin_pow_mul_add: y = sin(x * w0)^p * w1 + b
+// Vocoder periodic activation (48 occurrences in Kokoro)
+// Replaces: Mul -> Sin -> Pow -> Mul -> Add
+// ============================================================================
+
+// The host wrapper refuses fractional exponents, so only the integer
+// squaring loop is reachable here; `p` is always an integer value stored
+// in f32.
+extern "C" __global__ void fused_mul_sin_pow_mul_add_kernel(
+    float* out,
+    const float* x,
+    const float* w0,
+    const float* w1,
+    const float* b,
+    float p,
+    size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float s = sinf(x[i] * w0[i]);
+        // Integer exponent path: handles negative bases correctly.
+        int ip = (int) p;
+        float pow_val = 1.0f;
+        float base = s;
+        int exp = ip < 0 ? -ip : ip;
+        while (exp > 0) {
+            if (exp & 1) pow_val *= base;
+            base *= base;
+            exp >>= 1;
+        }
+        if (ip < 0) pow_val = 1.0f / pow_val;
+        out[i] = pow_val * w1[i] + b[i];
+    }
+}
+
+// Broadcast variant: w0, w1, and b may broadcast along the leading dimension
+// (they have shape [1, C] while x has shape [N, C]).
+// broadcast_stride is the number of elements per broadcast row (e.g., C when
+// broadcasting [1, C] over [N, C]).
+// Same integer-only exponent contract as the same-shape kernel above:
+// the host wrapper guarantees `p` is an integer value stored in f32.
+extern "C" __global__ void fused_mul_sin_pow_mul_add_broadcast_kernel(
+    float* out,
+    const float* x,
+    const float* w0,
+    const float* w1,
+    const float* b,
+    float p,
+    size_t n,
+    size_t broadcast_stride
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        size_t bi = i % broadcast_stride;
+        float s = sinf(x[i] * w0[bi]);
+        int ip = (int) p;
+        float pow_val = 1.0f;
+        float base = s;
+        int exp = ip < 0 ? -ip : ip;
+        while (exp > 0) {
+            if (exp & 1) pow_val *= base;
+            base *= base;
+            exp >>= 1;
+        }
+        if (ip < 0) pow_val = 1.0f / pow_val;
+        out[i] = pow_val * w1[bi] + b[bi];
+    }
+}
+
+// Per-channel-scale broadcast variant:
+//   x  is per-channel scalar, shape [..., C, 1]  (small_total = C)
+//   w0 is full shape,         shape [..., C, K]  (full_total  = C*K)
+//   w1 is per-channel scalar, shape [..., C, 1]
+//   b  is full shape,         shape [..., C, K]
+//
+// Each output element [i] (in flat row-major layout of the full shape)
+// uses x[i / k_dim] and w1[i / k_dim] (broadcast over the trailing
+// dim), and w0[i], b[i] at full index.
+//
+// `k_dim` is the size of the trailing dimension (the one being broadcast
+// over). `n` is the total output element count (= small_total * k_dim).
+extern "C" __global__ void fused_mul_sin_pow_mul_add_per_channel_scale_kernel(
+    float* out,
+    const float* x,
+    const float* w0,
+    const float* w1,
+    const float* b,
+    float p,
+    size_t n,
+    size_t k_dim
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        size_t chan_idx = i / k_dim;
+        float s = sinf(x[chan_idx] * w0[i]);
+        // Integer exponentiation by squaring. p is guaranteed to be an
+        // integer by the host guard before this kernel is invoked.
+        int ip = (int) p;
+        float pow_val = 1.0f;
+        float base = s;
+        int exp = ip < 0 ? -ip : ip;
+        while (exp > 0) {
+            if (exp & 1) pow_val *= base;
+            base *= base;
+            exp >>= 1;
+        }
+        if (ip < 0) pow_val = 1.0f / pow_val;
+        out[i] = pow_val * w1[chan_idx] + b[i];
+    }
+}
 "#;
 
 /// Compute optimal launch configuration for elementwise operations
-fn elementwise_config(n: usize) -> LaunchConfig {
+pub(super) fn elementwise_config(n: usize) -> LaunchConfig {
     LaunchConfig::for_num_elems(n as u32)
-}
-
-// ============================================================================
-// Fused operation implementations
-// ============================================================================
-
-/// GPU fused div_rsqrt: out = numerator / sqrt(variance + eps)
-/// Replaces Add -> Sqrt -> Div pattern
-/// Supports broadcasting when variance has trailing 1 dimensions
-pub fn gpu_fused_div_rsqrt(
-    ctx: &IconnxCudaContext,
-    cache: &FusedKernelCache,
-    pool: &mut GpuMemoryPool,
-    numerator: &GpuTensor,
-    variance: &GpuTensor,
-    eps: f32,
-) -> Result<GpuTensor, CudaError> {
-    // Check if shapes match or if broadcasting is possible
-    let num_shape = numerator.shape();
-    let var_shape = variance.shape();
-
-    // Simple case: shapes match
-    if num_shape == var_shape {
-        let n = numerator.len();
-        let mut out = pool.get_tensor_f32(ctx, numerator.shape().to_vec())?;
-
-        let func = cache
-            .get("fused_div_rsqrt_scalar_eps_kernel")
-            .ok_or_else(|| {
-                CudaError::Kernel("fused_div_rsqrt_scalar_eps_kernel not found".into())
-            })?;
-
-        unsafe {
-            ctx.stream()
-                .launch_builder(func)
-                .arg(out.data_f32_mut()?)
-                .arg(numerator.data_f32()?)
-                .arg(variance.data_f32()?)
-                .arg(&eps)
-                .arg(&n)
-                .launch(elementwise_config(n))
-                .map_err(|e| CudaError::Kernel(format!("fused_div_rsqrt launch failed: {}", e)))?;
-        }
-
-        return Ok(out);
-    }
-
-    // Broadcasting case: check if variance can be broadcast to numerator shape
-    // Supported pattern: variance has trailing 1 dimensions that broadcast to numerator
-    // e.g., numerator [1, 512, 5], variance [1, 512, 1] -> broadcast last dim
-    if let Some(variance_stride) = compute_broadcast_stride(num_shape, var_shape) {
-        let n = numerator.len();
-        let mut out = pool.get_tensor_f32(ctx, numerator.shape().to_vec())?;
-
-        let func = cache
-            .get("fused_div_rsqrt_broadcast_kernel")
-            .ok_or_else(|| {
-                CudaError::Kernel("fused_div_rsqrt_broadcast_kernel not found".into())
-            })?;
-
-        unsafe {
-            ctx.stream()
-                .launch_builder(func)
-                .arg(out.data_f32_mut()?)
-                .arg(numerator.data_f32()?)
-                .arg(variance.data_f32()?)
-                .arg(&eps)
-                .arg(&n)
-                .arg(&variance_stride)
-                .launch(elementwise_config(n))
-                .map_err(|e| {
-                    CudaError::Kernel(format!("fused_div_rsqrt_broadcast launch failed: {}", e))
-                })?;
-        }
-
-        return Ok(out);
-    }
-
-    // Unsupported broadcast pattern
-    Err(CudaError::Kernel(format!(
-        "fused_div_rsqrt: unsupported broadcast {:?} vs {:?}",
-        num_shape, var_shape
-    )))
 }
 
 /// Compute the broadcast stride for last-dimension broadcasting.
@@ -366,7 +408,7 @@ pub fn gpu_fused_div_rsqrt(
 ///
 /// The simple stride formula (i / stride) only works when broadcast dimensions
 /// are contiguous at the trailing end of the shape.
-fn compute_broadcast_stride(num_shape: &[usize], var_shape: &[usize]) -> Option<usize> {
+pub(super) fn compute_broadcast_stride(num_shape: &[usize], var_shape: &[usize]) -> Option<usize> {
     // Must have same number of dimensions
     if num_shape.len() != var_shape.len() {
         return None;
@@ -406,261 +448,11 @@ fn compute_broadcast_stride(num_shape: &[usize], var_shape: &[usize]) -> Option<
     }
 }
 
-/// GPU fused add_mul_add: out = (x + a) * b + c
-/// Replaces Add -> Mul -> Add pattern
-pub fn gpu_fused_add_mul_add(
-    ctx: &IconnxCudaContext,
-    cache: &FusedKernelCache,
-    pool: &mut GpuMemoryPool,
-    x: &GpuTensor,
-    a: &GpuTensor,
-    b: &GpuTensor,
-    c: &GpuTensor,
-) -> Result<GpuTensor, CudaError> {
-    let n = x.len();
-
-    // Check if a is scalar (broadcast case)
-    if a.len() == 1 {
-        // Use scalar version - need to read scalar value from GPU
-        // For now, use tensor version with broadcasting handled at caller
-    }
-
-    // All shapes must match for the simple case
-    if x.shape() != a.shape() || x.shape() != b.shape() || x.shape() != c.shape() {
-        return Err(CudaError::Kernel(format!(
-            "fused_add_mul_add: shape mismatch x={:?} a={:?} b={:?} c={:?}",
-            x.shape(),
-            a.shape(),
-            b.shape(),
-            c.shape()
-        )));
-    }
-
-    let mut out = pool.get_tensor_f32(ctx, x.shape().to_vec())?;
-
-    let func = cache
-        .get("fused_add_mul_add_kernel")
-        .ok_or_else(|| CudaError::Kernel("fused_add_mul_add_kernel not found".into()))?;
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(x.data_f32()?)
-            .arg(a.data_f32()?)
-            .arg(b.data_f32()?)
-            .arg(c.data_f32()?)
-            .arg(&n)
-            .launch(elementwise_config(n))
-            .map_err(|e| CudaError::Kernel(format!("fused_add_mul_add launch failed: {}", e)))?;
-    }
-
-    Ok(out)
-}
-
-/// GPU fused GELU: out = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-/// Replaces full GELU activation pattern (8 ops -> 1)
-pub fn gpu_fused_gelu(
-    ctx: &IconnxCudaContext,
-    cache: &FusedKernelCache,
-    pool: &mut GpuMemoryPool,
-    x: &GpuTensor,
-) -> Result<GpuTensor, CudaError> {
-    let n = x.len();
-    let mut out = pool.get_tensor_f32(ctx, x.shape().to_vec())?;
-
-    let func = cache
-        .get("fused_gelu_kernel")
-        .ok_or_else(|| CudaError::Kernel("fused_gelu_kernel not found".into()))?;
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(x.data_f32()?)
-            .arg(&n)
-            .launch(elementwise_config(n))
-            .map_err(|e| CudaError::Kernel(format!("fused_gelu launch failed: {}", e)))?;
-    }
-
-    Ok(out)
-}
-
-/// GPU fused mul_add: out = a * b + c
-/// Replaces Mul -> Add pattern (reduces kernel launches)
-pub fn gpu_fused_mul_add(
-    ctx: &IconnxCudaContext,
-    cache: &FusedKernelCache,
-    pool: &mut GpuMemoryPool,
-    a: &GpuTensor,
-    b: &GpuTensor,
-    c: &GpuTensor,
-) -> Result<GpuTensor, CudaError> {
-    let n = a.len();
-
-    // Shapes must match for elementwise operation
-    if a.shape() != b.shape() || a.shape() != c.shape() {
-        return Err(CudaError::Kernel(format!(
-            "fused_mul_add: shape mismatch a={:?} b={:?} c={:?}",
-            a.shape(),
-            b.shape(),
-            c.shape()
-        )));
-    }
-
-    let mut out = pool.get_tensor_f32(ctx, a.shape().to_vec())?;
-
-    let func = cache
-        .get("fused_mul_add_kernel")
-        .ok_or_else(|| CudaError::Kernel("fused_mul_add_kernel not found".into()))?;
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(a.data_f32()?)
-            .arg(b.data_f32()?)
-            .arg(c.data_f32()?)
-            .arg(&n)
-            .launch(elementwise_config(n))
-            .map_err(|e| CudaError::Kernel(format!("fused_mul_add launch failed: {}", e)))?;
-    }
-
-    Ok(out)
-}
-
-/// GPU fused add_mul: out = (a + b) * c
-/// Replaces Add -> Mul pattern (reduces kernel launches)
-pub fn gpu_fused_add_mul(
-    ctx: &IconnxCudaContext,
-    cache: &FusedKernelCache,
-    pool: &mut GpuMemoryPool,
-    a: &GpuTensor,
-    b: &GpuTensor,
-    c: &GpuTensor,
-) -> Result<GpuTensor, CudaError> {
-    let n = a.len();
-
-    // Shapes must match for elementwise operation
-    if a.shape() != b.shape() || a.shape() != c.shape() {
-        return Err(CudaError::Kernel(format!(
-            "fused_add_mul: shape mismatch a={:?} b={:?} c={:?}",
-            a.shape(),
-            b.shape(),
-            c.shape()
-        )));
-    }
-
-    let mut out = pool.get_tensor_f32(ctx, a.shape().to_vec())?;
-
-    let func = cache
-        .get("fused_add_mul_kernel")
-        .ok_or_else(|| CudaError::Kernel("fused_add_mul_kernel not found".into()))?;
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(a.data_f32()?)
-            .arg(b.data_f32()?)
-            .arg(c.data_f32()?)
-            .arg(&n)
-            .launch(elementwise_config(n))
-            .map_err(|e| CudaError::Kernel(format!("fused_add_mul launch failed: {}", e)))?;
-    }
-
-    Ok(out)
-}
-
-/// GPU fused sub_mul: out = (a - b) * c
-/// Replaces Sub -> Mul pattern (reduces kernel launches)
-pub fn gpu_fused_sub_mul(
-    ctx: &IconnxCudaContext,
-    cache: &FusedKernelCache,
-    pool: &mut GpuMemoryPool,
-    a: &GpuTensor,
-    b: &GpuTensor,
-    c: &GpuTensor,
-) -> Result<GpuTensor, CudaError> {
-    let n = a.len();
-
-    // Shapes must match for elementwise operation
-    if a.shape() != b.shape() || a.shape() != c.shape() {
-        return Err(CudaError::Kernel(format!(
-            "fused_sub_mul: shape mismatch a={:?} b={:?} c={:?}",
-            a.shape(),
-            b.shape(),
-            c.shape()
-        )));
-    }
-
-    let mut out = pool.get_tensor_f32(ctx, a.shape().to_vec())?;
-
-    let func = cache
-        .get("fused_sub_mul_kernel")
-        .ok_or_else(|| CudaError::Kernel("fused_sub_mul_kernel not found".into()))?;
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(a.data_f32()?)
-            .arg(b.data_f32()?)
-            .arg(c.data_f32()?)
-            .arg(&n)
-            .launch(elementwise_config(n))
-            .map_err(|e| CudaError::Kernel(format!("fused_sub_mul launch failed: {}", e)))?;
-    }
-
-    Ok(out)
-}
-
-/// GPU fused div_mul: out = (a / b) * c
-/// Replaces Div -> Mul pattern (reduces kernel launches)
-pub fn gpu_fused_div_mul(
-    ctx: &IconnxCudaContext,
-    cache: &FusedKernelCache,
-    pool: &mut GpuMemoryPool,
-    a: &GpuTensor,
-    b: &GpuTensor,
-    c: &GpuTensor,
-) -> Result<GpuTensor, CudaError> {
-    let n = a.len();
-
-    // Shapes must match for elementwise operation
-    if a.shape() != b.shape() || a.shape() != c.shape() {
-        return Err(CudaError::Kernel(format!(
-            "fused_div_mul: shape mismatch a={:?} b={:?} c={:?}",
-            a.shape(),
-            b.shape(),
-            c.shape()
-        )));
-    }
-
-    let mut out = pool.get_tensor_f32(ctx, a.shape().to_vec())?;
-
-    let func = cache
-        .get("fused_div_mul_kernel")
-        .ok_or_else(|| CudaError::Kernel("fused_div_mul_kernel not found".into()))?;
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(a.data_f32()?)
-            .arg(b.data_f32()?)
-            .arg(c.data_f32()?)
-            .arg(&n)
-            .launch(elementwise_config(n))
-            .map_err(|e| CudaError::Kernel(format!("fused_div_mul launch failed: {}", e)))?;
-    }
-
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cuda::memory_pool::GpuMemoryPool;
+    use crate::cuda::tensor::GpuTensor;
 
     fn setup() -> (IconnxCudaContext, FusedKernelCache, GpuMemoryPool) {
         let ctx = IconnxCudaContext::new().expect("Failed to create CUDA context");

@@ -9,7 +9,7 @@ mod context;
 mod conv;
 pub mod cudnn;
 pub mod cufft;
-mod inference;
+pub mod inference;
 mod kernels;
 mod lstm;
 mod matmul;
@@ -67,6 +67,12 @@ pub use kernels::{
     gpu_sub,
     gpu_tanh,
     KernelCache,
+};
+#[allow(unused_imports)]
+pub use kernels::fused::{
+    gpu_fused_add_mul, gpu_fused_add_mul_add, gpu_fused_div_mul, gpu_fused_div_rsqrt,
+    gpu_fused_gelu, gpu_fused_mul_add, gpu_fused_mul_sin_pow_mul_add, gpu_fused_sub_mul,
+    FusedKernelCache,
 };
 #[allow(unused_imports)]
 pub use lstm::{gpu_lstm, LstmKernelCache};
