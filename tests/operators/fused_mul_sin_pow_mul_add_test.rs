@@ -161,3 +161,50 @@ fn rejects_non_per_channel_shape_mismatch() {
         err_msg
     );
 }
+
+#[test]
+fn odd_exponent_p3_preserves_sign() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+    let elem_cache = KernelCache::new(&ctx).expect("KernelCache");
+    let fused_cache = FusedKernelCache::new(&ctx).expect("FusedKernelCache");
+    let mut pool = GpuMemoryPool::new();
+
+    // Deliberately choose inputs so that x * w0 lands in regions where
+    // sin() is negative (values near 3pi/2 ~= 4.712). Then raising to an
+    // odd exponent must preserve the negative sign -- CUDA powf(neg, 3)
+    // returns NaN by default, which is the bug this test guards.
+    let shape = vec![2, 6];
+    let n = 2 * 6;
+    // x in [4.0, 5.1] produces sin values spanning the negative trough
+    // between pi and 2*pi.
+    let x_data: Vec<f32> = (0..n).map(|i| 4.0 + 0.1 * i as f32).collect();
+    // w0 = 1.0 everywhere so x * w0 == x.
+    let w0_data: Vec<f32> = vec![1.0; n];
+    let w1_data: Vec<f32> = (0..n).map(|i| 1.0 + 0.01 * i as f32).collect();
+    let b_data: Vec<f32> = (0..n).map(|i| 0.01 * i as f32).collect();
+
+    let x = upload(&ctx, x_data, shape.clone());
+    let w0 = upload(&ctx, w0_data, shape.clone());
+    let w1 = upload(&ctx, w1_data, shape.clone());
+    let b = upload(&ctx, b_data, shape);
+    let p: f32 = 3.0;
+
+    let reference =
+        unfused_reference(&ctx, &elem_cache, &mut pool, &x, &w0, &w1, &b, p);
+    let fused = gpu_fused_mul_sin_pow_mul_add(
+        &ctx, &fused_cache, &mut pool, &x, &w0, &w1, &b, p,
+    )
+    .expect("gpu_fused_mul_sin_pow_mul_add p=3");
+
+    // Sanity check: at least one reference output should be strictly
+    // negative, otherwise the test isn't actually exercising the
+    // sign-handling path.
+    let ref_host = reference.to_host_f32(&ctx).expect("to_host reference");
+    assert!(
+        ref_host.iter().any(|&v| v < -1e-3),
+        "test inputs don't produce negative values -- strengthen them. Got: {:?}",
+        ref_host
+    );
+
+    assert_close(&ctx, &fused, &reference, 1e-5);
+}
