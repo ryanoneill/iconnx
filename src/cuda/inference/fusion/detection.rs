@@ -24,7 +24,7 @@ use crate::cuda::tensor::GpuTensor;
 /// from weight tensors during exponent validation (GELU's `Pow` exponent
 /// must be exactly 3.0). It is not used for any GPU computation during
 /// detection.
-pub(in crate::cuda::inference) fn detect_fused_patterns(
+pub(crate) fn detect_fused_patterns(
     nodes: &[ExecutionNode],
     weights: &HashMap<String, GpuTensor>,
     ctx: &IconnxCudaContext,
@@ -528,6 +528,142 @@ pub(in crate::cuda::inference) fn detect_fused_patterns(
                 fused_patterns.insert(node.name.clone(), pattern_info);
             }
         }
+    }
+
+    // Detect Mul -> Sin -> Pow -> Mul -> Add pattern
+    // (vocoder periodic activation: y = sin(x * w0)^p * w1 + b).
+    //
+    // Requirements:
+    //  - All intermediate outputs (head Mul, Sin, Pow, tail Mul) must be
+    //    single-use so the fused kernel is a safe drop-in replacement.
+    //  - No node in the chain may already belong to another pattern.
+    //  - The Pow exponent must be a scalar integer constant in the
+    //    weights map. Fractional exponents are rejected because the
+    //    fused kernel's integer squaring loop is the only supported
+    //    exponent path (Task B phase).
+    for node in nodes {
+        if node.op_type != "Mul" {
+            continue;
+        }
+        if nodes_to_skip.contains(&node.name) {
+            continue;
+        }
+        if node.inputs.len() < 2 {
+            continue;
+        }
+
+        let head_mul_output = &node.outputs[0];
+        if output_uses.get(head_mul_output.as_str()) != Some(&1) {
+            continue;
+        }
+
+        // Step 1: Sin consuming head Mul's output.
+        let sin_node = output_to_node
+            .iter()
+            .find(|(_, n)| {
+                n.op_type == "Sin"
+                    && !nodes_to_skip.contains(&n.name)
+                    && n.inputs.contains(head_mul_output)
+            })
+            .map(|(_, n)| *n);
+        let Some(sin_node) = sin_node else { continue };
+        let sin_output = &sin_node.outputs[0];
+        if output_uses.get(sin_output.as_str()) != Some(&1) {
+            continue;
+        }
+
+        // Step 2: Pow consuming Sin's output; exponent must be a scalar
+        // integer constant in the weights map.
+        let pow_node = output_to_node
+            .iter()
+            .find(|(_, n)| {
+                n.op_type == "Pow"
+                    && !nodes_to_skip.contains(&n.name)
+                    && n.inputs.len() >= 2
+                    && n.inputs[0] == *sin_output
+            })
+            .map(|(_, n)| *n);
+        let Some(pow_node) = pow_node else { continue };
+        let pow_output = &pow_node.outputs[0];
+        if output_uses.get(pow_output.as_str()) != Some(&1) {
+            continue;
+        }
+        let p_input = &pow_node.inputs[1];
+        let p_is_integer_scalar_weight = weights.get(p_input).is_some_and(|t| {
+            if t.len() != 1 {
+                return false;
+            }
+            match t.to_host_f32(ctx) {
+                Ok(data) => data[0].fract() == 0.0,
+                Err(_) => false,
+            }
+        });
+        if !p_is_integer_scalar_weight {
+            continue;
+        }
+
+        // Step 3: Tail Mul consuming Pow's output. Its other operand is w1.
+        let tail_mul = output_to_node
+            .iter()
+            .find(|(_, n)| {
+                n.op_type == "Mul"
+                    && !nodes_to_skip.contains(&n.name)
+                    && n.inputs.contains(pow_output)
+            })
+            .map(|(_, n)| *n);
+        let Some(tail_mul_node) = tail_mul else { continue };
+        let tail_mul_output = &tail_mul_node.outputs[0];
+        if output_uses.get(tail_mul_output.as_str()) != Some(&1) {
+            continue;
+        }
+        let w1_input = if tail_mul_node.inputs[0] == *pow_output {
+            tail_mul_node.inputs[1].clone()
+        } else {
+            tail_mul_node.inputs[0].clone()
+        };
+
+        // Step 4: Add consuming tail Mul's output. Other operand is b.
+        let bias_add = output_to_node
+            .iter()
+            .find(|(_, n)| {
+                n.op_type == "Add"
+                    && !nodes_to_skip.contains(&n.name)
+                    && n.inputs.contains(tail_mul_output)
+            })
+            .map(|(_, n)| *n);
+        let Some(bias_add_node) = bias_add else { continue };
+        let b_input = if bias_add_node.inputs[0] == *tail_mul_output {
+            bias_add_node.inputs[1].clone()
+        } else {
+            bias_add_node.inputs[0].clone()
+        };
+
+        // Identify x and w0 (the two inputs to the head Mul).
+        let (x_input, w0_input) = (node.inputs[0].clone(), node.inputs[1].clone());
+
+        // Commit: register the pattern and mark interior nodes as skip.
+        let pattern_info = FusedPatternInfo {
+            pattern: FusedPattern::MulSinPowMulAdd {
+                x_input,
+                w0_input,
+                w1_input,
+                b_input,
+                p_input: p_input.clone(),
+                output_name: bias_add_node.outputs[0].clone(),
+            },
+            nodes_to_skip: vec![
+                sin_node.name.clone(),
+                pow_node.name.clone(),
+                tail_mul_node.name.clone(),
+                bias_add_node.name.clone(),
+            ],
+            head_node: node.name.clone(),
+        };
+
+        for skip_name in &pattern_info.nodes_to_skip {
+            nodes_to_skip.insert(skip_name.clone());
+        }
+        fused_patterns.insert(node.name.clone(), pattern_info);
     }
 
     // NOTE: Transpose absorption into MatMul (trans_a/trans_b flags) is a potential

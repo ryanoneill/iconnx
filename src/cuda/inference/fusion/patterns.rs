@@ -68,6 +68,22 @@ pub enum FusedPattern {
         c_input: String,
         output_name: String,
     },
+    /// Mul -> Sin -> Pow -> Mul -> Add: y = sin(x * w0)^p * w1 + b
+    ///
+    /// Vocoder periodic activation (appears 48 times in Kokoro). The
+    /// exponent `p` is always a scalar integer constant in the weight
+    /// map; non-integer exponents are rejected during detection because
+    /// the fused kernel's integer squaring loop is the only supported
+    /// exponent path.
+    MulSinPowMulAdd {
+        x_input: String,
+        w0_input: String,
+        w1_input: String,
+        b_input: String,
+        /// Name of the weight tensor holding the scalar exponent.
+        p_input: String,
+        output_name: String,
+    },
 }
 
 /// Information about a detected fused pattern

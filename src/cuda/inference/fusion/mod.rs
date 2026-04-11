@@ -10,8 +10,8 @@
 //! without a live CUDA context. Execution stays in `inference/mod.rs`
 //! because it needs the executor's kernel caches and stream.
 
-pub(super) mod patterns;
-pub(super) mod detection;
+pub(crate) mod patterns;
+pub(crate) mod detection;
 
-pub(super) use patterns::{FusedPattern, FusedPatternInfo};
-pub(super) use detection::detect_fused_patterns;
+pub use patterns::{FusedPattern, FusedPatternInfo};
+pub(crate) use detection::detect_fused_patterns;

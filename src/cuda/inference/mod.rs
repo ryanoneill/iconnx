@@ -43,7 +43,8 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
-mod fusion;
+pub mod fusion;
+pub mod testing;
 
 use self::fusion::{FusedPattern, FusedPatternInfo};
 
@@ -226,32 +227,40 @@ pub struct GpuGraphExecutor {
     validator: RefCell<Option<super::validation::TensorValidator>>,
 }
 
-/// Pre-computed Slice parameters extracted at graph construction time
+/// Pre-computed Slice parameters extracted at graph construction time.
 /// When Slice inputs (starts, ends, axes, steps) come from initializers,
-/// we can extract their values once and avoid D2H transfers entirely
+/// we can extract their values once and avoid D2H transfers entirely.
+///
+/// Widened to `pub(crate)` so `ExecutionNode` (also `pub(crate)`) does
+/// not leak a less-visible field type.
 #[derive(Clone, Debug, Default)]
-pub(in crate::cuda::inference) struct PrecomputedSlice {
+pub(crate) struct PrecomputedSlice {
     /// Pre-computed starts values (if input is an initializer)
-    pub(in crate::cuda::inference) starts: Option<Vec<i64>>,
+    pub(crate) starts: Option<Vec<i64>>,
     /// Pre-computed ends values (if input is an initializer)
-    pub(in crate::cuda::inference) ends: Option<Vec<i64>>,
+    pub(crate) ends: Option<Vec<i64>>,
     /// Pre-computed axes values (if input is an initializer)
-    pub(in crate::cuda::inference) axes: Option<Vec<i64>>,
+    pub(crate) axes: Option<Vec<i64>>,
     /// Pre-computed steps values (if input is an initializer)
-    pub(in crate::cuda::inference) steps: Option<Vec<i64>>,
+    pub(crate) steps: Option<Vec<i64>>,
 }
 
-/// A node in the execution graph (fields used in future graph execution)
+/// A node in the execution graph (fields used in future graph execution).
+///
+/// Visibility is `pub(crate)` so `cuda::inference::fusion::detection` and
+/// the sibling `cuda::inference::testing` module can construct and read
+/// these nodes. No production code outside `cuda::inference` touches
+/// this type.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-pub(in crate::cuda::inference) struct ExecutionNode {
-    pub(in crate::cuda::inference) name: String,
-    pub(in crate::cuda::inference) op_type: String,
-    pub(in crate::cuda::inference) inputs: Vec<String>,
-    pub(in crate::cuda::inference) outputs: Vec<String>,
-    pub(in crate::cuda::inference) attributes: NodeAttributes,
+pub(crate) struct ExecutionNode {
+    pub(crate) name: String,
+    pub(crate) op_type: String,
+    pub(crate) inputs: Vec<String>,
+    pub(crate) outputs: Vec<String>,
+    pub(crate) attributes: NodeAttributes,
     /// Pre-computed Slice parameters (only for Slice nodes with constant inputs)
-    pub(in crate::cuda::inference) precomputed_slice: Option<PrecomputedSlice>,
+    pub(crate) precomputed_slice: Option<PrecomputedSlice>,
 }
 
 impl GpuGraphExecutor {
@@ -686,6 +695,15 @@ impl GpuGraphExecutor {
                     })?;
 
                 gpu_fused_div_mul(&self.ctx, &self.fused_kernels, &mut pool, a, b, c)
+            }
+            FusedPattern::MulSinPowMulAdd { .. } => {
+                // Dispatch for this pattern lands in Task D1+D2. Detection
+                // can register the pattern, but until execution is wired
+                // the executor must fall back with a clear error if a
+                // graph containing this chain is actually run on GPU.
+                Err(CudaError::Kernel(
+                    "Fused MulSinPowMulAdd dispatch not yet wired (Task D1+D2)".into(),
+                ))
             }
         }
     }
@@ -2565,6 +2583,9 @@ impl GpuGraphExecutor {
                     FusedPattern::DivMul { output_name, .. } => {
                         values.insert(output_name.clone(), output);
                     }
+                    FusedPattern::MulSinPowMulAdd { output_name, .. } => {
+                        values.insert(output_name.clone(), output);
+                    }
                 }
                 continue;
             }
@@ -3022,6 +3043,7 @@ impl GpuGraphExecutor {
                     FusedPattern::AddMul { output_name, .. } => output_name.clone(),
                     FusedPattern::SubMul { output_name, .. } => output_name.clone(),
                     FusedPattern::DivMul { output_name, .. } => output_name.clone(),
+                    FusedPattern::MulSinPowMulAdd { output_name, .. } => output_name.clone(),
                 };
 
                 // Validate fused output
@@ -3287,6 +3309,7 @@ impl GpuGraphExecutor {
                     FusedPattern::AddMul { output_name, .. } => output_name.clone(),
                     FusedPattern::SubMul { output_name, .. } => output_name.clone(),
                     FusedPattern::DivMul { output_name, .. } => output_name.clone(),
+                    FusedPattern::MulSinPowMulAdd { output_name, .. } => output_name.clone(),
                 };
 
                 // Capture checkpoint
@@ -4112,6 +4135,10 @@ impl GpuGraphExecutor {
                     FusedPattern::DivMul { output_name, .. } => {
                         values.insert(output_name.clone(), output);
                         "Fused_DivMul"
+                    }
+                    FusedPattern::MulSinPowMulAdd { output_name, .. } => {
+                        values.insert(output_name.clone(), output);
+                        "Fused_MulSinPowMulAdd"
                     }
                 };
 

@@ -9,7 +9,7 @@ mod context;
 mod conv;
 pub mod cudnn;
 pub mod cufft;
-mod inference;
+pub mod inference;
 mod kernels;
 mod lstm;
 mod matmul;
