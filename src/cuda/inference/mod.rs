@@ -2155,7 +2155,13 @@ impl GpuGraphExecutor {
                 let input_shape = inputs[0].shape();
                 let input_len = inputs[0].len();
 
-                let shape_data: Vec<i64> = if let Some(shape_attr) = attributes.get_ints("shape") {
+                // Precomputation path (Cycle 2): if the shape was resolved at
+                // graph-build time, use those values directly. The `0`/`-1`
+                // resolution further down still runs because it depends on
+                // the runtime input_shape.
+                let shape_data: Vec<i64> = if let Some(precomp) = precomputed.reshape_shape {
+                    precomp.clone()
+                } else if let Some(shape_attr) = attributes.get_ints("shape") {
                     shape_attr.to_vec()
                 } else if inputs.len() > 1 {
                     // Get shape from cache or fetch via D2H (avoids device_ptr() overhead)

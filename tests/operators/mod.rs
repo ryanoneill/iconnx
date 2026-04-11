@@ -34,6 +34,7 @@ mod range_test;
 mod reduce_mean_test;
 mod reduce_sum_test;
 mod reduce_test;
+mod reshape_precompute_test;
 mod reshape_test;
 mod resize_test;
 mod round_test;
