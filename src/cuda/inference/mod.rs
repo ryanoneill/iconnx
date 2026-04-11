@@ -472,10 +472,55 @@ impl GpuGraphExecutor {
         outputs: Vec<&str>,
         attributes: NodeAttributes,
     ) {
+        // Cache Int64 values from Constant nodes at graph-build time so
+        // downstream ops (Unsqueeze, Reshape, Squeeze, Slice) can look
+        // them up via `static_i64_cache` during their own add_node calls.
+        //
+        // Without this, the static cache would be empty at add_node time
+        // (no nodes have dispatched yet), so try_precompute_* helpers
+        // would return None for Constant-sourced inputs and precomputation
+        // would never fire.
+        //
+        // The existing runtime caching (inside the execution loop's
+        // Constant branch) stays in place as defense-in-depth: it's a
+        // harmless re-insert of the same value on each run.
+        if op_type == "Constant" {
+            if let Some(value_tensor) = attributes.get_tensor("value") {
+                if let crate::tensor::Tensor::Int64(_) = value_tensor {
+                    let data = value_tensor.as_slice_i64();
+                    if let Some(output_name) = outputs.first() {
+                        self.static_i64_cache
+                            .borrow_mut()
+                            .insert(output_name.to_string(), data.to_vec());
+                    }
+                }
+            }
+        }
+
         // For Slice nodes, try to pre-compute parameters from initializers
         // This avoids D2H transfers entirely for static parameters
         let precomputed_slice = if op_type == "Slice" {
             self.try_precompute_slice_params(&inputs)
+        } else {
+            None
+        };
+
+        // Pre-compute shape/axes parameters for Reshape, Unsqueeze, Squeeze
+        // when their Int64 input is in static_i64_cache (populated either by
+        // add_initializer for weights or by the Constant-caching block
+        // above for Constant nodes added earlier in topological order).
+        let precomputed_reshape_shape = if op_type == "Reshape" {
+            self.try_precompute_reshape_shape(&inputs)
+        } else {
+            None
+        };
+        let precomputed_unsqueeze_axes = if op_type == "Unsqueeze" {
+            self.try_precompute_unsqueeze_axes(&inputs)
+        } else {
+            None
+        };
+        let precomputed_squeeze_axes = if op_type == "Squeeze" {
+            self.try_precompute_squeeze_axes(&inputs)
         } else {
             None
         };
@@ -487,11 +532,9 @@ impl GpuGraphExecutor {
             outputs: outputs.iter().map(|s| s.to_string()).collect(),
             attributes,
             precomputed_slice,
-            // New fields — populated by helpers in Task 2. Initialize to None here
-            // so Task 1 is a pure structural refactor with no behavior change.
-            precomputed_reshape_shape: None,
-            precomputed_unsqueeze_axes: None,
-            precomputed_squeeze_axes: None,
+            precomputed_reshape_shape,
+            precomputed_unsqueeze_axes,
+            precomputed_squeeze_axes,
         });
         // Invalidate topo sort cache when graph structure changes
         *self.sorted_nodes_cache.borrow_mut() = None;
@@ -546,6 +589,49 @@ impl GpuGraphExecutor {
         } else {
             None
         }
+    }
+
+    /// Try to pre-compute Unsqueeze axes from the `static_i64_cache`.
+    /// Returns Some(axes) if `inputs[1]` (the axes input) is present in the
+    /// cache — which happens when the axes come from an initializer or a
+    /// Constant node added earlier in topological order.
+    fn try_precompute_unsqueeze_axes(&self, inputs: &[&str]) -> Option<Vec<i64>> {
+        if inputs.len() < 2 {
+            return None;
+        }
+        let name = inputs[1];
+        if name.is_empty() {
+            return None;
+        }
+        self.static_i64_cache.borrow().get(name).cloned()
+    }
+
+    /// Try to pre-compute Squeeze axes from the `static_i64_cache`.
+    /// Same lookup pattern as `try_precompute_unsqueeze_axes`.
+    fn try_precompute_squeeze_axes(&self, inputs: &[&str]) -> Option<Vec<i64>> {
+        if inputs.len() < 2 {
+            return None;
+        }
+        let name = inputs[1];
+        if name.is_empty() {
+            return None;
+        }
+        self.static_i64_cache.borrow().get(name).cloned()
+    }
+
+    /// Try to pre-compute Reshape shape values from the `static_i64_cache`.
+    /// Returns the raw shape vector; `0`/`-1` resolution happens at runtime
+    /// in the dispatch arm because those semantics depend on the actual
+    /// input tensor's shape.
+    fn try_precompute_reshape_shape(&self, inputs: &[&str]) -> Option<Vec<i64>> {
+        if inputs.len() < 2 {
+            return None;
+        }
+        let name = inputs[1];
+        if name.is_empty() {
+            return None;
+        }
+        self.static_i64_cache.borrow().get(name).cloned()
     }
 
     /// Detect fuseable operator patterns in the graph.
