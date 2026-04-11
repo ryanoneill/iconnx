@@ -245,7 +245,7 @@ pub struct GpuGraphExecutor {
     weights: HashMap<String, GpuTensor>,
 
     /// Execution nodes (same as CPU version)
-    nodes: Vec<ExecutionNode>,
+    pub(crate) nodes: Vec<ExecutionNode>,
 
     /// Cached topological sort order (avoids recomputing ~2.6ms per inference)
     sorted_nodes_cache: RefCell<Option<Vec<ExecutionNode>>>,
@@ -284,6 +284,25 @@ pub(crate) struct PrecomputedSlice {
     pub(crate) steps: Option<Vec<i64>>,
 }
 
+/// Bundle of precomputed node parameters passed to dispatch.
+///
+/// Threaded through `execute_gpu_operator_with_precomputed` as a single
+/// parameter so the function signature doesn't accumulate `Option<&...>`
+/// arguments as new precomputation kinds are added.
+///
+/// Constructed per-call at dispatch time from the corresponding
+/// `ExecutionNode` fields. An all-default instance (via
+/// `NodePrecomputed::default()`) means "no precomputation available" —
+/// all four fields are `None` and dispatch falls back to the existing
+/// runtime paths.
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct NodePrecomputed<'a> {
+    pub(crate) slice: Option<&'a PrecomputedSlice>,
+    pub(crate) reshape_shape: Option<&'a Vec<i64>>,
+    pub(crate) unsqueeze_axes: Option<&'a Vec<i64>>,
+    pub(crate) squeeze_axes: Option<&'a Vec<i64>>,
+}
+
 /// A node in the execution graph (fields used in future graph execution).
 ///
 /// Visibility is `pub(crate)` so `cuda::inference::fusion::detection` and
@@ -300,6 +319,18 @@ pub(crate) struct ExecutionNode {
     pub(crate) attributes: NodeAttributes,
     /// Pre-computed Slice parameters (only for Slice nodes with constant inputs)
     pub(crate) precomputed_slice: Option<PrecomputedSlice>,
+    /// Pre-computed shape vector for Reshape nodes. Raw values from the shape
+    /// input tensor, BEFORE `0`/`-1` resolution (which must happen at runtime
+    /// using the actual input's shape). Populated by
+    /// `try_precompute_reshape_shape` at `add_node` time if the shape input
+    /// is present in `static_i64_cache`.
+    pub(crate) precomputed_reshape_shape: Option<Vec<i64>>,
+    /// Pre-computed axes for Unsqueeze nodes. Populated at `add_node` time
+    /// by `try_precompute_unsqueeze_axes`.
+    pub(crate) precomputed_unsqueeze_axes: Option<Vec<i64>>,
+    /// Pre-computed axes for Squeeze nodes. Populated at `add_node` time by
+    /// `try_precompute_squeeze_axes`.
+    pub(crate) precomputed_squeeze_axes: Option<Vec<i64>>,
 }
 
 impl GpuGraphExecutor {
@@ -441,10 +472,55 @@ impl GpuGraphExecutor {
         outputs: Vec<&str>,
         attributes: NodeAttributes,
     ) {
+        // Cache Int64 values from Constant nodes at graph-build time so
+        // downstream ops (Unsqueeze, Reshape, Squeeze, Slice) can look
+        // them up via `static_i64_cache` during their own add_node calls.
+        //
+        // Without this, the static cache would be empty at add_node time
+        // (no nodes have dispatched yet), so try_precompute_* helpers
+        // would return None for Constant-sourced inputs and precomputation
+        // would never fire.
+        //
+        // The existing runtime caching (inside the execution loop's
+        // Constant branch) stays in place as defense-in-depth: it's a
+        // harmless re-insert of the same value on each run.
+        if op_type == "Constant" {
+            if let Some(value_tensor) = attributes.get_tensor("value") {
+                if let crate::tensor::Tensor::Int64(_) = value_tensor {
+                    let data = value_tensor.as_slice_i64();
+                    if let Some(output_name) = outputs.first() {
+                        self.static_i64_cache
+                            .borrow_mut()
+                            .insert(output_name.to_string(), data.to_vec());
+                    }
+                }
+            }
+        }
+
         // For Slice nodes, try to pre-compute parameters from initializers
         // This avoids D2H transfers entirely for static parameters
         let precomputed_slice = if op_type == "Slice" {
             self.try_precompute_slice_params(&inputs)
+        } else {
+            None
+        };
+
+        // Pre-compute shape/axes parameters for Reshape, Unsqueeze, Squeeze
+        // when their Int64 input is in static_i64_cache (populated either by
+        // add_initializer for weights or by the Constant-caching block
+        // above for Constant nodes added earlier in topological order).
+        let precomputed_reshape_shape = if op_type == "Reshape" {
+            self.try_precompute_reshape_shape(&inputs)
+        } else {
+            None
+        };
+        let precomputed_unsqueeze_axes = if op_type == "Unsqueeze" {
+            self.try_precompute_unsqueeze_axes(&inputs)
+        } else {
+            None
+        };
+        let precomputed_squeeze_axes = if op_type == "Squeeze" {
+            self.try_precompute_squeeze_axes(&inputs)
         } else {
             None
         };
@@ -456,6 +532,9 @@ impl GpuGraphExecutor {
             outputs: outputs.iter().map(|s| s.to_string()).collect(),
             attributes,
             precomputed_slice,
+            precomputed_reshape_shape,
+            precomputed_unsqueeze_axes,
+            precomputed_squeeze_axes,
         });
         // Invalidate topo sort cache when graph structure changes
         *self.sorted_nodes_cache.borrow_mut() = None;
@@ -510,6 +589,49 @@ impl GpuGraphExecutor {
         } else {
             None
         }
+    }
+
+    /// Try to pre-compute Unsqueeze axes from the `static_i64_cache`.
+    /// Returns Some(axes) if `inputs[1]` (the axes input) is present in the
+    /// cache — which happens when the axes come from an initializer or a
+    /// Constant node added earlier in topological order.
+    fn try_precompute_unsqueeze_axes(&self, inputs: &[&str]) -> Option<Vec<i64>> {
+        if inputs.len() < 2 {
+            return None;
+        }
+        let name = inputs[1];
+        if name.is_empty() {
+            return None;
+        }
+        self.static_i64_cache.borrow().get(name).cloned()
+    }
+
+    /// Try to pre-compute Squeeze axes from the `static_i64_cache`.
+    /// Same lookup pattern as `try_precompute_unsqueeze_axes`.
+    fn try_precompute_squeeze_axes(&self, inputs: &[&str]) -> Option<Vec<i64>> {
+        if inputs.len() < 2 {
+            return None;
+        }
+        let name = inputs[1];
+        if name.is_empty() {
+            return None;
+        }
+        self.static_i64_cache.borrow().get(name).cloned()
+    }
+
+    /// Try to pre-compute Reshape shape values from the `static_i64_cache`.
+    /// Returns the raw shape vector; `0`/`-1` resolution happens at runtime
+    /// in the dispatch arm because those semantics depend on the actual
+    /// input tensor's shape.
+    fn try_precompute_reshape_shape(&self, inputs: &[&str]) -> Option<Vec<i64>> {
+        if inputs.len() < 2 {
+            return None;
+        }
+        let name = inputs[1];
+        if name.is_empty() {
+            return None;
+        }
+        self.static_i64_cache.borrow().get(name).cloned()
     }
 
     /// Detect fuseable operator patterns in the graph.
@@ -931,18 +1053,26 @@ impl GpuGraphExecutor {
         input_names: &[String],
         attributes: &NodeAttributes,
     ) -> Result<GpuTensor, CudaError> {
-        self.execute_gpu_operator_with_precomputed(op_type, inputs, input_names, attributes, None)
+        self.execute_gpu_operator_with_precomputed(
+            op_type,
+            inputs,
+            input_names,
+            attributes,
+            NodePrecomputed::default(),
+        )
     }
 
     /// Execute a GPU operator with optional pre-computed parameters
-    /// For Slice operations, precomputed_slice provides already-extracted parameter values
+    /// For Slice operations, `precomputed.slice` provides already-extracted parameter values.
+    /// Future precomputation kinds (reshape/unsqueeze/squeeze) are carried on the same
+    /// `NodePrecomputed` bundle so this signature doesn't churn as new kinds land.
     fn execute_gpu_operator_with_precomputed(
         &self,
         op_type: &str,
         inputs: &[&GpuTensor],
         input_names: &[String],
         attributes: &NodeAttributes,
-        precomputed_slice: Option<&PrecomputedSlice>,
+        precomputed: NodePrecomputed<'_>,
     ) -> Result<GpuTensor, CudaError> {
         let mut pool = self.memory_pool.borrow_mut();
         match op_type {
@@ -1910,7 +2040,7 @@ impl GpuGraphExecutor {
                 }
 
                 // Get starts - prefer precomputed, then cache lookup (using get_or_fetch_i64 to avoid device_ptr overhead)
-                let starts = if let Some(precomp) = precomputed_slice.and_then(|p| p.starts.as_ref()) {
+                let starts = if let Some(precomp) = precomputed.slice.and_then(|p| p.starts.as_ref()) {
                     precomp.clone()
                 } else {
                     let starts_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -1918,7 +2048,7 @@ impl GpuGraphExecutor {
                 };
 
                 // Get ends - prefer precomputed, then cache lookup
-                let ends = if let Some(precomp) = precomputed_slice.and_then(|p| p.ends.as_ref()) {
+                let ends = if let Some(precomp) = precomputed.slice.and_then(|p| p.ends.as_ref()) {
                     precomp.clone()
                 } else {
                     let ends_name = input_names.get(2).map(|s| s.as_str()).unwrap_or("");
@@ -1969,7 +2099,7 @@ impl GpuGraphExecutor {
                 let num_slices = starts.len();
 
                 // axes: prefer precomputed, then cache lookup
-                let axes = if let Some(precomp) = precomputed_slice.and_then(|p| p.axes.as_ref()) {
+                let axes = if let Some(precomp) = precomputed.slice.and_then(|p| p.axes.as_ref()) {
                     if precomp.len() == num_slices {
                         Some(precomp.clone())
                     } else {
@@ -1989,7 +2119,7 @@ impl GpuGraphExecutor {
                 };
 
                 // steps: prefer precomputed, then cache lookup
-                let steps = if let Some(precomp) = precomputed_slice.and_then(|p| p.steps.as_ref()) {
+                let steps = if let Some(precomp) = precomputed.slice.and_then(|p| p.steps.as_ref()) {
                     if precomp.len() == num_slices {
                         Some(precomp.clone())
                     } else {
@@ -2025,7 +2155,13 @@ impl GpuGraphExecutor {
                 let input_shape = inputs[0].shape();
                 let input_len = inputs[0].len();
 
-                let shape_data: Vec<i64> = if let Some(shape_attr) = attributes.get_ints("shape") {
+                // Precomputation path (Cycle 2): if the shape was resolved at
+                // graph-build time, use those values directly. The `0`/`-1`
+                // resolution further down still runs because it depends on
+                // the runtime input_shape.
+                let shape_data: Vec<i64> = if let Some(precomp) = precomputed.reshape_shape {
+                    precomp.clone()
+                } else if let Some(shape_attr) = attributes.get_ints("shape") {
                     shape_attr.to_vec()
                 } else if inputs.len() > 1 {
                     // Get shape from cache or fetch via D2H (avoids device_ptr() overhead)
@@ -2083,7 +2219,13 @@ impl GpuGraphExecutor {
                 // Squeeze removes dimensions of size 1
                 // Opset <= 12: axes from attribute (optional)
                 // Opset 13+: axes from second input tensor (optional)
-                let axes: Option<Vec<i64>> = if let Some(axes_attr) = attributes.get_ints("axes") {
+                //
+                // Precomputation path (Cycle 2): if the axes were resolved
+                // at graph-build time in try_precompute_squeeze_axes, use
+                // those values directly and skip the D2H fallback.
+                let axes: Option<Vec<i64>> = if let Some(precomp) = precomputed.squeeze_axes {
+                    Some(precomp.clone())
+                } else if let Some(axes_attr) = attributes.get_ints("axes") {
                     Some(axes_attr.to_vec())
                 } else if inputs.len() > 1 {
                     // Opset 13+: axes come from second input
@@ -2126,7 +2268,13 @@ impl GpuGraphExecutor {
                 // Unsqueeze inserts dimensions of size 1 at specified axes
                 // Opset <= 12: axes from attribute
                 // Opset 13+: axes from second input tensor
-                let axes: Vec<i64> = if let Some(axes_attr) = attributes.get_ints("axes") {
+                //
+                // Precomputation path (Cycle 2): if the axes were resolved
+                // at graph-build time in try_precompute_unsqueeze_axes, use
+                // those values directly and skip the D2H fallback.
+                let axes: Vec<i64> = if let Some(precomp) = precomputed.unsqueeze_axes {
+                    precomp.clone()
+                } else if let Some(axes_attr) = attributes.get_ints("axes") {
                     axes_attr.to_vec()
                 } else if inputs.len() > 1 {
                     // Opset 13+: axes come from second input
@@ -2774,7 +2922,12 @@ impl GpuGraphExecutor {
                     &input_refs,
                     &node.inputs,
                     &node.attributes,
-                    node.precomputed_slice.as_ref(),
+                    NodePrecomputed {
+                        slice: node.precomputed_slice.as_ref(),
+                        reshape_shape: node.precomputed_reshape_shape.as_ref(),
+                        unsqueeze_axes: node.precomputed_unsqueeze_axes.as_ref(),
+                        squeeze_axes: node.precomputed_squeeze_axes.as_ref(),
+                    },
                 )
                 .map_err(|e| {
                     // Add context about which node failed
@@ -3219,7 +3372,12 @@ impl GpuGraphExecutor {
                     &input_refs,
                     &node.inputs,
                     &node.attributes,
-                    node.precomputed_slice.as_ref(),
+                    NodePrecomputed {
+                        slice: node.precomputed_slice.as_ref(),
+                        reshape_shape: node.precomputed_reshape_shape.as_ref(),
+                        unsqueeze_axes: node.precomputed_unsqueeze_axes.as_ref(),
+                        squeeze_axes: node.precomputed_squeeze_axes.as_ref(),
+                    },
                 )
                 .map_err(|e| {
                     ValidationError::Cuda(CudaError::Kernel(format!(
@@ -3484,7 +3642,12 @@ impl GpuGraphExecutor {
                     &input_refs,
                     &node.inputs,
                     &node.attributes,
-                    node.precomputed_slice.as_ref(),
+                    NodePrecomputed {
+                        slice: node.precomputed_slice.as_ref(),
+                        reshape_shape: node.precomputed_reshape_shape.as_ref(),
+                        unsqueeze_axes: node.precomputed_unsqueeze_axes.as_ref(),
+                        squeeze_axes: node.precomputed_squeeze_axes.as_ref(),
+                    },
                 )
                 .map_err(|e| {
                     CudaError::Kernel(format!(
@@ -3852,7 +4015,12 @@ impl GpuGraphExecutor {
                     &input_refs,
                     &node.inputs,
                     &node.attributes,
-                    node.precomputed_slice.as_ref(),
+                    NodePrecomputed {
+                        slice: node.precomputed_slice.as_ref(),
+                        reshape_shape: node.precomputed_reshape_shape.as_ref(),
+                        unsqueeze_axes: node.precomputed_unsqueeze_axes.as_ref(),
+                        squeeze_axes: node.precomputed_squeeze_axes.as_ref(),
+                    },
                 )
                 .map_err(|e| {
                     CudaError::Kernel(format!(
@@ -4329,7 +4497,12 @@ impl GpuGraphExecutor {
                 &input_refs,
                 &node.inputs,
                 &node.attributes,
-                node.precomputed_slice.as_ref(),
+                NodePrecomputed {
+                    slice: node.precomputed_slice.as_ref(),
+                    reshape_shape: node.precomputed_reshape_shape.as_ref(),
+                    unsqueeze_axes: node.precomputed_unsqueeze_axes.as_ref(),
+                    squeeze_axes: node.precomputed_squeeze_axes.as_ref(),
+                },
             )?;
             let op_us = op_start.elapsed().as_micros() as u64;
 
