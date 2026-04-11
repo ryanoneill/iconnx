@@ -13,7 +13,8 @@ use super::cudnn::{
 use super::cufft::StftKernelCache;
 use super::kernels::fused::{
     gpu_fused_add_mul, gpu_fused_add_mul_add, gpu_fused_div_mul, gpu_fused_div_rsqrt,
-    gpu_fused_gelu, gpu_fused_mul_add, gpu_fused_sub_mul, FusedKernelCache,
+    gpu_fused_gelu, gpu_fused_mul_add, gpu_fused_mul_sin_pow_mul_add, gpu_fused_sub_mul,
+    FusedKernelCache,
 };
 use super::kernels::{
     gpu_abs, gpu_add, gpu_ceil, gpu_clip, gpu_cos, gpu_div, gpu_exp, gpu_floor, gpu_leaky_relu,
@@ -696,14 +697,72 @@ impl GpuGraphExecutor {
 
                 gpu_fused_div_mul(&self.ctx, &self.fused_kernels, &mut pool, a, b, c)
             }
-            FusedPattern::MulSinPowMulAdd { .. } => {
-                // Dispatch for this pattern lands in Task D1+D2. Detection
-                // can register the pattern, but until execution is wired
-                // the executor must fall back with a clear error if a
-                // graph containing this chain is actually run on GPU.
-                Err(CudaError::Kernel(
-                    "Fused MulSinPowMulAdd dispatch not yet wired (Task D1+D2)".into(),
-                ))
+            FusedPattern::MulSinPowMulAdd {
+                x_input,
+                w0_input,
+                w1_input,
+                b_input,
+                p_input,
+                ..
+            } => {
+                let x = values
+                    .get(x_input)
+                    .or_else(|| self.weights.get(x_input))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused MulSinPowMulAdd: x '{}' not found",
+                            x_input
+                        ))
+                    })?;
+                let w0 = values
+                    .get(w0_input)
+                    .or_else(|| self.weights.get(w0_input))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused MulSinPowMulAdd: w0 '{}' not found",
+                            w0_input
+                        ))
+                    })?;
+                let w1 = values
+                    .get(w1_input)
+                    .or_else(|| self.weights.get(w1_input))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused MulSinPowMulAdd: w1 '{}' not found",
+                            w1_input
+                        ))
+                    })?;
+                let b = values
+                    .get(b_input)
+                    .or_else(|| self.weights.get(b_input))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused MulSinPowMulAdd: b '{}' not found",
+                            b_input
+                        ))
+                    })?;
+                let p_tensor = values
+                    .get(p_input)
+                    .or_else(|| self.weights.get(p_input))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused MulSinPowMulAdd: p '{}' not found",
+                            p_input
+                        ))
+                    })?;
+                // p is a scalar exponent — fetch its single value.
+                let p = p_tensor.to_host_f32(&self.ctx)?[0];
+
+                gpu_fused_mul_sin_pow_mul_add(
+                    &self.ctx,
+                    &self.fused_kernels,
+                    &mut pool,
+                    x,
+                    w0,
+                    w1,
+                    b,
+                    p,
+                )
             }
         }
     }

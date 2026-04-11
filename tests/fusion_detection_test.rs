@@ -237,3 +237,140 @@ fn rejects_non_integer_exponent() {
         "Non-integer exponent p=2.5 must not be detected as MulSinPowMulAdd"
     );
 }
+
+#[test]
+fn executor_runs_mul_sin_pow_mul_add_and_records_profile_entry() {
+    use iconnx::cuda::GpuGraphExecutor;
+    use iconnx::tensor::Tensor;
+    use iconnx::NodeAttributes;
+
+    // Minimal graph: the same 5-op chain, with x as a runtime input and
+    // w0, w1, b, p registered as model initializers.
+    let mut executor = GpuGraphExecutor::new().expect("executor");
+
+    let shape = vec![2usize, 4usize];
+    let n = 2 * 4;
+    let w0_data: Vec<f32> = (0..n).map(|i| 0.5 + 0.05 * i as f32).collect();
+    let w1_data: Vec<f32> = (0..n).map(|i| 1.0 - 0.03 * i as f32).collect();
+    let b_data: Vec<f32> = (0..n).map(|i| 0.1 * i as f32).collect();
+
+    executor
+        .add_initializer(
+            "w0".to_string(),
+            &Tensor::from_vec_f32(w0_data.clone(), shape.clone()),
+        )
+        .expect("add w0");
+    executor
+        .add_initializer(
+            "w1".to_string(),
+            &Tensor::from_vec_f32(w1_data.clone(), shape.clone()),
+        )
+        .expect("add w1");
+    executor
+        .add_initializer(
+            "b".to_string(),
+            &Tensor::from_vec_f32(b_data.clone(), shape.clone()),
+        )
+        .expect("add b");
+    executor
+        .add_initializer(
+            "p".to_string(),
+            &Tensor::from_vec_f32(vec![2.0], vec![1]),
+        )
+        .expect("add p");
+
+    executor.add_node(
+        "head_mul",
+        "Mul",
+        vec!["x", "w0"],
+        vec!["t0"],
+        NodeAttributes::default(),
+    );
+    executor.add_node(
+        "sin_node",
+        "Sin",
+        vec!["t0"],
+        vec!["t1"],
+        NodeAttributes::default(),
+    );
+    executor.add_node(
+        "pow_node",
+        "Pow",
+        vec!["t1", "p"],
+        vec!["t2"],
+        NodeAttributes::default(),
+    );
+    executor.add_node(
+        "tail_mul",
+        "Mul",
+        vec!["t2", "w1"],
+        vec!["t3"],
+        NodeAttributes::default(),
+    );
+    executor.add_node(
+        "bias_add",
+        "Add",
+        vec!["t3", "b"],
+        vec!["y"],
+        NodeAttributes::default(),
+    );
+
+    let x_data: Vec<f32> = (0..n).map(|i| 0.01 * i as f32 + 0.2).collect();
+    let mut inputs = std::collections::HashMap::new();
+    inputs.insert(
+        "x".to_string(),
+        Tensor::from_vec_f32(x_data.clone(), shape.clone()),
+    );
+
+    let (outputs, profile) = executor
+        .run_with_profiling(inputs, vec!["y"])
+        .expect("run");
+
+    // The profile must contain the new fused pattern entry.
+    let entry = profile
+        .op_times
+        .get("Fused_MulSinPowMulAdd")
+        .unwrap_or_else(|| {
+            panic!(
+                "Fused_MulSinPowMulAdd missing from profile. Got: {:?}",
+                profile.op_times.keys().collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        entry.1, 1,
+        "expected exactly one fused-pattern execution, got {}",
+        entry.1
+    );
+
+    // Intermediate ops that the pattern consumed should be absent from the
+    // profile (they were skipped during execution).
+    for skipped in ["Mul", "Sin", "Pow", "Add"] {
+        assert!(
+            !profile.op_times.contains_key(skipped),
+            "{skipped} should have been skipped by fusion, but appears in profile: {:?}",
+            profile.op_times.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // Numerical check: compute the same thing with plain Rust and compare.
+    let y_tensor = outputs
+        .get("y")
+        .expect("output y missing")
+        .as_slice()
+        .to_vec();
+    let mut expected = vec![0.0f32; n];
+    for i in 0..n {
+        let s = (x_data[i] * w0_data[i]).sin();
+        expected[i] = s * s * w1_data[i] + b_data[i];
+    }
+    for i in 0..n {
+        let diff = (y_tensor[i] - expected[i]).abs();
+        assert!(
+            diff <= 1e-5,
+            "y[{i}] = {}, expected {}, diff {}",
+            y_tensor[i],
+            expected[i],
+            diff
+        );
+    }
+}
