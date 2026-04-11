@@ -43,6 +43,8 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
+mod fusion;
+
 /// Log entry for a single node execution (for debugging shape mismatches)
 #[derive(Debug, Clone)]
 pub struct NodeExecutionLog {
