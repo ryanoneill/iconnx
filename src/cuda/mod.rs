@@ -69,6 +69,12 @@ pub use kernels::{
     KernelCache,
 };
 #[allow(unused_imports)]
+pub use kernels::fused::{
+    gpu_fused_add_mul, gpu_fused_add_mul_add, gpu_fused_div_mul, gpu_fused_div_rsqrt,
+    gpu_fused_gelu, gpu_fused_mul_add, gpu_fused_mul_sin_pow_mul_add, gpu_fused_sub_mul,
+    FusedKernelCache,
+};
+#[allow(unused_imports)]
 pub use lstm::{gpu_lstm, LstmKernelCache};
 #[allow(unused_imports)]
 pub use matmul::{gpu_batched_matmul, gpu_gemm, gpu_matmul, gpu_matmul_2d_3d};

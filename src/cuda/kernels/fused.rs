@@ -72,6 +72,10 @@ const FUSED_KERNEL_NAMES: &[&str] = &[
     "fused_sub_mul_kernel",
     // Div-Mul: y = (a / b) * c (fused div-multiply)
     "fused_div_mul_kernel",
+    // Mul-Sin-Pow-Mul-Add: y = sin(x * w0)^p * w1 + b
+    // Vocoder periodic activation (48 occurrences in Kokoro)
+    // NOTE: The broadcast variant is added in Task B3.
+    "fused_mul_sin_pow_mul_add_kernel",
 ];
 
 /// CUDA source for fused kernels
@@ -267,6 +271,46 @@ extern "C" __global__ void fused_div_mul_kernel(
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = (a[i] / b[i]) * c[i];
+    }
+}
+
+// ============================================================================
+// Fused mul_sin_pow_mul_add: y = sin(x * w0)^p * w1 + b
+// Vocoder periodic activation (48 occurrences in Kokoro)
+// Replaces: Mul -> Sin -> Pow -> Mul -> Add
+// ============================================================================
+
+extern "C" __global__ void fused_mul_sin_pow_mul_add_kernel(
+    float* out,
+    const float* x,
+    const float* w0,
+    const float* w1,
+    const float* b,
+    float p,
+    int p_is_int,
+    size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float s = sinf(x[i] * w0[i]);
+        float pow_val;
+        if (p_is_int != 0) {
+            // Integer exponent path: handles negative bases correctly
+            int ip = (int) p;
+            pow_val = 1.0f;
+            float base = s;
+            int exp = ip < 0 ? -ip : ip;
+            while (exp > 0) {
+                if (exp & 1) pow_val *= base;
+                base *= base;
+                exp >>= 1;
+            }
+            if (ip < 0) pow_val = 1.0f / pow_val;
+        } else {
+            // Float exponent path: caller guarantees base is non-negative
+            pow_val = powf(s, p);
+        }
+        out[i] = pow_val * w1[i] + b[i];
     }
 }
 "#;
@@ -656,6 +700,76 @@ pub fn gpu_fused_div_mul(
     }
 
     Ok(out)
+}
+
+/// GPU fused mul_sin_pow_mul_add: y = sin(x * w0)^p * w1 + b
+///
+/// Replaces the 5-op chain Mul -> Sin -> Pow -> Mul -> Add used in vocoder
+/// periodic activations (48 occurrences in Kokoro).
+///
+/// All tensors must have the same shape. A broadcast variant is added in
+/// a separate task.
+///
+/// `p` is passed as f32. Integer exponents (detected via `p.fract() == 0.0`)
+/// use a squaring loop that handles negative bases correctly; non-integer
+/// exponents use `powf` (and require non-negative bases).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_fused_mul_sin_pow_mul_add(
+    ctx: &IconnxCudaContext,
+    cache: &FusedKernelCache,
+    pool: &mut GpuMemoryPool,
+    x: &GpuTensor,
+    w0: &GpuTensor,
+    w1: &GpuTensor,
+    b: &GpuTensor,
+    p: f32,
+) -> Result<GpuTensor, CudaError> {
+    // Same-shape fast path: all four tensors share one shape.
+    let shape = x.shape();
+    if w0.shape() == shape && w1.shape() == shape && b.shape() == shape {
+        let n = x.len();
+        let mut out = pool.get_tensor_f32(ctx, shape.to_vec())?;
+
+        let func = cache
+            .get("fused_mul_sin_pow_mul_add_kernel")
+            .ok_or_else(|| {
+                CudaError::Kernel("fused_mul_sin_pow_mul_add_kernel not found".into())
+            })?;
+
+        let p_is_int: i32 = if p.fract() == 0.0 { 1 } else { 0 };
+
+        unsafe {
+            ctx.stream()
+                .launch_builder(func)
+                .arg(out.data_f32_mut()?)
+                .arg(x.data_f32()?)
+                .arg(w0.data_f32()?)
+                .arg(w1.data_f32()?)
+                .arg(b.data_f32()?)
+                .arg(&p)
+                .arg(&p_is_int)
+                .arg(&n)
+                .launch(elementwise_config(n))
+                .map_err(|e| {
+                    CudaError::Kernel(format!(
+                        "fused_mul_sin_pow_mul_add launch failed: {}",
+                        e
+                    ))
+                })?;
+        }
+
+        return Ok(out);
+    }
+
+    // Broadcast cases are added in Task B3.
+    Err(CudaError::Kernel(format!(
+        "gpu_fused_mul_sin_pow_mul_add: broadcast variant not yet implemented \
+         (x={:?}, w0={:?}, w1={:?}, b={:?})",
+        x.shape(),
+        w0.shape(),
+        w1.shape(),
+        b.shape()
+    )))
 }
 
 #[cfg(test)]

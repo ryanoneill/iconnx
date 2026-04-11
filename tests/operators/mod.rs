@@ -15,6 +15,7 @@ mod equal_test;
 mod exp_test;
 mod expand_test;
 mod floor_test;
+mod fused_mul_sin_pow_mul_add_test;
 mod gather_test;
 mod gemm_test;
 mod greater_or_equal_test;
