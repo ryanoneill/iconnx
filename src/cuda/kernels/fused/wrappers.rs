@@ -15,6 +15,29 @@ use crate::cuda::memory_pool::GpuMemoryPool;
 use crate::cuda::tensor::GpuTensor;
 use cudarc::driver::PushKernelArg;
 
+/// Returns true iff `w` is a valid per-channel broadcast of `x`:
+/// all leading dims are 1, and `w.shape().last()` equals the last axis of `x`.
+///
+/// This is the only broadcast contract supported by
+/// `gpu_fused_mul_sin_pow_mul_add`: `w` must have shape `[C]`, `[1, C]`,
+/// `[1, 1, C]`, and so on, where `C` matches `x`'s last axis size.
+fn is_per_channel_broadcast(x: &GpuTensor, w: &GpuTensor) -> bool {
+    let x_shape = x.shape();
+    let w_shape = w.shape();
+    let channels = match x_shape.last() {
+        Some(&c) if c > 0 => c,
+        _ => return false,
+    };
+    if w_shape.last() != Some(&channels) {
+        return false;
+    }
+    // All dims except the last must be 1.
+    w_shape
+        .iter()
+        .take(w_shape.len().saturating_sub(1))
+        .all(|&d| d == 1)
+}
+
 // ============================================================================
 // Fused operation implementations
 // ============================================================================
@@ -420,19 +443,23 @@ pub fn gpu_fused_mul_sin_pow_mul_add(
         return Ok(out);
     }
 
-    // Broadcast case: w0, w1, b all share shape [1, C] or [..., 1, C] while
-    // x has shape [..., N, C]. The broadcast stride is the number of
-    // channels (last-axis length), computed as w0.len().
-    let w0_shape = w0.shape();
-    let w1_shape = w1.shape();
-    let b_shape = b.shape();
+    // Broadcast case: w0, w1, b all have per-channel broadcast shape
+    // (leading dims all 1, last dim matching x's last axis). We only accept
+    // shapes like [C], [1, C], [1, 1, C], etc., so the broadcast stride is
+    // exactly `channels` (the last-axis length of x).
+    let w_per_channel = is_per_channel_broadcast(x, w0)
+        && is_per_channel_broadcast(x, w1)
+        && is_per_channel_broadcast(x, b)
+        && w0.shape() == w1.shape()
+        && w1.shape() == b.shape();
 
-    let broadcast_shapes_match = w0_shape == w1_shape && w1_shape == b_shape && !w0.is_empty();
-    let broadcast_stride = w0.len();
-    let x_len = x.len();
-
-    if broadcast_shapes_match && x_len.is_multiple_of(broadcast_stride) {
-        let n = x_len;
+    if w_per_channel {
+        let channels = *x
+            .shape()
+            .last()
+            .expect("is_per_channel_broadcast ensured non-empty last axis");
+        let broadcast_stride = channels;
+        let n = x.len();
         let mut out = pool.get_tensor_f32(ctx, shape.to_vec())?;
 
         let func = cache
@@ -471,7 +498,8 @@ pub fn gpu_fused_mul_sin_pow_mul_add(
 
     Err(CudaError::Kernel(format!(
         "gpu_fused_mul_sin_pow_mul_add: unsupported shape combination \
-         (x={:?}, w0={:?}, w1={:?}, b={:?})",
+         (x={:?}, w0={:?}, w1={:?}, b={:?}) -- need same-shape fast path or \
+         per-channel broadcast (w shapes like [1,...,1,C] matching x's last axis)",
         x.shape(),
         w0.shape(),
         w1.shape(),

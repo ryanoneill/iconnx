@@ -132,3 +132,32 @@ fn broadcasting_w0_w1_b_per_channel() {
 
     assert_close(&ctx, &fused, &reference, 1e-5);
 }
+
+#[test]
+fn rejects_non_per_channel_shape_mismatch() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+    let fused_cache = FusedKernelCache::new(&ctx).expect("FusedKernelCache");
+    let mut pool = GpuMemoryPool::new();
+
+    // Malformed broadcast: x has 48 elements, w0/w1/b have 24. Pre-fix
+    // predicate would accept this (48 % 24 == 0) and silently produce
+    // a garbage result. Post-fix predicate must reject it.
+    let x = upload(&ctx, vec![0.1f32; 48], vec![6, 8]);
+    let w0 = upload(&ctx, vec![0.5f32; 24], vec![3, 8]);
+    let w1 = upload(&ctx, vec![1.0f32; 24], vec![3, 8]);
+    let b = upload(&ctx, vec![0.0f32; 24], vec![3, 8]);
+
+    let result = gpu_fused_mul_sin_pow_mul_add(
+        &ctx, &fused_cache, &mut pool, &x, &w0, &w1, &b, 2.0,
+    );
+    let err = match result {
+        Ok(_) => panic!("expected the broadcast guard to reject x=[6,8] with w=[3,8]"),
+        Err(e) => e,
+    };
+    let err_msg = format!("{}", err);
+    assert!(
+        err_msg.contains("unsupported shape combination"),
+        "error should mention shape combination: {}",
+        err_msg
+    );
+}
