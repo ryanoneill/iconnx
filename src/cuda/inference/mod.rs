@@ -45,6 +45,8 @@ use std::collections::{BTreeMap, HashMap};
 
 mod fusion;
 
+use self::fusion::{FusedPattern, FusedPatternInfo};
+
 /// Log entry for a single node execution (for debugging shape mismatches)
 #[derive(Debug, Clone)]
 pub struct NodeExecutionLog {
@@ -250,77 +252,6 @@ struct ExecutionNode {
     attributes: NodeAttributes,
     /// Pre-computed Slice parameters (only for Slice nodes with constant inputs)
     precomputed_slice: Option<PrecomputedSlice>,
-}
-
-/// Types of fused kernel patterns we can detect and optimize
-#[derive(Clone, Debug)]
-enum FusedPattern {
-    /// Add -> Sqrt -> Div: y / sqrt(x + eps)
-    /// Stores: (numerator_input, variance_input, eps_input, output_name)
-    DivRsqrt {
-        numerator_input: String,
-        variance_input: String,
-        eps_input: String,
-        output_name: String,
-    },
-    /// Add -> Mul -> Add: (x + a) * b + c
-    /// Stores: (x, a, b, c, output_name)
-    AddMulAdd {
-        x_input: String,
-        a_input: String,
-        b_input: String,
-        c_input: String,
-        output_name: String,
-    },
-    /// Full GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    /// Replaces 8 ops: Pow -> Mul -> Add -> Mul -> Tanh -> Add -> Mul -> Mul
-    Gelu {
-        x_input: String,
-        output_name: String,
-    },
-    /// Mul -> Add: y = a * b + c
-    /// Simple multiply-add pattern for scalar operations
-    MulAdd {
-        a_input: String,
-        b_input: String,
-        c_input: String,
-        output_name: String,
-    },
-    /// Add -> Mul: y = (a + b) * c
-    /// Simple add-multiply pattern for scalar operations
-    AddMul {
-        a_input: String,
-        b_input: String,
-        c_input: String,
-        output_name: String,
-    },
-    /// Sub -> Mul: y = (a - b) * c
-    /// Simple sub-multiply pattern
-    SubMul {
-        a_input: String,
-        b_input: String,
-        c_input: String,
-        output_name: String,
-    },
-    /// Div -> Mul: y = (a / b) * c
-    /// Simple div-multiply pattern
-    DivMul {
-        a_input: String,
-        b_input: String,
-        c_input: String,
-        output_name: String,
-    },
-}
-
-/// Information about a detected fused pattern
-#[derive(Clone, Debug)]
-struct FusedPatternInfo {
-    /// The pattern type and its inputs
-    pattern: FusedPattern,
-    /// Node names that are part of this pattern (to skip during execution)
-    nodes_to_skip: Vec<String>,
-    /// The first node name (head) that triggers execution of the fused kernel
-    head_node: String,
 }
 
 impl GpuGraphExecutor {

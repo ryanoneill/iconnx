@@ -13,8 +13,5 @@
 pub(super) mod patterns;
 pub(super) mod detection;
 
-// NOTE: the `pub(super) use patterns::{FusedPattern, FusedPatternInfo};`
-// and `pub(super) use detection::detect_fused_patterns;` re-exports will
-// be added in Task A2/A3 when the types and function are actually moved
-// into these submodules. Keeping them here before the content exists
-// would cause a compile error.
+pub(super) use patterns::{FusedPattern, FusedPatternInfo};
+// detect_fused_patterns re-export added in Task A3 when the function moves
