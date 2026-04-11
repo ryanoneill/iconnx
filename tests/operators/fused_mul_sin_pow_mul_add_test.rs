@@ -134,6 +134,62 @@ fn broadcasting_w0_w1_b_per_channel() {
 }
 
 #[test]
+fn per_channel_scale_broadcast_matches_reference() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+    let elem_cache = KernelCache::new(&ctx).expect("KernelCache");
+    let fused_cache = FusedKernelCache::new(&ctx).expect("FusedKernelCache");
+    let mut pool = GpuMemoryPool::new();
+
+    // Kokoro's vocoder shape pattern:
+    //   x  = [1, C, 1]    -- per-channel scalar
+    //   w0 = [1, C, K]    -- full tensor
+    //   w1 = [1, C, 1]    -- per-channel scalar
+    //   b  = [1, C, K]    -- full tensor
+    //   output = [1, C, K]
+    //
+    // Using small C and K here for test speed.
+    let batch = 1usize;
+    let channels = 4usize;
+    let k_dim = 6usize;
+    let small_total = batch * channels;
+    let full_total = batch * channels * k_dim;
+
+    let x_data: Vec<f32> = (0..small_total).map(|i| 0.1 + 0.02 * i as f32).collect();
+    let w0_data: Vec<f32> = (0..full_total).map(|i| 0.5 + 0.03 * i as f32).collect();
+    let w1_data: Vec<f32> = (0..small_total).map(|i| 1.0 - 0.05 * i as f32).collect();
+    let b_data: Vec<f32> = (0..full_total).map(|i| 0.01 * i as f32).collect();
+
+    let x = upload(&ctx, x_data.clone(), vec![batch, channels, 1]);
+    let w0 = upload(&ctx, w0_data.clone(), vec![batch, channels, k_dim]);
+    let w1 = upload(&ctx, w1_data.clone(), vec![batch, channels, 1]);
+    let b = upload(&ctx, b_data.clone(), vec![batch, channels, k_dim]);
+    let p: f32 = 2.0;
+
+    // Build a reference by expanding `x` and `w1` to the full shape, then
+    // running the unfused chain. (upload + reshape so no kernel churn.)
+    let mut x_tiled = Vec::with_capacity(full_total);
+    let mut w1_tiled = Vec::with_capacity(full_total);
+    for c in 0..channels {
+        for _ in 0..k_dim {
+            x_tiled.push(x_data[c]);
+            w1_tiled.push(w1_data[c]);
+        }
+    }
+    let x_full = upload(&ctx, x_tiled, vec![batch, channels, k_dim]);
+    let w1_full = upload(&ctx, w1_tiled, vec![batch, channels, k_dim]);
+
+    let reference = unfused_reference(
+        &ctx, &elem_cache, &mut pool, &x_full, &w0, &w1_full, &b, p,
+    );
+    let fused = gpu_fused_mul_sin_pow_mul_add(
+        &ctx, &fused_cache, &mut pool, &x, &w0, &w1, &b, p,
+    )
+    .expect("gpu_fused_mul_sin_pow_mul_add per-channel-scale broadcast");
+
+    assert_close(&ctx, &fused, &reference, 1e-5);
+}
+
+#[test]
 fn rejects_non_per_channel_shape_mismatch() {
     let ctx = IconnxCudaContext::new().expect("CUDA context");
     let fused_cache = FusedKernelCache::new(&ctx).expect("FusedKernelCache");

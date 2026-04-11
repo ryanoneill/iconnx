@@ -38,6 +38,56 @@ fn is_per_channel_broadcast(x: &GpuTensor, w: &GpuTensor) -> bool {
         .all(|&d| d == 1)
 }
 
+/// Returns `Some(k_dim)` iff:
+/// - `x.shape() == w1.shape()`
+/// - `w0.shape() == b.shape()`
+/// - `x`'s shape is `w0`'s shape with the LAST axis replaced by 1 (i.e.,
+///   `x` and `w1` broadcast trailing-dim over `w0` and `b`).
+/// - The last dim of `w0` (`k_dim`) is >= 1.
+///
+/// This is the shape pattern Kokoro's vocoder uses for per-channel scale:
+/// x: [..., C, 1], w0: [..., C, K], w1: [..., C, 1], b: [..., C, K].
+fn is_per_channel_scale_broadcast(
+    x: &GpuTensor,
+    w0: &GpuTensor,
+    w1: &GpuTensor,
+    b: &GpuTensor,
+) -> Option<usize> {
+    let x_shape = x.shape();
+    let w0_shape = w0.shape();
+    let w1_shape = w1.shape();
+    let b_shape = b.shape();
+
+    if x_shape != w1_shape {
+        return None;
+    }
+    if w0_shape != b_shape {
+        return None;
+    }
+    if x_shape.len() != w0_shape.len() {
+        return None;
+    }
+    let ndim = w0_shape.len();
+    if ndim == 0 {
+        return None;
+    }
+    // All leading dims must match
+    for i in 0..ndim - 1 {
+        if x_shape[i] != w0_shape[i] {
+            return None;
+        }
+    }
+    // x's last dim must be 1, w0's must be >= 1
+    if *x_shape.last().unwrap() != 1 {
+        return None;
+    }
+    let k_dim = *w0_shape.last().unwrap();
+    if k_dim == 0 {
+        return None;
+    }
+    Some(k_dim)
+}
+
 // ============================================================================
 // Fused operation implementations
 // ============================================================================
@@ -378,10 +428,14 @@ pub fn gpu_fused_div_mul(
 /// Replaces the 5-op chain Mul -> Sin -> Pow -> Mul -> Add used in vocoder
 /// periodic activations (48 occurrences in Kokoro).
 ///
-/// Supports two shape layouts:
+/// Supports three shape layouts:
 /// 1. **Same-shape fast path:** `x`, `w0`, `w1`, and `b` all share one shape.
 /// 2. **Per-channel broadcast:** `w0`, `w1`, `b` have shape `[C]`, `[1, C]`,
 ///    `[1, 1, C]`, etc., where `C` matches the last axis of `x`.
+/// 3. **Per-channel scale broadcast:** `x` and `w1` have shape `[..., C, 1]`
+///    (per-channel scalars), while `w0` and `b` have full shape `[..., C, K]`.
+///    Every `K` output elements share the same `x[c]` and `w1[c]` values.
+///    This is the shape pattern Kokoro's vocoder periodic activation uses.
 ///
 /// `p` is passed as f32 but must be integer-valued (`p.fract() == 0.0`).
 /// The kernel uses a squaring loop that handles negative bases correctly;
@@ -494,10 +548,50 @@ pub fn gpu_fused_mul_sin_pow_mul_add(
         return Ok(out);
     }
 
+    // Per-channel-scale broadcast branch: x and w1 broadcast over the
+    // trailing dim of w0 and b. This is Kokoro's vocoder periodic
+    // activation shape.
+    if let Some(k_dim) = is_per_channel_scale_broadcast(x, w0, w1, b) {
+        let n = w0.len();
+        let mut out = pool.get_tensor_f32(ctx, w0.shape().to_vec())?;
+
+        let func = cache
+            .get("fused_mul_sin_pow_mul_add_per_channel_scale_kernel")
+            .ok_or_else(|| {
+                CudaError::Kernel(
+                    "fused_mul_sin_pow_mul_add_per_channel_scale_kernel not found".into(),
+                )
+            })?;
+
+        unsafe {
+            ctx.stream()
+                .launch_builder(func)
+                .arg(out.data_f32_mut()?)
+                .arg(x.data_f32()?)
+                .arg(w0.data_f32()?)
+                .arg(w1.data_f32()?)
+                .arg(b.data_f32()?)
+                .arg(&p)
+                .arg(&n)
+                .arg(&k_dim)
+                .launch(elementwise_config(n))
+                .map_err(|e| {
+                    CudaError::Kernel(format!(
+                        "fused_mul_sin_pow_mul_add_per_channel_scale launch failed: {}",
+                        e
+                    ))
+                })?;
+        }
+
+        return Ok(out);
+    }
+
     Err(CudaError::Kernel(format!(
         "gpu_fused_mul_sin_pow_mul_add: unsupported shape combination \
-         (x={:?}, w0={:?}, w1={:?}, b={:?}) -- need same-shape fast path or \
-         per-channel broadcast (w shapes like [1,...,1,C] matching x's last axis)",
+         (x={:?}, w0={:?}, w1={:?}, b={:?}) -- need same-shape fast path, \
+         per-channel broadcast (w shapes like [1,...,1,C] matching x's last axis), \
+         or per-channel-scale broadcast (x and w1 shape [..., C, 1] over w0 and b \
+         shape [..., C, K])",
         x.shape(),
         w0.shape(),
         w1.shape(),

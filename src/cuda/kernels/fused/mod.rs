@@ -84,6 +84,7 @@ const FUSED_KERNEL_NAMES: &[&str] = &[
     // Vocoder periodic activation (48 occurrences in Kokoro)
     "fused_mul_sin_pow_mul_add_kernel",
     "fused_mul_sin_pow_mul_add_broadcast_kernel",
+    "fused_mul_sin_pow_mul_add_per_channel_scale_kernel",
 ];
 
 /// CUDA source for fused kernels
@@ -349,6 +350,48 @@ extern "C" __global__ void fused_mul_sin_pow_mul_add_broadcast_kernel(
         }
         if (ip < 0) pow_val = 1.0f / pow_val;
         out[i] = pow_val * w1[bi] + b[bi];
+    }
+}
+
+// Per-channel-scale broadcast variant:
+//   x  is per-channel scalar, shape [..., C, 1]  (small_total = C)
+//   w0 is full shape,         shape [..., C, K]  (full_total  = C*K)
+//   w1 is per-channel scalar, shape [..., C, 1]
+//   b  is full shape,         shape [..., C, K]
+//
+// Each output element [i] (in flat row-major layout of the full shape)
+// uses x[i / k_dim] and w1[i / k_dim] (broadcast over the trailing
+// dim), and w0[i], b[i] at full index.
+//
+// `k_dim` is the size of the trailing dimension (the one being broadcast
+// over). `n` is the total output element count (= small_total * k_dim).
+extern "C" __global__ void fused_mul_sin_pow_mul_add_per_channel_scale_kernel(
+    float* out,
+    const float* x,
+    const float* w0,
+    const float* w1,
+    const float* b,
+    float p,
+    size_t n,
+    size_t k_dim
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        size_t chan_idx = i / k_dim;
+        float s = sinf(x[chan_idx] * w0[i]);
+        // Integer exponentiation by squaring. p is guaranteed to be an
+        // integer by the host guard before this kernel is invoked.
+        int ip = (int) p;
+        float pow_val = 1.0f;
+        float base = s;
+        int exp = ip < 0 ? -ip : ip;
+        while (exp > 0) {
+            if (exp & 1) pow_val *= base;
+            base *= base;
+            exp >>= 1;
+        }
+        if (ip < 0) pow_val = 1.0f / pow_val;
+        out[i] = pow_val * w1[chan_idx] + b[i];
     }
 }
 "#;
