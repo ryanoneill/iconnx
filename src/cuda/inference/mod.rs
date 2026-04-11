@@ -49,6 +49,7 @@ pub mod gpu_event_timer;
 pub mod testing;
 
 use self::fusion::{FusedPattern, FusedPatternInfo};
+use self::gpu_event_timer::GpuEventTimer;
 
 /// Log entry for a single node execution (for debugging shape mismatches)
 #[derive(Debug, Clone)]
@@ -4179,6 +4180,12 @@ impl GpuGraphExecutor {
 
         // Execute nodes with per-op-type timing
         let mut op_times: BTreeMap<String, (u64, usize)> = BTreeMap::new();
+        // GPU-side timing via CUDA events. Allocates events fresh per run.
+        let mut gpu_timer = GpuEventTimer::new(
+            self.ctx.context().clone(),
+            self.ctx.stream(),
+            sorted_nodes.len(),
+        )?;
         let exec_start = Instant::now();
 
         for node in sorted_nodes {
@@ -4232,6 +4239,7 @@ impl GpuGraphExecutor {
                 let entry = op_times.entry(pattern_name.to_string()).or_insert((0, 0));
                 entry.0 += op_us;
                 entry.1 += 1;
+                gpu_timer.record(pattern_name.to_string())?;
 
                 continue;
             }
@@ -4320,6 +4328,7 @@ impl GpuGraphExecutor {
             let entry = op_times.entry(node.op_type.clone()).or_insert((0, 0));
             entry.0 += op_us;
             entry.1 += 1;
+            gpu_timer.record(node.op_type.clone())?;
 
             if node.outputs.len() == 1 {
                 values.insert(node.outputs[0].clone(), output);
@@ -4345,6 +4354,7 @@ impl GpuGraphExecutor {
         let _ = (&tensor_groups, &group_remaining);
         profile.node_execution_us = exec_start.elapsed().as_micros() as u64;
         profile.op_times = op_times;
+        profile.gpu_op_times = gpu_timer.finalize()?;
 
         // Download outputs
         let download_start = Instant::now();
