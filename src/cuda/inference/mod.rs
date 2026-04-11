@@ -45,9 +45,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 pub mod fusion;
+pub mod gpu_event_timer;
 pub mod testing;
 
 use self::fusion::{FusedPattern, FusedPatternInfo};
+use self::gpu_event_timer::GpuEventTimer;
 
 /// Log entry for a single node execution (for debugging shape mismatches)
 #[derive(Debug, Clone)]
@@ -106,6 +108,27 @@ pub struct ProfileData {
     pub total_us: u64,
     /// Per-operator-type timing: (total_us, count)
     pub op_times: BTreeMap<String, (u64, usize)>,
+    /// Per-op GPU-side timing from CUDA events.
+    ///
+    /// Keys match `op_times` exactly: same op-type strings, same fused
+    /// pattern labels. For any key present in `op_times` the same key is
+    /// present here, and the `count` values match.
+    ///
+    /// This is the actual GPU kernel wall time (measured via
+    /// `cudaEventElapsedTime` between paired events recorded on the stream
+    /// around each dispatch). It is orthogonal to `op_times`, which
+    /// measures CPU-side async enqueue overhead only (see `op_times`'
+    /// comment). The two maps together give you both halves of the picture:
+    /// `op_times[k]` is the launch/dispatch cost, `gpu_op_times[k]` is
+    /// the compute cost. There is no guaranteed magnitude relationship
+    /// between them -- `gpu_op_times[k]` is usually larger for non-trivial
+    /// ops (kernels execute longer than their dispatch cost) but may be
+    /// smaller for tiny metadata ops that finish faster than the
+    /// enqueue overhead.
+    ///
+    /// An entry may have `total_us == 0` when the GPU work is effectively
+    /// instantaneous (metadata-only ops, near-no-op kernels, etc.).
+    pub gpu_op_times: BTreeMap<String, (u64, usize)>,
 }
 
 impl ProfileData {
@@ -137,6 +160,21 @@ impl ProfileData {
                 "  {:20} {:>8} us ({:>4} calls, {:>6.1} us/call)",
                 op, time_us, count, avg
             );
+        }
+
+        if !self.gpu_op_times.is_empty() {
+            eprintln!("\n=== Top Operators by GPU-Side Time (CUDA events) ===");
+            let mut sorted_gpu: Vec<_> = self.gpu_op_times.iter().collect();
+            sorted_gpu.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+
+            for (op, (time_us, count)) in sorted_gpu.iter().take(15) {
+                let cpu_us = self.op_times.get(*op).map(|(t, _)| *t).unwrap_or(0);
+                let overhead = cpu_us.saturating_sub(*time_us);
+                eprintln!(
+                    "  {:20} gpu={:>8} us cpu={:>8} us overhead={:>8} us ({:>4} calls)",
+                    op, time_us, cpu_us, overhead, count
+                );
+            }
         }
     }
 }
@@ -4151,6 +4189,12 @@ impl GpuGraphExecutor {
 
         // Execute nodes with per-op-type timing
         let mut op_times: BTreeMap<String, (u64, usize)> = BTreeMap::new();
+        // GPU-side timing via CUDA events. Allocates events fresh per run.
+        let mut gpu_timer = GpuEventTimer::new(
+            self.ctx.context().clone(),
+            self.ctx.stream(),
+            sorted_nodes.len(),
+        )?;
         let exec_start = Instant::now();
 
         for node in sorted_nodes {
@@ -4204,6 +4248,7 @@ impl GpuGraphExecutor {
                 let entry = op_times.entry(pattern_name.to_string()).or_insert((0, 0));
                 entry.0 += op_us;
                 entry.1 += 1;
+                gpu_timer.record(pattern_name.to_string())?;
 
                 continue;
             }
@@ -4292,6 +4337,7 @@ impl GpuGraphExecutor {
             let entry = op_times.entry(node.op_type.clone()).or_insert((0, 0));
             entry.0 += op_us;
             entry.1 += 1;
+            gpu_timer.record(node.op_type.clone())?;
 
             if node.outputs.len() == 1 {
                 values.insert(node.outputs[0].clone(), output);
@@ -4317,6 +4363,7 @@ impl GpuGraphExecutor {
         let _ = (&tensor_groups, &group_remaining);
         profile.node_execution_us = exec_start.elapsed().as_micros() as u64;
         profile.op_times = op_times;
+        profile.gpu_op_times = gpu_timer.finalize()?;
 
         // Download outputs
         let download_start = Instant::now();
