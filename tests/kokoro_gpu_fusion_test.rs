@@ -226,4 +226,133 @@ fn fusion_fires_on_full_kokoro_at_seq_len_5() {
         "\n✅ gpu_op_times populated with {} keys, key parity verified",
         profile.gpu_op_times.len()
     );
+
+    // === Cycle 2: zero-cost shape-only ops ===
+    //
+    // Primary gate: hit-rate assertions via the testing facade. The
+    // precomputation mechanism's correctness is measured by how many
+    // Unsqueeze/Reshape/Squeeze nodes in the graph have their precomputed
+    // field populated (Some), not by raw GPU-side timing.
+    //
+    // Why: Cycle 1.5a's GPU event timer has a ~10-20 us per-call floor
+    // from event creation + recording overhead. For metadata-only ops
+    // like Unsqueeze (which do no real kernel work), this floor
+    // dominates the measurement. The original 2 ms threshold from the
+    // spec was based on a theoretical analysis that assumed D2H
+    // elimination would drop GPU time to near-zero — that assumption was
+    // wrong. Diagnostic instrumentation confirmed 192/192 Unsqueeze
+    // precomp hits yet only a 10% GPU time reduction.
+    //
+    // The REAL savings from Cycle 2 are on the CPU driver-call side:
+    // ~207 D2H calls eliminated per inference on Kokoro seq_len=5.
+    // These don't show up in gpu_op_times but they DO reduce driver
+    // pressure and latency jitter.
+    use iconnx::cuda::inference::testing::count_precomputed_shape_ops;
+    let precompute_stats = count_precomputed_shape_ops(&executor);
+
+    eprintln!(
+        "\n=== Cycle 2 precompute hit rates ===\n  \
+         Unsqueeze: {}/{} hits ({:.0}%)\n  \
+         Reshape:   {}/{} hits ({:.0}%)\n  \
+         Squeeze:   {}/{} hits ({:.0}%)",
+        precompute_stats.unsqueeze_hits,
+        precompute_stats.unsqueeze_total,
+        precompute_stats.unsqueeze_hits as f64 * 100.0
+            / precompute_stats.unsqueeze_total.max(1) as f64,
+        precompute_stats.reshape_hits,
+        precompute_stats.reshape_total,
+        precompute_stats.reshape_hits as f64 * 100.0
+            / precompute_stats.reshape_total.max(1) as f64,
+        precompute_stats.squeeze_hits,
+        precompute_stats.squeeze_total,
+        precompute_stats.squeeze_hits as f64 * 100.0
+            / precompute_stats.squeeze_total.max(1) as f64,
+    );
+
+    // Hit-rate assertions: Cycle 2's mechanism must fire for every node
+    // whose axes/shape input is statically resolvable.
+    //
+    // Unsqueeze: 100% hit expected on Kokoro. All 192 Unsqueeze nodes
+    // have axes from Constant Int64 nodes.
+    assert_eq!(
+        precompute_stats.unsqueeze_hits, precompute_stats.unsqueeze_total,
+        "Cycle 2 Unsqueeze precompute hit rate should be 100% on Kokoro. \
+         Got {}/{}. If this regressed, check that add_node's Constant-Int64 \
+         caching block is still populating static_i64_cache and that \
+         try_precompute_unsqueeze_axes is being called.",
+        precompute_stats.unsqueeze_hits,
+        precompute_stats.unsqueeze_total,
+    );
+
+    // Squeeze: 100% hit expected on Kokoro. Low volume (only 5 nodes).
+    assert_eq!(
+        precompute_stats.squeeze_hits, precompute_stats.squeeze_total,
+        "Cycle 2 Squeeze precompute hit rate should be 100% on Kokoro. \
+         Got {}/{}.",
+        precompute_stats.squeeze_hits,
+        precompute_stats.squeeze_total,
+    );
+
+    // Reshape: lower hit rate is expected because 51 of Kokoro's 61
+    // Reshape nodes have shapes computed at runtime from Shape -> Cast ->
+    // Gather chains. Cycle 2's targeted fix can't reach those; a broader
+    // shape-inference pass (Approach C) is needed. The assertion here is
+    // a floor: at least the 10 Constant-sourced Reshapes must hit.
+    //
+    // Current baseline from Cycle 2 diagnostic: 10/61 hits (16%). Allow
+    // ±2 for graph evolution but catch major regressions.
+    assert!(
+        precompute_stats.reshape_hits >= 8,
+        "Cycle 2 Reshape precompute hit rate regressed: got {}/{} hits \
+         (expected at least 8, baseline 10). This usually means \
+         try_precompute_reshape_shape stopped finding shape inputs in \
+         static_i64_cache.",
+        precompute_stats.reshape_hits,
+        precompute_stats.reshape_total,
+    );
+
+    // Secondary gate: loose GPU-time regression guard. The 2 ms target
+    // from the original spec was wrong; a more realistic guard catches
+    // gross regressions (e.g., if precomputation stopped firing and we
+    // re-introduced D2H on every call) without being flaky on the
+    // measurement floor.
+    //
+    // Post-Cycle-2 baselines from diagnostic run on RTX 4070 Laptop, seq_len=5:
+    //   Unsqueeze: ~3962 us (192 calls, floor dominated by event overhead)
+    //   Reshape:   ~7279 us diagnostic / ~11236 us second run
+    //               (51 misses still do D2H + 10 hits near-zero; wide noise
+    //                observed run-to-run, guard widened accordingly)
+    //   Squeeze:    ~251 us (5 calls, negligible)
+    //
+    // Thresholds pad generously above the widest observed values to
+    // tolerate noise. The guard catches a gross regression (precompute
+    // failing) which would push these values substantially higher.
+    const MAX_GPU_US_REGRESSION_GUARD_UNSQUEEZE: u64 = 6_000;
+    const MAX_GPU_US_REGRESSION_GUARD_RESHAPE: u64 = 14_000;
+    const MAX_GPU_US_REGRESSION_GUARD_SQUEEZE: u64 = 500;
+
+    for (op, limit) in [
+        ("Unsqueeze", MAX_GPU_US_REGRESSION_GUARD_UNSQUEEZE),
+        ("Reshape", MAX_GPU_US_REGRESSION_GUARD_RESHAPE),
+        ("Squeeze", MAX_GPU_US_REGRESSION_GUARD_SQUEEZE),
+    ] {
+        if let Some(&(gpu_us, count)) = profile.gpu_op_times.get(op) {
+            assert!(
+                gpu_us < limit,
+                "{op} GPU time ({gpu_us} us across {count} calls) exceeds \
+                 regression guard {limit} us. This is a gross regression, \
+                 not a measurement-floor issue — check whether precomputation \
+                 is still firing via the hit-rate assertions above.",
+            );
+            eprintln!(
+                "  {:20} Cycle 2: {:>6} us / {:>4} calls — under {} us guard",
+                op, gpu_us, count, limit,
+            );
+        } else {
+            eprintln!(
+                "  {:20} Cycle 2: not present in gpu_op_times (op did not run)",
+                op,
+            );
+        }
+    }
 }

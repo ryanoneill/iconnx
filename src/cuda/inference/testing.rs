@@ -105,3 +105,56 @@ pub fn get_node_precomputed(
         squeeze_axes: node.precomputed_squeeze_axes.clone(),
     })
 }
+
+/// Aggregate counts of how many Unsqueeze/Reshape/Squeeze nodes in the
+/// executor have their precomputed fields populated. Used by the Kokoro
+/// integration test to verify Cycle 2's precomputation mechanism is
+/// firing on real model graphs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrecomputeStats {
+    pub unsqueeze_hits: usize,
+    pub unsqueeze_total: usize,
+    pub reshape_hits: usize,
+    pub reshape_total: usize,
+    pub squeeze_hits: usize,
+    pub squeeze_total: usize,
+}
+
+/// Count precompute hits and totals for Unsqueeze, Reshape, and Squeeze
+/// nodes in the executor's graph.
+///
+/// A "hit" means the ExecutionNode has its precomputed field populated
+/// (`Some(_)`). A "miss" is when the field is `None` — meaning
+/// try_precompute_* failed to find the axes/shape input in the static
+/// cache at add_node time, typically because the input comes from a
+/// runtime-computed chain (Shape -> Cast -> Gather -> ...) rather than
+/// a Constant or initializer.
+pub fn count_precomputed_shape_ops(
+    executor: &crate::cuda::inference::GpuGraphExecutor,
+) -> PrecomputeStats {
+    let mut stats = PrecomputeStats::default();
+    for node in &executor.nodes {
+        match node.op_type.as_str() {
+            "Unsqueeze" => {
+                stats.unsqueeze_total += 1;
+                if node.precomputed_unsqueeze_axes.is_some() {
+                    stats.unsqueeze_hits += 1;
+                }
+            }
+            "Reshape" => {
+                stats.reshape_total += 1;
+                if node.precomputed_reshape_shape.is_some() {
+                    stats.reshape_hits += 1;
+                }
+            }
+            "Squeeze" => {
+                stats.squeeze_total += 1;
+                if node.precomputed_squeeze_axes.is_some() {
+                    stats.squeeze_hits += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    stats
+}
