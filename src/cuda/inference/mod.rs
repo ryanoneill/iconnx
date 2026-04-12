@@ -255,6 +255,9 @@ pub struct GpuGraphExecutor {
     pub(crate) fused_patterns: RefCell<HashMap<String, FusedPatternInfo>>,
     /// Set of node names to skip (they're part of a fused pattern)
     nodes_to_skip: RefCell<std::collections::HashSet<String>>,
+    /// Dynamic fusion candidates: AddMulAdd chains where b/c are runtime-
+    /// computed. Attempted at execution time with shape-check fallback.
+    pub(crate) dynamic_candidates: RefCell<HashMap<String, FusedPatternInfo>>,
     /// Flag to track if patterns have been detected
     patterns_detected: RefCell<bool>,
 
@@ -423,6 +426,7 @@ impl GpuGraphExecutor {
             sorted_nodes_cache: RefCell::new(None),
             fused_patterns: RefCell::new(HashMap::new()),
             nodes_to_skip: RefCell::new(std::collections::HashSet::new()),
+            dynamic_candidates: RefCell::new(HashMap::new()),
             patterns_detected: RefCell::new(false),
             memory_pool: RefCell::new(GpuMemoryPool::new()),
             #[cfg(feature = "debug-inference")]
@@ -541,6 +545,7 @@ impl GpuGraphExecutor {
         // Clear detected patterns (will be re-detected on next run)
         self.fused_patterns.borrow_mut().clear();
         self.nodes_to_skip.borrow_mut().clear();
+        self.dynamic_candidates.borrow_mut().clear();
         *self.patterns_detected.borrow_mut() = false;
     }
 
@@ -641,12 +646,41 @@ impl GpuGraphExecutor {
             return;
         }
 
-        let (detected, skip_set) =
+        let (detected, skip_set, dynamic) =
             fusion::detect_fused_patterns(&self.nodes, &self.weights, &self.ctx);
 
         *self.fused_patterns.borrow_mut() = detected;
         *self.nodes_to_skip.borrow_mut() = skip_set;
+        *self.dynamic_candidates.borrow_mut() = dynamic;
         *self.patterns_detected.borrow_mut() = true;
+    }
+
+    /// Check whether all inputs required by a dynamic AddMulAdd candidate are
+    /// available in `values` or `self.weights`.  Returns `false` if any input
+    /// is missing, signalling that the fusion should be deferred and the head
+    /// node should be executed normally (the interior nodes were not added to
+    /// `nodes_to_skip`, so they will also execute normally).
+    fn dynamic_candidate_inputs_ready(
+        &self,
+        pattern_info: &FusedPatternInfo,
+        values: &HashMap<String, GpuTensor>,
+    ) -> bool {
+        match &pattern_info.pattern {
+            FusedPattern::AddMulAdd {
+                x_input,
+                a_input,
+                b_input,
+                c_input,
+                ..
+            } => {
+                let has = |name: &str| {
+                    values.contains_key(name) || self.weights.contains_key(name)
+                };
+                has(x_input) && has(a_input) && has(b_input) && has(c_input)
+            }
+            // Only AddMulAdd is currently registered as a dynamic candidate.
+            _ => false,
+        }
     }
 
     /// Execute a detected fused pattern
@@ -2797,6 +2831,8 @@ impl GpuGraphExecutor {
         let tensor_last_use = self.compute_tensor_last_use(&sorted_nodes, &output_names);
 
         // Execute nodes in order
+        let mut dynamically_fused: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for (node_idx, node) in sorted_nodes.iter().enumerate() {
             // Skip nodes that are part of a fused pattern (handled by pattern head)
             if self.nodes_to_skip.borrow().contains(&node.name) {
@@ -2832,6 +2868,40 @@ impl GpuGraphExecutor {
                         values.insert(output_name.clone(), output);
                     }
                 }
+                continue;
+            }
+
+            // Dynamic candidate: attempt fusion with shape-check fallback
+            if let Some(pattern_info) =
+                self.dynamic_candidates.borrow().get(&node.name).cloned()
+            {
+                if self.dynamic_candidate_inputs_ready(&pattern_info, &values) {
+                    let result = self.execute_fused_pattern(&pattern_info, &values);
+                    match result {
+                        Ok(output) => {
+                            match &pattern_info.pattern {
+                                FusedPattern::AddMulAdd { output_name, .. } => {
+                                    values.insert(output_name.clone(), output);
+                                }
+                                _ => unreachable!(
+                                    "dynamic candidates are only AddMulAdd"
+                                ),
+                            }
+                            for skip_name in &pattern_info.nodes_to_skip {
+                                dynamically_fused.insert(skip_name.clone());
+                            }
+                            continue;
+                        }
+                        Err(CudaError::FusionShapeMismatch(_)) => {
+                            // Fall through to normal execution
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            // Skip interior nodes of a successfully-fused dynamic candidate
+            if dynamically_fused.contains(&node.name) {
                 continue;
             }
 
@@ -3274,6 +3344,8 @@ impl GpuGraphExecutor {
         let tensor_last_use = self.compute_tensor_last_use(&sorted_nodes, &output_names);
 
         // Execute nodes with validation
+        let mut dynamically_fused: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for (node_idx, node) in sorted_nodes.iter().enumerate() {
             if self.nodes_to_skip.borrow().contains(&node.name) {
                 continue;
@@ -3299,6 +3371,40 @@ impl GpuGraphExecutor {
                 // Validate fused output
                 validator.validate(&output_name, "Fused", &output, &self.ctx)?;
                 values.insert(output_name, output);
+                continue;
+            }
+
+            // Dynamic candidate: attempt fusion with shape-check fallback
+            if let Some(pattern_info) =
+                self.dynamic_candidates.borrow().get(&node.name).cloned()
+            {
+                if self.dynamic_candidate_inputs_ready(&pattern_info, &values) {
+                    let result = self.execute_fused_pattern(&pattern_info, &values);
+                    match result {
+                        Ok(output) => {
+                            match &pattern_info.pattern {
+                                FusedPattern::AddMulAdd { output_name, .. } => {
+                                    values.insert(output_name.clone(), output);
+                                }
+                                _ => unreachable!(
+                                    "dynamic candidates are only AddMulAdd"
+                                ),
+                            }
+                            for skip_name in &pattern_info.nodes_to_skip {
+                                dynamically_fused.insert(skip_name.clone());
+                            }
+                            continue;
+                        }
+                        Err(CudaError::FusionShapeMismatch(_)) => {
+                            // Fall through to normal execution
+                        }
+                        Err(e) => return Err(ValidationError::from(e)),
+                    }
+                }
+            }
+
+            // Skip interior nodes of a successfully-fused dynamic candidate
+            if dynamically_fused.contains(&node.name) {
                 continue;
             }
 
@@ -3547,6 +3653,8 @@ impl GpuGraphExecutor {
         let tensor_last_use = self.compute_tensor_last_use(&sorted_nodes, &output_names);
 
         // Execute nodes with checkpoint capture
+        let mut dynamically_fused: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for (node_idx, node) in sorted_nodes.iter().enumerate() {
             if self.nodes_to_skip.borrow().contains(&node.name) {
                 continue;
@@ -3573,6 +3681,40 @@ impl GpuGraphExecutor {
                     .map_err(|e| CudaError::Kernel(format!("Checkpoint capture failed: {}", e)))?;
 
                 values.insert(output_name, output);
+                continue;
+            }
+
+            // Dynamic candidate: attempt fusion with shape-check fallback
+            if let Some(pattern_info) =
+                self.dynamic_candidates.borrow().get(&node.name).cloned()
+            {
+                if self.dynamic_candidate_inputs_ready(&pattern_info, &values) {
+                    let result = self.execute_fused_pattern(&pattern_info, &values);
+                    match result {
+                        Ok(output) => {
+                            match &pattern_info.pattern {
+                                FusedPattern::AddMulAdd { output_name, .. } => {
+                                    values.insert(output_name.clone(), output);
+                                }
+                                _ => unreachable!(
+                                    "dynamic candidates are only AddMulAdd"
+                                ),
+                            }
+                            for skip_name in &pattern_info.nodes_to_skip {
+                                dynamically_fused.insert(skip_name.clone());
+                            }
+                            continue;
+                        }
+                        Err(CudaError::FusionShapeMismatch(_)) => {
+                            // Fall through to normal execution
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            // Skip interior nodes of a successfully-fused dynamic candidate
+            if dynamically_fused.contains(&node.name) {
                 continue;
             }
 
@@ -4365,6 +4507,8 @@ impl GpuGraphExecutor {
         )?;
         let exec_start = Instant::now();
 
+        let mut dynamically_fused: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for node in sorted_nodes {
             // Skip nodes that are part of a fused pattern (handled by pattern head)
             if self.nodes_to_skip.borrow().contains(&node.name) {
@@ -4420,6 +4564,50 @@ impl GpuGraphExecutor {
 
                 continue;
             }
+
+            // Dynamic candidate: attempt fusion with shape-check fallback
+            if let Some(pattern_info) =
+                self.dynamic_candidates.borrow().get(&node.name).cloned()
+            {
+                if self.dynamic_candidate_inputs_ready(&pattern_info, &values) {
+                    let op_start = Instant::now();
+                    let result = self.execute_fused_pattern(&pattern_info, &values);
+                    match result {
+                        Ok(output) => {
+                            let op_us = op_start.elapsed().as_micros() as u64;
+                            let pattern_name = match &pattern_info.pattern {
+                                FusedPattern::AddMulAdd { output_name, .. } => {
+                                    values.insert(output_name.clone(), output);
+                                    "Fused_AddMulAdd"
+                                }
+                                _ => unreachable!(
+                                    "dynamic candidates are only AddMulAdd"
+                                ),
+                            };
+                            for skip_name in &pattern_info.nodes_to_skip {
+                                dynamically_fused.insert(skip_name.clone());
+                            }
+                            let entry = op_times
+                                .entry(pattern_name.to_string())
+                                .or_insert((0, 0));
+                            entry.0 += op_us;
+                            entry.1 += 1;
+                            gpu_timer.record(pattern_name.to_string())?;
+                            continue;
+                        }
+                        Err(CudaError::FusionShapeMismatch(_)) => {
+                            // Fall through to normal execution
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            // Skip interior nodes of a successfully-fused dynamic candidate
+            if dynamically_fused.contains(&node.name) {
+                continue;
+            }
+
             if node.op_type == "Constant" {
                 if let Some(value_tensor) = node.attributes.get_tensor("value") {
                     let gpu_tensor = match value_tensor {

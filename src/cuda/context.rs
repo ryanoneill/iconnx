@@ -168,6 +168,10 @@ pub enum CudaError {
     Cudnn(String),
     /// Memory operation failed
     Memory(String),
+    /// Fusion shapes are incompatible — fall back to unfused execution.
+    /// This is a sentinel, not a hard error: the executor catches it and
+    /// runs the individual ops instead.
+    FusionShapeMismatch(String),
 }
 
 impl std::fmt::Display for CudaError {
@@ -182,6 +186,9 @@ impl std::fmt::Display for CudaError {
             CudaError::Cublas(s) => write!(f, "cuBLAS operation failed: {}", s),
             CudaError::Cudnn(s) => write!(f, "cuDNN operation failed: {}", s),
             CudaError::Memory(s) => write!(f, "CUDA memory operation failed: {}", s),
+            CudaError::FusionShapeMismatch(s) => {
+                write!(f, "Fusion shape mismatch (fallback): {}", s)
+            }
         }
     }
 }

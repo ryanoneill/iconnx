@@ -70,6 +70,7 @@ const FUSED_KERNEL_NAMES: &[&str] = &[
     // Affine transform: (x + a) * b + c
     "fused_add_mul_add_kernel",
     "fused_add_mul_add_scalar_kernel",
+    "fused_add_mul_add_bcast_c_kernel",
     // Full GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     "fused_gelu_kernel",
     // Mul-Add: y = a * b + c (fused multiply-add)
@@ -173,6 +174,29 @@ extern "C" __global__ void fused_add_mul_add_scalar_kernel(
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = (x[i] + a) * b[i] + c[i];
+    }
+}
+
+// Broadcast-c version: x, a, b have identical shape, c broadcasts via
+// a contiguous non-broadcast block. c_inner_stride is the product of
+// x dims after the non-broadcast block; c_size is the product of dims
+// in the non-broadcast block.
+// AdaIN: c=[1,C,1], x=[1,C,T] -> c_inner_stride=T, c_size=C
+// LSTM:  c=[1,1,C], x=[1,T,C] -> c_inner_stride=1, c_size=C
+extern "C" __global__ void fused_add_mul_add_bcast_c_kernel(
+    float* out,
+    const float* x,
+    const float* a,
+    const float* b,
+    const float* c,
+    size_t n,
+    size_t c_inner_stride,
+    size_t c_size
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        size_t c_idx = (i / c_inner_stride) % c_size;
+        out[i] = (x[i] + a[i]) * b[i] + c[c_idx];
     }
 }
 
@@ -450,6 +474,7 @@ pub(super) fn compute_broadcast_stride(num_shape: &[usize], var_shape: &[usize])
 
 #[cfg(test)]
 mod tests {
+    use super::wrappers::compute_c_broadcast_params;
     use super::*;
     use crate::cuda::memory_pool::GpuMemoryPool;
     use crate::cuda::tensor::GpuTensor;
@@ -660,5 +685,147 @@ mod tests {
         assert!((host_result[1] - 9.0).abs() < 1e-5);
         // (3.0 + 1.5) * 4.0 = 18.0
         assert!((host_result[2] - 18.0).abs() < 1e-5);
+    }
+
+    // ========================================================================
+    // Unit tests for compute_c_broadcast_params
+    // ========================================================================
+
+    #[test]
+    fn test_c_broadcast_params_adain_trailing() {
+        let result = compute_c_broadcast_params(&[1, 256, 1900], &[1, 256, 1]);
+        assert_eq!(result, Some((1900, 256)));
+    }
+
+    #[test]
+    fn test_c_broadcast_params_lstm_middle() {
+        let result = compute_c_broadcast_params(&[1, 5, 512], &[1, 1, 512]);
+        assert_eq!(result, Some((1, 512)));
+    }
+
+    #[test]
+    fn test_c_broadcast_params_same_shape_returns_none() {
+        let result = compute_c_broadcast_params(&[1, 4, 8], &[1, 4, 8]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_c_broadcast_params_incompatible_returns_none() {
+        let result = compute_c_broadcast_params(&[1, 4, 8], &[2, 4, 8]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_c_broadcast_params_non_contiguous_returns_none() {
+        let result = compute_c_broadcast_params(&[4, 3, 4], &[4, 1, 4]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_c_broadcast_params_different_ndim_returns_none() {
+        let result = compute_c_broadcast_params(&[1, 4, 8], &[4, 8]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_c_broadcast_params_all_ones() {
+        let result = compute_c_broadcast_params(&[1, 4, 8], &[1, 1, 1]);
+        assert_eq!(result, Some((1, 1)));
+    }
+
+    #[test]
+    fn test_c_broadcast_params_small_adain() {
+        let result = compute_c_broadcast_params(&[1, 4, 8], &[1, 4, 1]);
+        assert_eq!(result, Some((8, 4)));
+    }
+
+    #[test]
+    fn test_c_broadcast_params_small_lstm() {
+        let result = compute_c_broadcast_params(&[1, 3, 6], &[1, 1, 6]);
+        assert_eq!(result, Some((1, 6)));
+    }
+
+    // ========================================================================
+    // Kernel-level integration tests for broadcast-c dispatch
+    // ========================================================================
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_fused_add_mul_add_bcast_c_adain() {
+        let (ctx, cache, mut pool) = setup();
+
+        let x_data: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let a_data: Vec<f32> = vec![1.0; 32];
+        let b_data: Vec<f32> = vec![2.0; 32];
+        let c_data: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0]; // [1, 4, 1]
+
+        let x = GpuTensor::from_host_f32(&ctx, &x_data, vec![1, 4, 8]).unwrap();
+        let a = GpuTensor::from_host_f32(&ctx, &a_data, vec![1, 4, 8]).unwrap();
+        let b = GpuTensor::from_host_f32(&ctx, &b_data, vec![1, 4, 8]).unwrap();
+        let c = GpuTensor::from_host_f32(&ctx, &c_data, vec![1, 4, 1]).unwrap();
+
+        let out = gpu_fused_add_mul_add(&ctx, &cache, &mut pool, &x, &a, &b, &c).unwrap();
+        let result = out.to_host_f32(&ctx).unwrap();
+
+        for (i, &actual) in result.iter().enumerate().take(32) {
+            let c_idx = (i / 8) % 4;
+            let expected = ((i as f32) + 1.0) * 2.0 + c_data[c_idx];
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "mismatch at i={}: got {} expected {}",
+                i,
+                actual,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_fused_add_mul_add_bcast_c_lstm() {
+        let (ctx, cache, mut pool) = setup();
+
+        let x_data: Vec<f32> = (0..18).map(|i| i as f32).collect();
+        let a_data: Vec<f32> = vec![0.5; 18];
+        let b_data: Vec<f32> = vec![3.0; 18];
+        let c_data: Vec<f32> = vec![100.0, 200.0, 300.0, 400.0, 500.0, 600.0]; // [1, 1, 6]
+
+        let x = GpuTensor::from_host_f32(&ctx, &x_data, vec![1, 3, 6]).unwrap();
+        let a = GpuTensor::from_host_f32(&ctx, &a_data, vec![1, 3, 6]).unwrap();
+        let b = GpuTensor::from_host_f32(&ctx, &b_data, vec![1, 3, 6]).unwrap();
+        let c = GpuTensor::from_host_f32(&ctx, &c_data, vec![1, 1, 6]).unwrap();
+
+        let out = gpu_fused_add_mul_add(&ctx, &cache, &mut pool, &x, &a, &b, &c).unwrap();
+        let result = out.to_host_f32(&ctx).unwrap();
+
+        for (i, &actual) in result.iter().enumerate().take(18) {
+            let c_idx = i % 6;
+            let expected = ((i as f32) + 0.5) * 3.0 + c_data[c_idx];
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "mismatch at i={}: got {} expected {}",
+                i,
+                actual,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_fused_add_mul_add_shape_mismatch_returns_sentinel() {
+        let (ctx, cache, mut pool) = setup();
+
+        let x = GpuTensor::from_host_f32(&ctx, &[1.0; 32], vec![1, 4, 8]).unwrap();
+        let a = GpuTensor::from_host_f32(&ctx, &[1.0; 32], vec![1, 4, 8]).unwrap();
+        let b = GpuTensor::from_host_f32(&ctx, &[1.0; 32], vec![1, 4, 8]).unwrap();
+        let c = GpuTensor::from_host_f32(&ctx, &[1.0; 64], vec![2, 4, 8]).unwrap();
+
+        let result = gpu_fused_add_mul_add(&ctx, &cache, &mut pool, &x, &a, &b, &c);
+        match result {
+            Err(CudaError::FusionShapeMismatch(_)) => {} // expected
+            Err(other) => panic!("expected FusionShapeMismatch, got Err: {}", other),
+            Ok(_) => panic!("expected FusionShapeMismatch, got Ok"),
+        }
     }
 }

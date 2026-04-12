@@ -50,7 +50,11 @@ pub fn detect_fused_patterns_for_tests(
     nodes: &[ExecutionNodeForTests],
     weights: &HashMap<String, GpuTensor>,
     ctx: &IconnxCudaContext,
-) -> (HashMap<String, FusedPatternInfo>, HashSet<String>) {
+) -> (
+    HashMap<String, FusedPatternInfo>,
+    HashSet<String>,
+    HashMap<String, FusedPatternInfo>,
+) {
     let converted: Vec<ExecutionNode> = nodes
         .iter()
         .map(|n| ExecutionNode {
@@ -193,8 +197,9 @@ pub fn count_fused_patterns(
     executor: &crate::cuda::inference::GpuGraphExecutor,
 ) -> PatternCount {
     let patterns = executor.fused_patterns.borrow();
+    let dynamic = executor.dynamic_candidates.borrow();
     let mut count = PatternCount::default();
-    for info in patterns.values() {
+    for info in patterns.values().chain(dynamic.values()) {
         match &info.pattern {
             FusedPattern::DivRsqrt { .. } => count.div_rsqrt += 1,
             FusedPattern::AddMulAdd { .. } => count.add_mul_add += 1,
