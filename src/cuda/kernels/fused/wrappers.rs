@@ -320,7 +320,48 @@ pub fn gpu_fused_add_mul_add(
         }
     }
 
-    // Path 3: shapes incompatible -> sentinel error for fallback
+    // Path 3: Per-channel affine — x=[1,C,1], b=[1,C,T], c=[1,C,1], a empty/scalar
+    // This is Kokoro's AdaIN pattern: scale * normalized_input + bias
+    if b.shape().len() == 3 && b.shape()[0] == 1 {
+        let c_dim = b.shape()[1];
+        let t_dim = b.shape()[2];
+        let is_per_channel_x = x.shape() == [1, c_dim, 1];
+        let is_per_channel_c = c.shape() == [1, c_dim, 1];
+        let is_a_trivial = a.len() <= 1; // empty or scalar
+
+        if t_dim > 1 && is_per_channel_x && is_per_channel_c && is_a_trivial {
+            let n = b.len();
+            let mut out = pool.get_tensor_f32(ctx, b.shape().to_vec())?;
+
+            let func = cache
+                .get("fused_channel_affine_kernel")
+                .ok_or_else(|| {
+                    CudaError::Kernel("fused_channel_affine_kernel not found".into())
+                })?;
+
+            unsafe {
+                ctx.stream()
+                    .launch_builder(func)
+                    .arg(out.data_f32_mut()?)
+                    .arg(b.data_f32()?)    // input (full shape)
+                    .arg(x.data_f32()?)    // scale (per-channel)
+                    .arg(c.data_f32()?)    // bias (per-channel)
+                    .arg(&n)
+                    .arg(&t_dim)
+                    .launch(elementwise_config(n))
+                    .map_err(|e| {
+                        CudaError::Kernel(format!(
+                            "fused_channel_affine launch failed: {}",
+                            e
+                        ))
+                    })?;
+            }
+
+            return Ok(out);
+        }
+    }
+
+    // Path 4: shapes incompatible -> sentinel error for fallback
     Err(CudaError::FusionShapeMismatch(format!(
         "fused_add_mul_add: incompatible shapes x={:?} a={:?} b={:?} c={:?}",
         x.shape(),
