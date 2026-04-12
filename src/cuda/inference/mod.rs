@@ -8,7 +8,8 @@
 use super::context::{CudaError, IconnxCudaContext};
 use super::conv::{add_bias, gpu_conv2d, gpu_conv_transpose_2d, Conv2dParams, ConvKernelCache};
 use super::cudnn::{
-    cudnn_conv_1d, cudnn_conv_transpose_1d, CudnnHandle, Workspace as CudnnWorkspace,
+    cudnn_conv_1d, cudnn_conv_transpose_1d, ConvAlgoCache, CudnnHandle,
+    Workspace as CudnnWorkspace,
 };
 use super::cufft::StftKernelCache;
 use super::kernels::fused::{
@@ -231,6 +232,8 @@ pub struct GpuGraphExecutor {
     cudnn_handle: CudnnHandle,
     /// cuDNN workspace for scratch memory (RefCell for interior mutability)
     cudnn_workspace: RefCell<CudnnWorkspace>,
+    /// cuDNN algorithm selection cache (RefCell for interior mutability)
+    conv_algo_cache: RefCell<ConvAlgoCache>,
 
     /// Dynamic cache for Int64 values (cleared each run due to memory pool pointer reuse)
     /// Keyed by GPU device pointer, stores computed Int64 values during a single run
@@ -419,6 +422,7 @@ impl GpuGraphExecutor {
             fused_kernels,
             cudnn_handle,
             cudnn_workspace,
+            conv_algo_cache: RefCell::new(ConvAlgoCache::new()),
             i64_cache: RefCell::new(HashMap::new()),
             static_i64_cache: RefCell::new(HashMap::new()),
             weights: HashMap::new(),
@@ -1477,10 +1481,12 @@ impl GpuGraphExecutor {
 
                         // Use cuDNN for convolution
                         let mut workspace = self.cudnn_workspace.borrow_mut();
+                        let mut cache = self.conv_algo_cache.borrow_mut();
                         let mut output = cudnn_conv_1d(
                             &self.cudnn_handle,
                             &self.ctx,
                             &mut workspace,
+                            &mut cache,
                             inputs[0],
                             inputs[1],
                             stride,
@@ -1562,6 +1568,7 @@ impl GpuGraphExecutor {
 
                     // Use cuDNN for transposed convolution
                     let mut workspace = self.cudnn_workspace.borrow_mut();
+                    let mut cache = self.conv_algo_cache.borrow_mut();
 
                     // Debug: Print input stats for ConvTranspose
                     if std::env::var("DEBUG_CONV_TRANSPOSE").is_ok() {
@@ -1589,6 +1596,7 @@ impl GpuGraphExecutor {
                         &self.cudnn_handle,
                         &self.ctx,
                         &mut workspace,
+                        &mut cache,
                         inputs[0],
                         inputs[1],
                         stride,
