@@ -91,7 +91,7 @@ fn test_transpose_2d() {
     let result = output.to_host_f32(&ctx).unwrap();
 
     assert_eq!(output.shape(), &[3, 2]);
-    let expected = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
+    let expected = [1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
 
     for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
         assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);
@@ -117,7 +117,7 @@ fn test_where() {
     let output = gpu_where(&ctx, &cache, &mut pool, &condition, &x, &y).unwrap();
     let result = output.to_host_f32(&ctx).unwrap();
 
-    let expected = vec![10.0, 2.0, 30.0, 4.0, 50.0];
+    let expected = [10.0, 2.0, 30.0, 4.0, 50.0];
 
     for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
         assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);
@@ -161,7 +161,7 @@ fn test_slice_contiguous() {
     let result = output.to_host_f32(&ctx).unwrap();
 
     assert_eq!(output.shape(), &[4]);
-    let expected = vec![3.0, 4.0, 5.0, 6.0];
+    let expected = [3.0, 4.0, 5.0, 6.0];
 
     for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
         assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);

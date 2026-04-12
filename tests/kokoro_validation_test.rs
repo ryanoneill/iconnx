@@ -134,11 +134,9 @@ fn test_find_executable_kokoro_subgraph() {
     for node in nodes {
         if supported.contains(node.op_type.as_str()) {
             current_seq.push(node.clone());
-        } else {
-            if !current_seq.is_empty() {
-                sequences.push(current_seq.clone());
-                current_seq.clear();
-            }
+        } else if !current_seq.is_empty() {
+            sequences.push(current_seq.clone());
+            current_seq.clear();
         }
     }
     if !current_seq.is_empty() {

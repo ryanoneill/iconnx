@@ -39,7 +39,7 @@ fn test_stft_simple() {
 
     // Verify output contains real and imaginary parts
     let data = output.to_array();
-    assert!(data.len() > 0, "Output should contain data");
+    assert!(!data.is_empty(), "Output should contain data");
 
     // For a sine wave, DC component should be near zero
     // but some frequency bins should have non-zero values

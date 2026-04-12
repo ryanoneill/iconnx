@@ -108,7 +108,7 @@ fn test_tanh_basic() {
     let result = iconnx::operators::tanh::Tanh::forward(&[data], &NodeAttributes::new());
 
     assert_eq!(result.shape(), &[3]);
-    let expected = vec![0.0, 0.7615942, -0.7615942];
+    let expected = [0.0, 0.7615942, -0.7615942];
     for (i, (&r, &e)) in result.as_slice().iter().zip(expected.iter()).enumerate() {
         assert!((r - e).abs() < 0.0001, "Tanh at {}: {} vs {}", i, r, e);
     }

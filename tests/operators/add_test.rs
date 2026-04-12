@@ -61,8 +61,10 @@ fn test_add_three_inputs() {
 fn test_add_single_input() {
     let a = Tensor::from_vec(vec![1.0, 2.0, 3.0], vec![3]);
 
-    let result =
-        iconnx::operators::add::Add::forward(&[a.clone()], &NodeAttributes::new());
+    let result = iconnx::operators::add::Add::forward(
+        std::slice::from_ref(&a),
+        &NodeAttributes::new(),
+    );
 
     assert_eq!(result.shape(), &[3]);
     assert_eq!(result.as_slice(), &[1.0, 2.0, 3.0]);
