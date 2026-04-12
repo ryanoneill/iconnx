@@ -368,48 +368,15 @@ fn fusion_fires_on_full_kokoro_at_seq_len_5() {
         }
     }
 
-    // === Cycle 3: AddMulAdd detection gap — AdaIN finding ===
+    // === Cycle 4: Dynamic AddMulAdd fusion ===
     //
-    // Cycle 3's original premise was: the walker's static-value check
-    // was too strict (initializer-only), missing Constant-sourced affine
-    // transforms. Task 1 landed an `is_static` closure that also
-    // accepts Constant node outputs. On synthetic Constant-sourced
-    // graphs (see tests/fusion_detection_test.rs), the walker now works
-    // correctly — the unit tests pass.
-    //
-    // On the real Kokoro graph, the fix finds zero AddMulAdd patterns.
-    // A diagnostic instrumentation round revealed why: all 73 candidate
-    // `Add -> Mul -> Add` chains in Kokoro are Adaptive Instance
-    // Normalization (AdaIN) blocks where:
-    //   - b (scale) comes from a `Div` op — runtime-computed style
-    //     modulation that depends on the model's input
-    //   - c (bias) comes from a `Slice` op — a slice of the style
-    //     projection, also runtime-computed
-    //
-    // (Plus 3 LSTM layer-norm chains with b=LayerNormalization,
-    //  c=Transpose — same story: runtime-computed.)
-    //
-    // The `is_static` check correctly rejects these. Fusing them would
-    // require a DIFFERENT fused kernel that reads b and c from device
-    // tensors at execution time — the existing gpu_fused_add_mul_add
-    // bakes b and c as weight-resident constants and enforces
-    // identical shapes across x, a, b, c. A dynamic-AddMulAdd kernel
-    // variant with broadcasting support is a worthwhile future
-    // optimization but is out of scope for Cycle 3: it's a new kernel,
-    // not a walker fix.
-    //
-    // What Cycle 3 delivered:
-    //   - Task 1: is_static closure extension (valuable for any model
-    //     that DOES use Constant-sourced affine transforms)
-    //   - Unit tests proving the walker handles both initializer- and
-    //     Constant-sourced patterns
-    //   - This diagnostic Kokoro assertion that pins the current reality
-    //
-    // The assertion below is `== 0`, documenting that the current
-    // walker+kernel combination legitimately cannot fuse Kokoro's
-    // runtime-affine chains. A future cycle that adds a dynamic
-    // AddMulAdd kernel will need to revisit this assertion (probably
-    // flipping it to a positive threshold like `>= 70`).
+    // Cycle 4 extended the walker to register non-static AddMulAdd
+    // chains as dynamic candidates. The count_fused_patterns helper
+    // counts both static patterns and dynamic candidates. On Kokoro,
+    // all ~73 Add->Mul->Add chains are AdaIN (b=Div, c=Slice) and
+    // are registered as dynamic candidates, bringing the total above
+    // 40. The >= 40 threshold absorbs single-use exclusions and
+    // future pattern subsumption (AddMulAddLeakyRelu).
     //
     // The unasserted pattern counts (DivRsqrt, Gelu, MulSinPowMulAdd, etc.)
     // serve as soft regression signal in the diagnostic printout — a
@@ -418,7 +385,7 @@ fn fusion_fires_on_full_kokoro_at_seq_len_5() {
     use iconnx::cuda::inference::testing::count_fused_patterns;
     let pattern_counts = count_fused_patterns(&executor);
 
-    eprintln!("\n=== Cycle 3 fused pattern counts ===");
+    eprintln!("\n=== Cycle 4 fused pattern counts ===");
     eprintln!("  DivRsqrt:          {:>4}", pattern_counts.div_rsqrt);
     eprintln!("  AddMulAdd:         {:>4}", pattern_counts.add_mul_add);
     eprintln!("  Gelu:              {:>4}", pattern_counts.gelu);
@@ -428,19 +395,14 @@ fn fusion_fires_on_full_kokoro_at_seq_len_5() {
     eprintln!("  SubMul:            {:>4}", pattern_counts.sub_mul);
     eprintln!("  DivMul:            {:>4}", pattern_counts.div_mul);
 
-    assert_eq!(
-        pattern_counts.add_mul_add, 0,
-        "Cycle 3 reality check: Kokoro's AddMulAdd chains are all AdaIN \
-         (runtime-computed b/c via Div and Slice), which the current \
-         static-affine kernel legitimately cannot fuse. Expected 0 \
-         matches until a dynamic-AddMulAdd kernel variant is introduced \
-         in a future cycle. If this assertion is failing because the \
-         count went UP, that's good news — either the walker has been \
-         extended to handle runtime operands, or a new dynamic kernel \
-         has been wired in. Update this assertion to match the new \
-         reality (probably a positive threshold like `>= 70`). If the \
-         count went up to a small positive number unintentionally, the \
-         walker may be silently overpromising — verify that execution \
-         actually succeeds before relaxing this assertion.",
+    assert!(
+        pattern_counts.add_mul_add >= 40,
+        "Cycle 4: Kokoro's ~73 AddMulAdd chains (AdaIN + LSTM layer-norm) \
+         should be registered as dynamic candidates. The count includes \
+         both static patterns and dynamic candidates. The >= 40 threshold \
+         absorbs single-use exclusions, future pattern subsumption \
+         (AddMulAddLeakyRelu), and any shape-mismatch fallbacks on chains \
+         we haven't characterized. Got: {}",
+        pattern_counts.add_mul_add,
     );
 }

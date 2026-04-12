@@ -655,6 +655,34 @@ impl GpuGraphExecutor {
         *self.patterns_detected.borrow_mut() = true;
     }
 
+    /// Check whether all inputs required by a dynamic AddMulAdd candidate are
+    /// available in `values` or `self.weights`.  Returns `false` if any input
+    /// is missing, signalling that the fusion should be deferred and the head
+    /// node should be executed normally (the interior nodes were not added to
+    /// `nodes_to_skip`, so they will also execute normally).
+    fn dynamic_candidate_inputs_ready(
+        &self,
+        pattern_info: &FusedPatternInfo,
+        values: &HashMap<String, GpuTensor>,
+    ) -> bool {
+        match &pattern_info.pattern {
+            FusedPattern::AddMulAdd {
+                x_input,
+                a_input,
+                b_input,
+                c_input,
+                ..
+            } => {
+                let has = |name: &str| {
+                    values.contains_key(name) || self.weights.contains_key(name)
+                };
+                has(x_input) && has(a_input) && has(b_input) && has(c_input)
+            }
+            // Only AddMulAdd is currently registered as a dynamic candidate.
+            _ => false,
+        }
+    }
+
     /// Execute a detected fused pattern
     fn execute_fused_pattern(
         &self,
@@ -2847,26 +2875,28 @@ impl GpuGraphExecutor {
             if let Some(pattern_info) =
                 self.dynamic_candidates.borrow().get(&node.name).cloned()
             {
-                let result = self.execute_fused_pattern(&pattern_info, &values);
-                match result {
-                    Ok(output) => {
-                        match &pattern_info.pattern {
-                            FusedPattern::AddMulAdd { output_name, .. } => {
-                                values.insert(output_name.clone(), output);
+                if self.dynamic_candidate_inputs_ready(&pattern_info, &values) {
+                    let result = self.execute_fused_pattern(&pattern_info, &values);
+                    match result {
+                        Ok(output) => {
+                            match &pattern_info.pattern {
+                                FusedPattern::AddMulAdd { output_name, .. } => {
+                                    values.insert(output_name.clone(), output);
+                                }
+                                _ => unreachable!(
+                                    "dynamic candidates are only AddMulAdd"
+                                ),
                             }
-                            _ => unreachable!(
-                                "dynamic candidates are only AddMulAdd"
-                            ),
+                            for skip_name in &pattern_info.nodes_to_skip {
+                                dynamically_fused.insert(skip_name.clone());
+                            }
+                            continue;
                         }
-                        for skip_name in &pattern_info.nodes_to_skip {
-                            dynamically_fused.insert(skip_name.clone());
+                        Err(CudaError::FusionShapeMismatch(_)) => {
+                            // Fall through to normal execution
                         }
-                        continue;
+                        Err(e) => return Err(e),
                     }
-                    Err(CudaError::FusionShapeMismatch(_)) => {
-                        // Fall through to normal execution
-                    }
-                    Err(e) => return Err(e),
                 }
             }
 
@@ -3348,26 +3378,28 @@ impl GpuGraphExecutor {
             if let Some(pattern_info) =
                 self.dynamic_candidates.borrow().get(&node.name).cloned()
             {
-                let result = self.execute_fused_pattern(&pattern_info, &values);
-                match result {
-                    Ok(output) => {
-                        match &pattern_info.pattern {
-                            FusedPattern::AddMulAdd { output_name, .. } => {
-                                values.insert(output_name.clone(), output);
+                if self.dynamic_candidate_inputs_ready(&pattern_info, &values) {
+                    let result = self.execute_fused_pattern(&pattern_info, &values);
+                    match result {
+                        Ok(output) => {
+                            match &pattern_info.pattern {
+                                FusedPattern::AddMulAdd { output_name, .. } => {
+                                    values.insert(output_name.clone(), output);
+                                }
+                                _ => unreachable!(
+                                    "dynamic candidates are only AddMulAdd"
+                                ),
                             }
-                            _ => unreachable!(
-                                "dynamic candidates are only AddMulAdd"
-                            ),
+                            for skip_name in &pattern_info.nodes_to_skip {
+                                dynamically_fused.insert(skip_name.clone());
+                            }
+                            continue;
                         }
-                        for skip_name in &pattern_info.nodes_to_skip {
-                            dynamically_fused.insert(skip_name.clone());
+                        Err(CudaError::FusionShapeMismatch(_)) => {
+                            // Fall through to normal execution
                         }
-                        continue;
+                        Err(e) => return Err(ValidationError::from(e)),
                     }
-                    Err(CudaError::FusionShapeMismatch(_)) => {
-                        // Fall through to normal execution
-                    }
-                    Err(e) => return Err(ValidationError::from(e)),
                 }
             }
 
@@ -3656,26 +3688,28 @@ impl GpuGraphExecutor {
             if let Some(pattern_info) =
                 self.dynamic_candidates.borrow().get(&node.name).cloned()
             {
-                let result = self.execute_fused_pattern(&pattern_info, &values);
-                match result {
-                    Ok(output) => {
-                        match &pattern_info.pattern {
-                            FusedPattern::AddMulAdd { output_name, .. } => {
-                                values.insert(output_name.clone(), output);
+                if self.dynamic_candidate_inputs_ready(&pattern_info, &values) {
+                    let result = self.execute_fused_pattern(&pattern_info, &values);
+                    match result {
+                        Ok(output) => {
+                            match &pattern_info.pattern {
+                                FusedPattern::AddMulAdd { output_name, .. } => {
+                                    values.insert(output_name.clone(), output);
+                                }
+                                _ => unreachable!(
+                                    "dynamic candidates are only AddMulAdd"
+                                ),
                             }
-                            _ => unreachable!(
-                                "dynamic candidates are only AddMulAdd"
-                            ),
+                            for skip_name in &pattern_info.nodes_to_skip {
+                                dynamically_fused.insert(skip_name.clone());
+                            }
+                            continue;
                         }
-                        for skip_name in &pattern_info.nodes_to_skip {
-                            dynamically_fused.insert(skip_name.clone());
+                        Err(CudaError::FusionShapeMismatch(_)) => {
+                            // Fall through to normal execution
                         }
-                        continue;
+                        Err(e) => return Err(e),
                     }
-                    Err(CudaError::FusionShapeMismatch(_)) => {
-                        // Fall through to normal execution
-                    }
-                    Err(e) => return Err(e),
                 }
             }
 
@@ -4535,35 +4569,37 @@ impl GpuGraphExecutor {
             if let Some(pattern_info) =
                 self.dynamic_candidates.borrow().get(&node.name).cloned()
             {
-                let op_start = Instant::now();
-                let result = self.execute_fused_pattern(&pattern_info, &values);
-                match result {
-                    Ok(output) => {
-                        let op_us = op_start.elapsed().as_micros() as u64;
-                        let pattern_name = match &pattern_info.pattern {
-                            FusedPattern::AddMulAdd { output_name, .. } => {
-                                values.insert(output_name.clone(), output);
-                                "Fused_AddMulAdd"
+                if self.dynamic_candidate_inputs_ready(&pattern_info, &values) {
+                    let op_start = Instant::now();
+                    let result = self.execute_fused_pattern(&pattern_info, &values);
+                    match result {
+                        Ok(output) => {
+                            let op_us = op_start.elapsed().as_micros() as u64;
+                            let pattern_name = match &pattern_info.pattern {
+                                FusedPattern::AddMulAdd { output_name, .. } => {
+                                    values.insert(output_name.clone(), output);
+                                    "Fused_AddMulAdd"
+                                }
+                                _ => unreachable!(
+                                    "dynamic candidates are only AddMulAdd"
+                                ),
+                            };
+                            for skip_name in &pattern_info.nodes_to_skip {
+                                dynamically_fused.insert(skip_name.clone());
                             }
-                            _ => unreachable!(
-                                "dynamic candidates are only AddMulAdd"
-                            ),
-                        };
-                        for skip_name in &pattern_info.nodes_to_skip {
-                            dynamically_fused.insert(skip_name.clone());
+                            let entry = op_times
+                                .entry(pattern_name.to_string())
+                                .or_insert((0, 0));
+                            entry.0 += op_us;
+                            entry.1 += 1;
+                            gpu_timer.record(pattern_name.to_string())?;
+                            continue;
                         }
-                        let entry = op_times
-                            .entry(pattern_name.to_string())
-                            .or_insert((0, 0));
-                        entry.0 += op_us;
-                        entry.1 += 1;
-                        gpu_timer.record(pattern_name.to_string())?;
-                        continue;
+                        Err(CudaError::FusionShapeMismatch(_)) => {
+                            // Fall through to normal execution
+                        }
+                        Err(e) => return Err(e),
                     }
-                    Err(CudaError::FusionShapeMismatch(_)) => {
-                        // Fall through to normal execution
-                    }
-                    Err(e) => return Err(e),
                 }
             }
 
