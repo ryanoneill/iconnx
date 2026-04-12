@@ -9,10 +9,10 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 
 use super::sys;
-use super::{check_cudnn, CudnnHandle, TensorDescriptor};
+use super::{check_cudnn, CudnnHandle, TensorDescriptor, Workspace};
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::tensor::GpuTensor;
 
@@ -223,6 +223,14 @@ impl PackedLstmWeights {
     /// Get the RNN descriptor
     pub(crate) fn rnn_desc(&self) -> &RnnDescriptor {
         &self.rnn_desc
+    }
+
+    /// Get the device pointer and guard for the packed weight buffer
+    pub(crate) fn buffer_device_ptr<'a>(
+        &'a self,
+        stream: &'a CudaStream,
+    ) -> (cudarc::driver::sys::CUdeviceptr, impl Drop + 'a) {
+        self.buffer.device_ptr(stream)
     }
 }
 
@@ -501,4 +509,173 @@ pub fn pack_lstm_weights_for_cudnn(
         size: weight_space_size,
         rnn_desc,
     })
+}
+
+// =============================================================================
+// Forward Pass
+// =============================================================================
+
+/// Execute a fused LSTM forward pass using cuDNN.
+///
+/// Processes the entire sequence in a single cuDNN call, replacing per-timestep
+/// cuBLAS GEMMs + custom CUDA kernels. For Kokoro's bidirectional LSTM with
+/// seq_len=95, this reduces ~570 kernel launches to 1 call.
+///
+/// Returns Y with shape [seq_len, num_directions, batch, hidden_size].
+/// The output layout matches ONNX LSTM's default seq_major format.
+pub fn cudnn_lstm_forward(
+    handle: &CudnnHandle,
+    ctx: &IconnxCudaContext,
+    workspace: &mut Workspace,
+    packed_weights: &PackedLstmWeights,
+    x: &GpuTensor,             // [seq_len, batch, input_size]
+    h_init: Option<&GpuTensor>, // [num_directions, batch, hidden_size]
+    c_init: Option<&GpuTensor>, // [num_directions, batch, hidden_size]
+    hidden_size: usize,
+    num_directions: usize,
+) -> Result<GpuTensor, CudaError> {
+    let x_shape = x.shape();
+
+    // Handle 2D input [seq_len, input_size] by treating as batch=1
+    let (seq_len, batch_size, input_size) = if x_shape.len() == 2 {
+        (x_shape[0], 1, x_shape[1])
+    } else if x_shape.len() == 3 {
+        (x_shape[0], x_shape[1], x_shape[2])
+    } else {
+        return Err(CudaError::Cudnn(format!(
+            "LSTM input must be 2D or 3D, got {:?}",
+            x_shape
+        )));
+    };
+
+    let output_size = num_directions * hidden_size;
+
+    // Create data descriptors for input X and output Y
+    let x_desc = RnnDataDescriptor::new(seq_len, batch_size, input_size)?;
+    let y_desc = RnnDataDescriptor::new(seq_len, batch_size, output_size)?;
+
+    // Create tensor descriptors for hidden/cell state
+    // cuDNN expects h/c descriptors as 3D: [numLayers * numDirs, batch, hidden]
+    let mut h_desc = TensorDescriptor::new()?;
+    let h_dims = [num_directions, batch_size, hidden_size];
+    let h_strides = [batch_size * hidden_size, hidden_size, 1];
+    h_desc.set_nd(
+        &h_dims,
+        &h_strides,
+        sys::cudnnDataType_t::CUDNN_DATA_FLOAT,
+    )?;
+
+    let mut c_desc = TensorDescriptor::new()?;
+    c_desc.set_nd(
+        &h_dims,
+        &h_strides,
+        sys::cudnnDataType_t::CUDNN_DATA_FLOAT,
+    )?;
+
+    // Query workspace size
+    let mut work_space_size: usize = 0;
+    let mut _reserve_space_size: usize = 0;
+    unsafe {
+        check_cudnn(sys::cudnnGetRNNTempSpaceSizes(
+            handle.raw(),
+            packed_weights.rnn_desc().raw(),
+            sys::cudnnForwardMode_t::CUDNN_FWD_MODE_INFERENCE,
+            x_desc.raw(),
+            &mut work_space_size,
+            &mut _reserve_space_size,
+        ))?;
+    }
+
+    // Ensure workspace is large enough
+    workspace.ensure_size(ctx, work_space_size)?;
+
+    // Allocate output Y: [seq_len, batch, num_directions * hidden_size]
+    let mut y = GpuTensor::zeros_f32(ctx, vec![seq_len, batch_size, output_size])?;
+
+    // Create seq_lengths array on device (all same length)
+    let seq_lengths_host: Vec<i32> = vec![seq_len as i32; batch_size];
+    let seq_lengths_dev: CudaSlice<i32> = ctx
+        .htod_i32(&seq_lengths_host)
+        .map_err(|e| CudaError::Transfer(format!("Failed to copy seq_lengths: {}", e)))?;
+
+    // Execute forward pass in a scoped block so device pointer guards are
+    // dropped before we reshape the output tensor.
+    {
+        let stream = ctx.stream();
+
+        let (x_ptr, _x_guard) = x.data_f32()?.device_ptr(stream);
+        let (y_ptr, _y_guard) = y.data_f32_mut()?.device_ptr_mut(stream);
+        let (w_ptr, _w_guard) = packed_weights.buffer_device_ptr(stream);
+        let workspace_ptr = workspace.ptr(stream);
+        let (seq_dev_ptr, _seq_guard) = seq_lengths_dev.device_ptr(stream);
+
+        // Get h_init and c_init raw pointers (null if not provided)
+        let (hx_ptr, _hx_guard) = if let Some(h) = h_init {
+            let (ptr, guard) = h.data_f32()?.device_ptr(stream);
+            (ptr as *const c_void, Some(guard))
+        } else {
+            (ptr::null(), None)
+        };
+
+        let (cx_ptr, _cx_guard) = if let Some(c) = c_init {
+            let (ptr, guard) = c.data_f32()?.device_ptr(stream);
+            (ptr as *const c_void, Some(guard))
+        } else {
+            (ptr::null(), None)
+        };
+
+        unsafe {
+            check_cudnn(sys::cudnnRNNForward(
+                handle.raw(),
+                packed_weights.rnn_desc().raw(),
+                sys::cudnnForwardMode_t::CUDNN_FWD_MODE_INFERENCE,
+                seq_dev_ptr as *const i32,
+                x_desc.raw(),
+                x_ptr as *const c_void,
+                y_desc.raw(),
+                y_ptr as *mut c_void,
+                h_desc.raw(),
+                hx_ptr,
+                ptr::null_mut(), // hy: don't need final hidden state
+                c_desc.raw(),
+                cx_ptr,
+                ptr::null_mut(), // cy: don't need final cell state
+                packed_weights.size(),
+                w_ptr as *const c_void,
+                work_space_size,
+                workspace_ptr,
+                0,               // reserveSpaceSize: 0 for inference
+                ptr::null_mut(), // reserveSpace: null for inference
+            ))?;
+        }
+    }
+
+    // cuDNN output Y is [seq_len, batch, num_directions * hidden_size]
+    // but the existing gpu_lstm returns [seq_len, num_directions, batch, hidden_size]
+    // Reshape to match the expected output format
+    let y_reshaped = y
+        .reshape(vec![seq_len, batch_size, num_directions, hidden_size])
+        .ok_or_else(|| CudaError::Cudnn("Failed to reshape Y for direction split".into()))?;
+
+    // Transpose from [seq, batch, dirs, hidden] to [seq, dirs, batch, hidden]
+    // This matches the ONNX LSTM output layout that gpu_lstm produces.
+    //
+    // For batch=1 (Kokoro's case), [seq, 1, dirs, hidden] == [seq, dirs, 1, hidden]
+    // so reshape alone suffices with no data movement. For batch>1 a transpose
+    // kernel would be needed.
+    if batch_size == 1 {
+        y_reshaped
+            .reshape(vec![seq_len, num_directions, batch_size, hidden_size])
+            .ok_or_else(|| {
+                CudaError::Cudnn("Failed to reshape Y to [seq, dirs, batch, hidden]".into())
+            })
+    } else {
+        // General case: need actual data movement for transposition
+        // [seq, batch, dirs, hidden] -> [seq, dirs, batch, hidden]
+        // For Kokoro all LSTMs have batch=1, so this path is not exercised.
+        Err(CudaError::Cudnn(format!(
+            "cuDNN LSTM with batch_size={} > 1 not yet supported (needs transpose kernel)",
+            batch_size
+        )))
+    }
 }
