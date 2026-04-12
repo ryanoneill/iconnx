@@ -171,8 +171,83 @@ pub fn gpu_fused_div_rsqrt(
     )))
 }
 
+/// Compute broadcast parameters for c in the AddMulAdd fusion.
+///
+/// Returns `Some((c_inner_stride, c_size))` if c is broadcast-compatible
+/// with x (same ndim, each c dim is 1 or matches x, at least one dim is 1,
+/// and the non-broadcast dims form a single contiguous block).
+///
+/// Returns `None` if shapes are incompatible or the broadcast pattern
+/// is non-contiguous (e.g., c = [C, 1, C]).
+pub(super) fn compute_c_broadcast_params(
+    x_shape: &[usize],
+    c_shape: &[usize],
+) -> Option<(usize, usize)> {
+    if x_shape.len() != c_shape.len() {
+        return None;
+    }
+
+    // Classify each dimension as broadcast (c=1, x>1) or matching (c==x)
+    // Also reject incompatible (c!=1 && c!=x)
+    let mut has_broadcast = false;
+    for (x_dim, c_dim) in x_shape.iter().zip(c_shape.iter()) {
+        if *c_dim == *x_dim {
+            // matching
+        } else if *c_dim == 1 {
+            has_broadcast = true;
+        } else {
+            return None; // incompatible
+        }
+    }
+
+    if !has_broadcast {
+        // All dims match -- this is the same-shape case, not broadcast
+        return None;
+    }
+
+    // Find the contiguous non-broadcast block.
+    // Non-broadcast dimension indices (where c_dim == x_dim AND x_dim > 1)
+    // Dims where both are 1 can be treated as either broadcast or matching.
+    let non_bcast_indices: Vec<usize> = x_shape
+        .iter()
+        .zip(c_shape.iter())
+        .enumerate()
+        .filter(|(_i, (x_d, c_d))| **c_d == **x_d && **x_d > 1)
+        .map(|(i, _)| i)
+        .collect();
+
+    if non_bcast_indices.is_empty() {
+        // c is all 1s -- degenerate scalar broadcast.
+        // c_size = 1, c_inner_stride = 1 works (c_idx = (i/1)%1 = 0 always).
+        return Some((1, 1));
+    }
+
+    // Check contiguity: indices must be consecutive
+    for window in non_bcast_indices.windows(2) {
+        if window[1] != window[0] + 1 {
+            return None; // non-contiguous non-broadcast block
+        }
+    }
+
+    let block_start = non_bcast_indices[0];
+    let block_end = *non_bcast_indices.last().unwrap() + 1; // exclusive
+
+    // c_size = product of x dims in [block_start..block_end)
+    let c_size: usize = x_shape[block_start..block_end].iter().product();
+
+    // c_inner_stride = product of x dims in [block_end..ndim)
+    let c_inner_stride: usize = x_shape[block_end..].iter().product();
+
+    Some((c_inner_stride, c_size))
+}
+
 /// GPU fused add_mul_add: out = (x + a) * b + c
 /// Replaces Add -> Mul -> Add pattern
+///
+/// Three-way dispatch:
+/// 1. All four shapes identical -> existing same-shape kernel
+/// 2. x, a, b same shape + c broadcasts -> broadcast-c kernel
+/// 3. Incompatible shapes -> FusionShapeMismatch sentinel for fallback
 pub fn gpu_fused_add_mul_add(
     ctx: &IconnxCudaContext,
     cache: &FusedKernelCache,
@@ -184,43 +259,75 @@ pub fn gpu_fused_add_mul_add(
 ) -> Result<GpuTensor, CudaError> {
     let n = x.len();
 
-    // Check if a is scalar (broadcast case)
-    if a.len() == 1 {
-        // Use scalar version - need to read scalar value from GPU
-        // For now, use tensor version with broadcasting handled at caller
+    // Path 1: All four shapes identical -> existing same-shape kernel
+    if x.shape() == a.shape() && x.shape() == b.shape() && x.shape() == c.shape() {
+        let mut out = pool.get_tensor_f32(ctx, x.shape().to_vec())?;
+
+        let func = cache
+            .get("fused_add_mul_add_kernel")
+            .ok_or_else(|| CudaError::Kernel("fused_add_mul_add_kernel not found".into()))?;
+
+        unsafe {
+            ctx.stream()
+                .launch_builder(func)
+                .arg(out.data_f32_mut()?)
+                .arg(x.data_f32()?)
+                .arg(a.data_f32()?)
+                .arg(b.data_f32()?)
+                .arg(c.data_f32()?)
+                .arg(&n)
+                .launch(elementwise_config(n))
+                .map_err(|e| {
+                    CudaError::Kernel(format!("fused_add_mul_add launch failed: {}", e))
+                })?;
+        }
+
+        return Ok(out);
     }
 
-    // All shapes must match for the simple case
-    if x.shape() != a.shape() || x.shape() != b.shape() || x.shape() != c.shape() {
-        return Err(CudaError::Kernel(format!(
-            "fused_add_mul_add: shape mismatch x={:?} a={:?} b={:?} c={:?}",
-            x.shape(),
-            a.shape(),
-            b.shape(),
-            c.shape()
-        )));
+    // Path 2: x, a, b same shape + c broadcasts -> broadcast-c kernel
+    if x.shape() == a.shape() && x.shape() == b.shape() {
+        if let Some((c_inner_stride, c_size)) =
+            compute_c_broadcast_params(x.shape(), c.shape())
+        {
+            let mut out = pool.get_tensor_f32(ctx, x.shape().to_vec())?;
+
+            let func = cache.get("fused_add_mul_add_bcast_c_kernel").ok_or_else(|| {
+                CudaError::Kernel("fused_add_mul_add_bcast_c_kernel not found".into())
+            })?;
+
+            unsafe {
+                ctx.stream()
+                    .launch_builder(func)
+                    .arg(out.data_f32_mut()?)
+                    .arg(x.data_f32()?)
+                    .arg(a.data_f32()?)
+                    .arg(b.data_f32()?)
+                    .arg(c.data_f32()?)
+                    .arg(&n)
+                    .arg(&c_inner_stride)
+                    .arg(&c_size)
+                    .launch(elementwise_config(n))
+                    .map_err(|e| {
+                        CudaError::Kernel(format!(
+                            "fused_add_mul_add_bcast_c launch failed: {}",
+                            e
+                        ))
+                    })?;
+            }
+
+            return Ok(out);
+        }
     }
 
-    let mut out = pool.get_tensor_f32(ctx, x.shape().to_vec())?;
-
-    let func = cache
-        .get("fused_add_mul_add_kernel")
-        .ok_or_else(|| CudaError::Kernel("fused_add_mul_add_kernel not found".into()))?;
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(x.data_f32()?)
-            .arg(a.data_f32()?)
-            .arg(b.data_f32()?)
-            .arg(c.data_f32()?)
-            .arg(&n)
-            .launch(elementwise_config(n))
-            .map_err(|e| CudaError::Kernel(format!("fused_add_mul_add launch failed: {}", e)))?;
-    }
-
-    Ok(out)
+    // Path 3: shapes incompatible -> sentinel error for fallback
+    Err(CudaError::FusionShapeMismatch(format!(
+        "fused_add_mul_add: incompatible shapes x={:?} a={:?} b={:?} c={:?}",
+        x.shape(),
+        a.shape(),
+        b.shape(),
+        c.shape()
+    )))
 }
 
 /// GPU fused GELU: out = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
