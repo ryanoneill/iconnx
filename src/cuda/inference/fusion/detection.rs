@@ -46,6 +46,29 @@ pub(crate) fn detect_fused_patterns(
     let mut fused_patterns: HashMap<String, FusedPatternInfo> = HashMap::new();
     let mut nodes_to_skip: HashSet<String> = HashSet::new();
 
+    // Predicate: is this tensor name a "static" value (known at graph-build
+    // time)? Matches either (a) an initializer registered via
+    // add_initializer (present in `weights`), or (b) the output of a
+    // `Constant` node added earlier in topological order (looked up via
+    // `output_to_node[name].op_type`).
+    //
+    // Used by the AddMulAdd walker's semantic-intent check: fuse only
+    // affine transforms where b (scale) and c (bias) are static values.
+    // Extends the original "initializer-only" check — Cycle 3 confirmed
+    // Kokoro's affine scales/biases come from Constant Float32 nodes, not
+    // initializers, so the walker was missing all 51 real instances.
+    //
+    // Not recognized as static: Cast-of-Constant, Unsqueeze-of-Constant,
+    // or any other chain. A broader shape/value inference pass would be
+    // needed for those.
+    let is_static = |name: &str| -> bool {
+        weights.contains_key(name)
+            || output_to_node
+                .get(name)
+                .map(|n| n.op_type == "Constant")
+                .unwrap_or(false)
+    };
+
     // Detect Add -> Sqrt -> Div pattern (normalization)
     // Pattern: numerator / sqrt(variance + eps)
     // Now supports broadcasting when variance has trailing 1 dimensions
@@ -158,10 +181,13 @@ pub(crate) fn detect_fused_patterns(
                         add2_node.inputs[0].clone()
                     };
 
-                    // Only fuse if b and c are weights (not computed values)
-                    // This ensures the affine transform pattern (gamma, beta are weights)
-                    if !weights.contains_key(&b_input) || !weights.contains_key(&c_input)
-                    {
+                    // Only fuse if b and c are static (initializers or
+                    // Constant node outputs). This preserves the affine-
+                    // transform semantic — gamma/beta are baked into the
+                    // model — while recognizing that modern ONNX exports
+                    // emit these as Constant Float32 nodes rather than
+                    // initializers. See the `is_static` closure above.
+                    if !is_static(&b_input) || !is_static(&c_input) {
                         continue;
                     }
 

@@ -15,6 +15,7 @@ use iconnx::cuda::inference::testing::{
     detect_fused_patterns_for_tests, is_mul_sin_pow_mul_add, ExecutionNodeForTests, FusedPattern,
 };
 use iconnx::cuda::{GpuTensor, IconnxCudaContext};
+use iconnx::tensor::Tensor;
 
 /// Helper: build a node with the given name, op type, inputs, and outputs
 /// (no attributes, no precomputed slice).
@@ -241,7 +242,6 @@ fn rejects_non_integer_exponent() {
 #[test]
 fn executor_runs_mul_sin_pow_mul_add_and_records_profile_entry() {
     use iconnx::cuda::GpuGraphExecutor;
-    use iconnx::tensor::Tensor;
     use iconnx::NodeAttributes;
 
     // Minimal graph: the same 5-op chain, with x as a runtime input and
@@ -373,4 +373,183 @@ fn executor_runs_mul_sin_pow_mul_add_and_records_profile_entry() {
             diff
         );
     }
+}
+
+/// Build a NodeAttributes whose `"value"` attribute is a Float32 tensor.
+/// Used for Constant Float32 nodes (e.g., affine transform scales and
+/// biases that modern ONNX exports emit as Constant nodes rather than
+/// baking into initializers).
+fn float32_constant_attrs(value: f32) -> NodeAttributes {
+    let mut attrs = NodeAttributes::default();
+    let tensor = Tensor::from_vec_f32(vec![value], vec![1]);
+    attrs.add_tensor("value".to_string(), tensor);
+    attrs
+}
+
+#[test]
+fn add_mul_add_detects_with_initializer_bc() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+
+    // Build the 3-op chain: (x + a) * b + c
+    //   t0 = Add(x, a)
+    //   t1 = Mul(t0, b)
+    //   y  = Add(t1, c)
+    let nodes = vec![
+        node("add1", "Add", &["x", "a"], &["t0"]),
+        node("mul1", "Mul", &["t0", "b"], &["t1"]),
+        node("add2", "Add", &["t1", "c"], &["y"]),
+    ];
+
+    // b and c are initializers (in the weights map).
+    let mut weights = HashMap::new();
+    weights.insert(
+        "b".to_string(),
+        GpuTensor::from_host_f32(&ctx, &[2.0], vec![1]).expect("b"),
+    );
+    weights.insert(
+        "c".to_string(),
+        GpuTensor::from_host_f32(&ctx, &[3.0], vec![1]).expect("c"),
+    );
+
+    let (patterns, _skip) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+
+    let info = patterns.get("add1").unwrap_or_else(|| {
+        panic!(
+            "add1 was not registered. Registered patterns: {:?}",
+            patterns.keys().collect::<Vec<_>>()
+        )
+    });
+    match &info.pattern {
+        FusedPattern::AddMulAdd {
+            x_input,
+            a_input,
+            b_input,
+            c_input,
+            output_name,
+        } => {
+            assert_eq!(x_input, "x");
+            assert_eq!(a_input, "a");
+            assert_eq!(b_input, "b");
+            assert_eq!(c_input, "c");
+            assert_eq!(output_name, "y");
+        }
+        other => panic!("expected AddMulAdd, got {:?}", other),
+    }
+}
+
+#[test]
+fn add_mul_add_detects_with_constant_bc() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+
+    // Build a graph with Constant Float32 nodes producing b and c,
+    // followed by the 3-op chain (x + a) * b + c.
+    let nodes = vec![
+        ExecutionNodeForTests {
+            name: "b_const".to_string(),
+            op_type: "Constant".to_string(),
+            inputs: vec![],
+            outputs: vec!["b".to_string()],
+            attributes: float32_constant_attrs(2.0),
+        },
+        ExecutionNodeForTests {
+            name: "c_const".to_string(),
+            op_type: "Constant".to_string(),
+            inputs: vec![],
+            outputs: vec!["c".to_string()],
+            attributes: float32_constant_attrs(3.0),
+        },
+        node("add1", "Add", &["x", "a"], &["t0"]),
+        node("mul1", "Mul", &["t0", "b"], &["t1"]),
+        node("add2", "Add", &["t1", "c"], &["y"]),
+    ];
+
+    // Empty weights map — b and c come from Constant nodes, not initializers.
+    let weights = HashMap::new();
+
+    let (patterns, _skip) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+
+    let info = patterns.get("add1").unwrap_or_else(|| {
+        panic!(
+            "add1 was not registered with Constant-sourced b/c. \
+             This is the Cycle 3 fix: is_static should recognize \
+             Constant node outputs, not just initializers. \
+             Registered: {:?}",
+            patterns.keys().collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        matches!(&info.pattern, FusedPattern::AddMulAdd { .. }),
+        "add1 registered but not as AddMulAdd: {:?}",
+        info.pattern
+    );
+}
+
+#[test]
+fn add_mul_add_rejects_when_b_is_computed() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+
+    // Build a graph where `b` is produced by a non-Constant op (Shape),
+    // so it's neither an initializer nor a Constant — it's a runtime
+    // computed value. The walker should NOT fuse this because the
+    // semantic intent is "static affine transform."
+    let nodes = vec![
+        node("shape_src", "Shape", &["shape_src_in"], &["b"]),
+        node("add1", "Add", &["x", "a"], &["t0"]),
+        node("mul1", "Mul", &["t0", "b"], &["t1"]),
+        node("add2", "Add", &["t1", "c"], &["y"]),
+    ];
+
+    // c is an initializer; b is the output of Shape (runtime-computed).
+    let mut weights = HashMap::new();
+    weights.insert(
+        "c".to_string(),
+        GpuTensor::from_host_f32(&ctx, &[3.0], vec![1]).expect("c"),
+    );
+
+    let (patterns, _skip) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+
+    let is_add_mul_add = patterns
+        .get("add1")
+        .map(|info| matches!(info.pattern, FusedPattern::AddMulAdd { .. }))
+        .unwrap_or(false);
+    assert!(
+        !is_add_mul_add,
+        "AddMulAdd must NOT fuse when b is a runtime-computed value. \
+         The static-value check exists to preserve the 'static affine \
+         transform' semantic. Got patterns: {:?}",
+        patterns.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn add_mul_add_rejects_when_c_is_computed() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+
+    // Mirror of the b-is-computed case. c comes from a non-Constant op
+    // (Shape); b is an initializer. The walker should still reject.
+    let nodes = vec![
+        node("shape_src", "Shape", &["shape_src_in"], &["c"]),
+        node("add1", "Add", &["x", "a"], &["t0"]),
+        node("mul1", "Mul", &["t0", "b"], &["t1"]),
+        node("add2", "Add", &["t1", "c"], &["y"]),
+    ];
+
+    let mut weights = HashMap::new();
+    weights.insert(
+        "b".to_string(),
+        GpuTensor::from_host_f32(&ctx, &[2.0], vec![1]).expect("b"),
+    );
+
+    let (patterns, _skip) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+
+    let is_add_mul_add = patterns
+        .get("add1")
+        .map(|info| matches!(info.pattern, FusedPattern::AddMulAdd { .. }))
+        .unwrap_or(false);
+    assert!(
+        !is_add_mul_add,
+        "AddMulAdd must NOT fuse when c is a runtime-computed value. \
+         Got patterns: {:?}",
+        patterns.keys().collect::<Vec<_>>()
+    );
 }
