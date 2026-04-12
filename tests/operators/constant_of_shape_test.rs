@@ -41,15 +41,19 @@ fn test_constant_of_shape_ones() {
 fn test_constant_of_shape_1d_custom() {
     let shape = Tensor::from_vec(vec![5.0], vec![1]);
 
-    // Set value=3.14 via attributes
+    // Set value=PI via attributes (arbitrary test value, chosen as a
+    // named constant so clippy's approx_constant lint stays happy)
     let mut attrs = NodeAttributes::new();
-    attrs.add_tensor("value".to_string(), Tensor::from_vec(vec![3.14], vec![]));
+    attrs.add_tensor(
+        "value".to_string(),
+        Tensor::from_vec(vec![std::f32::consts::PI], vec![]),
+    );
 
     let result =
         iconnx::operators::constant_of_shape::ConstantOfShape::forward(&[shape], &attrs);
 
     assert_eq!(result.shape(), &[5]);
-    assert_eq!(result.as_slice(), vec![3.14, 3.14, 3.14, 3.14, 3.14]);
+    assert_eq!(result.as_slice(), vec![std::f32::consts::PI; 5]);
 }
 
 /// Test 4: Create 3D tensor filled with negative value
