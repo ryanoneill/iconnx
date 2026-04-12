@@ -114,6 +114,40 @@ pub enum cudnnMathType_t {
     CUDNN_FMA_MATH = 3,
 }
 
+/// Determinism mode for cuDNN algorithms
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum cudnnDeterminism_t {
+    CUDNN_NON_DETERMINISTIC = 0,
+    CUDNN_DETERMINISTIC = 1,
+}
+
+/// Performance results for convolution forward algorithm selection
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct cudnnConvolutionFwdAlgoPerf_t {
+    pub algo: cudnnConvolutionFwdAlgo_t,
+    pub status: cudnnStatus_t,
+    pub time: f32,
+    pub memory: usize,
+    pub determinism: cudnnDeterminism_t,
+    pub mathType: cudnnMathType_t,
+    pub reserved: [c_int; 3],
+}
+
+/// Performance results for convolution backward data algorithm selection
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct cudnnConvolutionBwdDataAlgoPerf_t {
+    pub algo: cudnnConvolutionBwdDataAlgo_t,
+    pub status: cudnnStatus_t,
+    pub time: f32,
+    pub memory: usize,
+    pub determinism: cudnnDeterminism_t,
+    pub mathType: cudnnMathType_t,
+    pub reserved: [c_int; 3],
+}
+
 /// NaN propagation
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +370,22 @@ extern "C" {
         sizeInBytes: *mut usize,
     ) -> cudnnStatus_t;
 
+    // -------------------------------------------------------------------------
+    // Convolution Algorithm Selection
+    // -------------------------------------------------------------------------
+
+    /// Get best convolution forward algorithms (heuristic-based, no benchmarking)
+    pub fn cudnnGetConvolutionForwardAlgorithm_v7(
+        handle: cudnnHandle_t,
+        xDesc: cudnnTensorDescriptor_t,
+        wDesc: cudnnFilterDescriptor_t,
+        convDesc: cudnnConvolutionDescriptor_t,
+        yDesc: cudnnTensorDescriptor_t,
+        requestedAlgoCount: c_int,
+        returnedAlgoCount: *mut c_int,
+        perfResults: *mut cudnnConvolutionFwdAlgoPerf_t,
+    ) -> cudnnStatus_t;
+
     /// Perform convolution forward
     pub fn cudnnConvolutionForward(
         handle: cudnnHandle_t,
@@ -366,6 +416,18 @@ extern "C" {
         dxDesc: cudnnTensorDescriptor_t,
         algo: cudnnConvolutionBwdDataAlgo_t,
         sizeInBytes: *mut usize,
+    ) -> cudnnStatus_t;
+
+    /// Get best backward data algorithms (heuristic-based, no benchmarking)
+    pub fn cudnnGetConvolutionBackwardDataAlgorithm_v7(
+        handle: cudnnHandle_t,
+        wDesc: cudnnFilterDescriptor_t,
+        dyDesc: cudnnTensorDescriptor_t,
+        convDesc: cudnnConvolutionDescriptor_t,
+        dxDesc: cudnnTensorDescriptor_t,
+        requestedAlgoCount: c_int,
+        returnedAlgoCount: *mut c_int,
+        perfResults: *mut cudnnConvolutionBwdDataAlgoPerf_t,
     ) -> cudnnStatus_t;
 
     /// Perform convolution backward data (ConvTranspose)
