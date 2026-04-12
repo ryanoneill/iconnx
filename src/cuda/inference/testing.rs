@@ -158,3 +158,53 @@ pub fn count_precomputed_shape_ops(
     }
     stats
 }
+
+/// Snapshot of how many of each `FusedPattern` variant the detection
+/// walker registered. Used by integration tests to verify specific
+/// pattern detection works end-to-end on real graphs.
+///
+/// Every variant gets its own counter even if only some are asserted.
+/// The unasserted ones serve as soft regression signal in the test's
+/// diagnostic printout — a future change that silently drops DivRsqrt
+/// from 65 to 50 would be visible in the test output.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatternCount {
+    pub div_rsqrt: usize,
+    pub add_mul_add: usize,
+    pub gelu: usize,
+    pub mul_sin_pow_mul_add: usize,
+    pub mul_add: usize,
+    pub add_mul: usize,
+    pub sub_mul: usize,
+    pub div_mul: usize,
+}
+
+/// Count how many of each fused-pattern variant the detection walker
+/// has registered on the given executor. Call AFTER a `run()` or
+/// `run_with_profiling()` invocation has triggered `detect_fused_patterns`.
+///
+/// This is a test-only helper — production code should not need it.
+///
+/// Panics if `executor.fused_patterns` is currently mutably borrowed by
+/// another thread (which cannot happen in normal test usage because the
+/// walker is called inline inside `run_with_profiling` and completes
+/// before returning).
+pub fn count_fused_patterns(
+    executor: &crate::cuda::inference::GpuGraphExecutor,
+) -> PatternCount {
+    let patterns = executor.fused_patterns.borrow();
+    let mut count = PatternCount::default();
+    for info in patterns.values() {
+        match &info.pattern {
+            FusedPattern::DivRsqrt { .. } => count.div_rsqrt += 1,
+            FusedPattern::AddMulAdd { .. } => count.add_mul_add += 1,
+            FusedPattern::Gelu { .. } => count.gelu += 1,
+            FusedPattern::MulSinPowMulAdd { .. } => count.mul_sin_pow_mul_add += 1,
+            FusedPattern::MulAdd { .. } => count.mul_add += 1,
+            FusedPattern::AddMul { .. } => count.add_mul += 1,
+            FusedPattern::SubMul { .. } => count.sub_mul += 1,
+            FusedPattern::DivMul { .. } => count.div_mul += 1,
+        }
+    }
+    count
+}
