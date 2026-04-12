@@ -495,6 +495,59 @@ fn find_best_fwd_algo(
     Ok(algo)
 }
 
+/// Query cuDNN for the best backward-data convolution algorithm, caching by shape key.
+fn find_best_bwd_data_algo(
+    handle: &CudnnHandle,
+    filter_desc: &FilterDescriptor,
+    input_desc: &TensorDescriptor,
+    conv_desc: &ConvolutionDescriptor,
+    output_desc: &TensorDescriptor,
+    cache: &mut ConvAlgoCache,
+    key: &ConvAlgoKey,
+) -> Result<sys::cudnnConvolutionBwdDataAlgo_t, CudaError> {
+    if let Some(&algo) = cache.backward_data.get(key) {
+        return Ok(algo);
+    }
+
+    const MAX_ALGOS: usize = 6;
+    let mut perf_results = [sys::cudnnConvolutionBwdDataAlgoPerf_t {
+        algo: sys::cudnnConvolutionBwdDataAlgo_t::CUDNN_CONVOLUTION_BWD_DATA_ALGO_1,
+        status: sys::cudnnStatus_t::CUDNN_STATUS_NOT_INITIALIZED,
+        time: 0.0,
+        memory: 0,
+        determinism: sys::cudnnDeterminism_t::CUDNN_NON_DETERMINISTIC,
+        mathType: sys::cudnnMathType_t::CUDNN_DEFAULT_MATH,
+        reserved: [0; 3],
+    }; MAX_ALGOS];
+    let mut returned_count: c_int = 0;
+
+    unsafe {
+        check_cudnn(sys::cudnnGetConvolutionBackwardDataAlgorithm_v7(
+            handle.raw(),
+            filter_desc.raw(),
+            input_desc.raw(),
+            conv_desc.raw(),
+            output_desc.raw(),
+            MAX_ALGOS as c_int,
+            &mut returned_count,
+            perf_results.as_mut_ptr(),
+        ))?;
+    }
+
+    let best = perf_results[..returned_count as usize]
+        .iter()
+        .find(|r| r.status == sys::cudnnStatus_t::CUDNN_STATUS_SUCCESS)
+        .ok_or_else(|| {
+            CudaError::Cudnn(
+                "cudnnGetConvolutionBackwardDataAlgorithm_v7: no successful algorithms".into(),
+            )
+        })?;
+
+    let algo = best.algo;
+    cache.backward_data.insert(key.clone(), algo);
+    Ok(algo)
+}
+
 // =============================================================================
 // High-Level Operations
 // =============================================================================
@@ -509,6 +562,7 @@ pub fn cudnn_conv_transpose_1d(
     handle: &CudnnHandle,
     ctx: &IconnxCudaContext,
     workspace: &mut Workspace,
+    cache: &mut ConvAlgoCache,
     input: &GpuTensor,
     kernel: &GpuTensor,
     stride: usize,
@@ -588,8 +642,27 @@ pub fn cudnn_conv_transpose_1d(
     conv_desc.set_group_count(groups)?;
     conv_desc.set_math_type(true)?; // Enable tensor cores
 
+    // Select best algorithm (cached per shape)
+    let key = ConvAlgoKey {
+        input_shape: input_shape.to_vec(),
+        kernel_shape: kernel_shape.to_vec(),
+        stride,
+        padding,
+        dilation,
+        groups,
+        dtype: "f32",
+    };
+    let algo = find_best_bwd_data_algo(
+        handle,
+        &filter_desc,
+        &input_desc,
+        &conv_desc,
+        &output_desc,
+        cache,
+        &key,
+    )?;
+
     // Get workspace size
-    let algo = cudnnConvolutionBwdDataAlgo_t::CUDNN_CONVOLUTION_BWD_DATA_ALGO_1;
     let mut workspace_size: usize = 0;
     unsafe {
         check_cudnn(sys::cudnnGetConvolutionBackwardDataWorkspaceSize(
@@ -873,6 +946,7 @@ mod tests {
             .expect("Failed to set stream");
 
         let mut workspace = Workspace::new();
+        let mut cache = ConvAlgoCache::new();
 
         // Create test input: [batch=1, channels=8, length=8]
         let input_data: Vec<f32> = (0..64).map(|i| i as f32 * 0.1).collect();
@@ -887,6 +961,7 @@ mod tests {
             &handle,
             &ctx,
             &mut workspace,
+            &mut cache,
             &input,
             &kernel,
             2, // stride
