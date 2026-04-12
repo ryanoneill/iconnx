@@ -553,3 +553,170 @@ fn add_mul_add_rejects_when_c_is_computed() {
         patterns.keys().collect::<Vec<_>>()
     );
 }
+
+// ============================================================================
+// Cycle 4: Dynamic AddMulAdd candidate tests
+// ============================================================================
+
+#[test]
+fn dynamic_add_mul_add_registered_when_b_is_runtime_computed() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+
+    // b comes from a Div node (runtime computed, like AdaIN's instance-norm scale).
+    // c is an initializer (static).
+    let nodes = vec![
+        node("div_src", "Div", &["div_in_a", "div_in_b"], &["b"]),
+        node("add1", "Add", &["x", "a"], &["t0"]),
+        node("mul1", "Mul", &["t0", "b"], &["t1"]),
+        node("add2", "Add", &["t1", "c"], &["y"]),
+    ];
+
+    let mut weights = HashMap::new();
+    weights.insert(
+        "c".to_string(),
+        GpuTensor::from_host_f32(&ctx, &[3.0], vec![1]).expect("c"),
+    );
+
+    let (patterns, _skip, dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+
+    assert!(
+        !patterns.contains_key("add1"),
+        "add1 should not be a static pattern when b is runtime-computed"
+    );
+
+    let info = dynamic.get("add1").unwrap_or_else(|| {
+        panic!(
+            "add1 was not registered as dynamic candidate. \
+             Static patterns: {:?}, Dynamic: {:?}",
+            patterns.keys().collect::<Vec<_>>(),
+            dynamic.keys().collect::<Vec<_>>()
+        )
+    });
+    match &info.pattern {
+        FusedPattern::AddMulAdd {
+            x_input,
+            a_input,
+            b_input,
+            c_input,
+            output_name,
+        } => {
+            assert_eq!(x_input, "x");
+            assert_eq!(a_input, "a");
+            assert_eq!(b_input, "b");
+            assert_eq!(c_input, "c");
+            assert_eq!(output_name, "y");
+        }
+        other => panic!("expected AddMulAdd, got {:?}", other),
+    }
+}
+
+#[test]
+fn dynamic_add_mul_add_registered_when_c_is_runtime_computed() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+
+    // c comes from a Slice node (runtime computed, like AdaIN's style projection bias).
+    // b is an initializer (static).
+    let nodes = vec![
+        node("slice_src", "Slice", &["slice_in"], &["c"]),
+        node("add1", "Add", &["x", "a"], &["t0"]),
+        node("mul1", "Mul", &["t0", "b"], &["t1"]),
+        node("add2", "Add", &["t1", "c"], &["y"]),
+    ];
+
+    let mut weights = HashMap::new();
+    weights.insert(
+        "b".to_string(),
+        GpuTensor::from_host_f32(&ctx, &[2.0], vec![1]).expect("b"),
+    );
+
+    let (patterns, _skip, dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+
+    assert!(
+        !patterns.contains_key("add1"),
+        "add1 should not be a static pattern when c is runtime-computed"
+    );
+
+    let info = dynamic.get("add1").unwrap_or_else(|| {
+        panic!(
+            "add1 was not registered as dynamic candidate when c is runtime-computed. \
+             Dynamic: {:?}",
+            dynamic.keys().collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        matches!(&info.pattern, FusedPattern::AddMulAdd { .. }),
+        "expected AddMulAdd, got {:?}",
+        info.pattern
+    );
+}
+
+#[test]
+fn dynamic_add_mul_add_registered_when_both_bc_runtime_computed() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+
+    // Both b and c are runtime-computed (AdaIN pattern: b from Div, c from Slice).
+    let nodes = vec![
+        node("div_src", "Div", &["div_in_a", "div_in_b"], &["b"]),
+        node("slice_src", "Slice", &["slice_in"], &["c"]),
+        node("add1", "Add", &["x", "a"], &["t0"]),
+        node("mul1", "Mul", &["t0", "b"], &["t1"]),
+        node("add2", "Add", &["t1", "c"], &["y"]),
+    ];
+
+    let weights = HashMap::new(); // no static weights
+
+    let (patterns, _skip, dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+
+    assert!(
+        !patterns.contains_key("add1"),
+        "add1 should not be a static pattern when both b and c are runtime-computed"
+    );
+
+    let info = dynamic.get("add1").unwrap_or_else(|| {
+        panic!(
+            "add1 was not registered as dynamic candidate with both b/c runtime-computed. \
+             Dynamic: {:?}",
+            dynamic.keys().collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        matches!(&info.pattern, FusedPattern::AddMulAdd { .. }),
+        "expected AddMulAdd, got {:?}",
+        info.pattern
+    );
+}
+
+#[test]
+fn dynamic_add_mul_add_interior_nodes_not_in_skip_set() {
+    let ctx = IconnxCudaContext::new().expect("CUDA context");
+
+    // Dynamic candidates must NOT add their interior nodes to the skip set,
+    // because the fallback path needs them to remain executable.
+    let nodes = vec![
+        node("div_src", "Div", &["div_in_a", "div_in_b"], &["b"]),
+        node("add1", "Add", &["x", "a"], &["t0"]),
+        node("mul1", "Mul", &["t0", "b"], &["t1"]),
+        node("add2", "Add", &["t1", "c"], &["y"]),
+    ];
+
+    let mut weights = HashMap::new();
+    weights.insert(
+        "c".to_string(),
+        GpuTensor::from_host_f32(&ctx, &[3.0], vec![1]).expect("c"),
+    );
+
+    let (_patterns, skip_set, dynamic) =
+        detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+
+    assert!(dynamic.contains_key("add1"));
+
+    // Interior nodes (mul1, add2) must NOT be in the skip set
+    assert!(
+        !skip_set.contains("mul1"),
+        "mul1 should not be in skip_set for a dynamic candidate"
+    );
+    assert!(
+        !skip_set.contains("add2"),
+        "add2 should not be in skip_set for a dynamic candidate"
+    );
+}

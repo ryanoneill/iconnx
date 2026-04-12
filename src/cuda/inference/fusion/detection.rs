@@ -57,6 +57,16 @@ pub(crate) fn detect_fused_patterns(
     let mut fused_patterns: HashMap<String, FusedPatternInfo> = HashMap::new();
     let mut nodes_to_skip: HashSet<String> = HashSet::new();
     let mut dynamic_candidates: HashMap<String, FusedPatternInfo> = HashMap::new();
+    // Head nodes of dynamic candidates must not be claimed by later (shorter)
+    // walkers as static patterns. Keeping a dedicated set avoids adding heads
+    // to nodes_to_skip (which would prevent them from executing on the
+    // fallback path).
+    let mut dynamic_heads: HashSet<String> = HashSet::new();
+    // Interior nodes of dynamic candidates must also not be claimed by later
+    // walkers as heads or interiors of static patterns. Like dynamic_heads,
+    // these are NOT added to nodes_to_skip so the fallback path can execute
+    // them independently.
+    let mut dynamic_interiors: HashSet<String> = HashSet::new();
 
     // Predicate: is this tensor name a "static" value (known at graph-build
     // time)? Matches either (a) an initializer registered via
@@ -219,6 +229,12 @@ pub(crate) fn detect_fused_patterns(
                         };
                         // Do NOT add interior nodes to nodes_to_skip —
                         // they must remain executable for the fallback path.
+                        // Track the head and interiors so later (shorter)
+                        // walkers cannot re-claim them as static patterns.
+                        dynamic_heads.insert(node.name.clone());
+                        for interior in &pattern_info.nodes_to_skip {
+                            dynamic_interiors.insert(interior.clone());
+                        }
                         dynamic_candidates.insert(node.name.clone(), pattern_info);
                         continue;
                     }
@@ -411,7 +427,7 @@ pub(crate) fn detect_fused_patterns(
         if node.op_type != "Mul" {
             continue;
         }
-        if nodes_to_skip.contains(&node.name) {
+        if nodes_to_skip.contains(&node.name) || dynamic_heads.contains(&node.name) {
             continue;
         }
         if node.inputs.len() < 2 {
@@ -536,7 +552,10 @@ pub(crate) fn detect_fused_patterns(
     // This is a simpler pattern than AddMulAdd, catching remaining Mul-Add pairs
     // Only fuse when c is a weight (constant), ensuring it's available at execution time
     for node in nodes {
-        if node.op_type == "Mul" && !nodes_to_skip.contains(&node.name) {
+        if node.op_type == "Mul"
+            && !nodes_to_skip.contains(&node.name)
+            && !dynamic_heads.contains(&node.name)
+        {
             let mul_output = &node.outputs[0];
             // Check if Mul output is single-use
             if output_uses.get(mul_output.as_str()) != Some(&1) {
@@ -548,6 +567,7 @@ pub(crate) fn detect_fused_patterns(
                 n.op_type == "Add"
                     && n.inputs.contains(mul_output)
                     && !nodes_to_skip.contains(&n.name)
+                    && !dynamic_interiors.contains(&n.name)
             }) {
                 // Get the other Add input (c)
                 let c_input = add_node
@@ -586,7 +606,10 @@ pub(crate) fn detect_fused_patterns(
     // Complement pattern to Mul-Add
     // Only fuse when c is a weight (constant), ensuring it's available at execution time
     for node in nodes {
-        if node.op_type == "Add" && !nodes_to_skip.contains(&node.name) {
+        if node.op_type == "Add"
+            && !nodes_to_skip.contains(&node.name)
+            && !dynamic_heads.contains(&node.name)
+        {
             let add_output = &node.outputs[0];
             // Check if Add output is single-use
             if output_uses.get(add_output.as_str()) != Some(&1) {
@@ -598,6 +621,7 @@ pub(crate) fn detect_fused_patterns(
                 n.op_type == "Mul"
                     && n.inputs.contains(add_output)
                     && !nodes_to_skip.contains(&n.name)
+                    && !dynamic_interiors.contains(&n.name)
             }) {
                 // Get the other Mul input (c)
                 let c_input = mul_node
@@ -634,7 +658,10 @@ pub(crate) fn detect_fused_patterns(
     // Detect Sub -> Mul pattern (simple sub-multiply: (a - b) * c)
     // Similar to Add -> Mul but with subtraction
     for node in nodes {
-        if node.op_type == "Sub" && !nodes_to_skip.contains(&node.name) {
+        if node.op_type == "Sub"
+            && !nodes_to_skip.contains(&node.name)
+            && !dynamic_heads.contains(&node.name)
+        {
             let sub_output = &node.outputs[0];
             // Check if Sub output is single-use
             if output_uses.get(sub_output.as_str()) != Some(&1) {
@@ -646,6 +673,7 @@ pub(crate) fn detect_fused_patterns(
                 n.op_type == "Mul"
                     && n.inputs.contains(sub_output)
                     && !nodes_to_skip.contains(&n.name)
+                    && !dynamic_interiors.contains(&n.name)
             }) {
                 // Get the other Mul input (c)
                 let c_input = mul_node
@@ -682,7 +710,10 @@ pub(crate) fn detect_fused_patterns(
     // Detect Div -> Mul pattern (simple div-multiply: (a / b) * c)
     // Similar to Add -> Mul but with division
     for node in nodes {
-        if node.op_type == "Div" && !nodes_to_skip.contains(&node.name) {
+        if node.op_type == "Div"
+            && !nodes_to_skip.contains(&node.name)
+            && !dynamic_heads.contains(&node.name)
+        {
             let div_output = &node.outputs[0];
             // Check if Div output is single-use
             if output_uses.get(div_output.as_str()) != Some(&1) {
@@ -694,6 +725,7 @@ pub(crate) fn detect_fused_patterns(
                 n.op_type == "Mul"
                     && n.inputs.contains(div_output)
                     && !nodes_to_skip.contains(&n.name)
+                    && !dynamic_interiors.contains(&n.name)
             }) {
                 // Get the other Mul input (c)
                 let c_input = mul_node
