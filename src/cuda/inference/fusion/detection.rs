@@ -15,10 +15,17 @@ use crate::cuda::tensor::GpuTensor;
 
 /// Detect all fuseable operator patterns in the given node list.
 ///
-/// Returns a tuple of:
-/// - `HashMap<String, FusedPatternInfo>` keyed by the pattern head node name
-/// - `HashSet<String>` of all node names that should be skipped during
-///   execution because they are part of a detected pattern
+/// Returns a 3-tuple of:
+/// - `HashMap<String, FusedPatternInfo>` — static patterns keyed by head
+///   node name (unconditionally fusible; their interior nodes are added to
+///   the skip set)
+/// - `HashSet<String>` — node names to skip during execution because they
+///   are interior to a static pattern
+/// - `HashMap<String, FusedPatternInfo>` — dynamic candidates (AddMulAdd
+///   chains where b/c are runtime-computed). These are attempted at
+///   execution time with a shape-check fallback; their interior nodes are
+///   NOT added to the skip set so they remain executable on the fallback
+///   path.
 ///
 /// The `ctx` parameter is needed only to read constant scalar values
 /// from weight tensors during exponent validation (GELU's `Pow` exponent
@@ -28,7 +35,11 @@ pub(crate) fn detect_fused_patterns(
     nodes: &[ExecutionNode],
     weights: &HashMap<String, GpuTensor>,
     ctx: &IconnxCudaContext,
-) -> (HashMap<String, FusedPatternInfo>, HashSet<String>) {
+) -> (
+    HashMap<String, FusedPatternInfo>,
+    HashSet<String>,
+    HashMap<String, FusedPatternInfo>,
+) {
     // Build lookup maps
     let output_to_node: HashMap<&str, &ExecutionNode> = nodes
         .iter()
@@ -45,6 +56,7 @@ pub(crate) fn detect_fused_patterns(
 
     let mut fused_patterns: HashMap<String, FusedPatternInfo> = HashMap::new();
     let mut nodes_to_skip: HashSet<String> = HashSet::new();
+    let mut dynamic_candidates: HashMap<String, FusedPatternInfo> = HashMap::new();
 
     // Predicate: is this tensor name a "static" value (known at graph-build
     // time)? Matches either (a) an initializer registered via
@@ -181,13 +193,33 @@ pub(crate) fn detect_fused_patterns(
                         add2_node.inputs[0].clone()
                     };
 
-                    // Only fuse if b and c are static (initializers or
-                    // Constant node outputs). This preserves the affine-
+                    // Only fuse statically if b and c are static (initializers
+                    // or Constant node outputs). This preserves the affine-
                     // transform semantic — gamma/beta are baked into the
                     // model — while recognizing that modern ONNX exports
                     // emit these as Constant Float32 nodes rather than
                     // initializers. See the `is_static` closure above.
                     if !is_static(&b_input) || !is_static(&c_input) {
+                        // Non-static b or c: register as dynamic candidate.
+                        // The executor will attempt fusion at runtime and
+                        // fall back on shape mismatch.
+                        let pattern_info = FusedPatternInfo {
+                            pattern: FusedPattern::AddMulAdd {
+                                x_input,
+                                a_input,
+                                b_input,
+                                c_input,
+                                output_name: add2_node.outputs[0].clone(),
+                            },
+                            nodes_to_skip: vec![
+                                mul_node.name.clone(),
+                                add2_node.name.clone(),
+                            ],
+                            head_node: node.name.clone(),
+                        };
+                        // Do NOT add interior nodes to nodes_to_skip —
+                        // they must remain executable for the fallback path.
+                        dynamic_candidates.insert(node.name.clone(), pattern_info);
                         continue;
                     }
 
@@ -699,5 +731,5 @@ pub(crate) fn detect_fused_patterns(
     // optimization but requires deeper changes to the run() execution loop.
     // Deferred for Phase 4.
 
-    (fused_patterns, nodes_to_skip)
+    (fused_patterns, nodes_to_skip, dynamic_candidates)
 }
