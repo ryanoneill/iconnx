@@ -393,20 +393,20 @@ mod tests {
 
         assert_eq!(output.shape(), &[1, 2, 2, 2]);
 
-        for i in 0..4 {
+        for (i, &val) in result.iter().enumerate().take(4) {
             assert!(
-                (result[i] - 14.0).abs() < 1e-5,
+                (val - 14.0).abs() < 1e-5,
                 "Channel 0 mismatch at {}: {}",
                 i,
-                result[i]
+                val
             );
         }
-        for i in 4..8 {
+        for (i, &val) in result.iter().enumerate().take(8).skip(4) {
             assert!(
-                (result[i] - 24.0).abs() < 1e-5,
+                (val - 24.0).abs() < 1e-5,
                 "Channel 1 mismatch at {}: {}",
                 i,
-                result[i]
+                val
             );
         }
 
