@@ -255,6 +255,9 @@ pub struct GpuGraphExecutor {
     pub(crate) fused_patterns: RefCell<HashMap<String, FusedPatternInfo>>,
     /// Set of node names to skip (they're part of a fused pattern)
     nodes_to_skip: RefCell<std::collections::HashSet<String>>,
+    /// Dynamic fusion candidates: AddMulAdd chains where b/c are runtime-
+    /// computed. Attempted at execution time with shape-check fallback.
+    pub(crate) dynamic_candidates: RefCell<HashMap<String, FusedPatternInfo>>,
     /// Flag to track if patterns have been detected
     patterns_detected: RefCell<bool>,
 
@@ -423,6 +426,7 @@ impl GpuGraphExecutor {
             sorted_nodes_cache: RefCell::new(None),
             fused_patterns: RefCell::new(HashMap::new()),
             nodes_to_skip: RefCell::new(std::collections::HashSet::new()),
+            dynamic_candidates: RefCell::new(HashMap::new()),
             patterns_detected: RefCell::new(false),
             memory_pool: RefCell::new(GpuMemoryPool::new()),
             #[cfg(feature = "debug-inference")]
@@ -541,6 +545,7 @@ impl GpuGraphExecutor {
         // Clear detected patterns (will be re-detected on next run)
         self.fused_patterns.borrow_mut().clear();
         self.nodes_to_skip.borrow_mut().clear();
+        self.dynamic_candidates.borrow_mut().clear();
         *self.patterns_detected.borrow_mut() = false;
     }
 
@@ -641,11 +646,12 @@ impl GpuGraphExecutor {
             return;
         }
 
-        let (detected, skip_set) =
+        let (detected, skip_set, dynamic) =
             fusion::detect_fused_patterns(&self.nodes, &self.weights, &self.ctx);
 
         *self.fused_patterns.borrow_mut() = detected;
         *self.nodes_to_skip.borrow_mut() = skip_set;
+        *self.dynamic_candidates.borrow_mut() = dynamic;
         *self.patterns_detected.borrow_mut() = true;
     }
 

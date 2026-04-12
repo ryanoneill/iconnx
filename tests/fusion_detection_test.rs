@@ -93,7 +93,7 @@ fn detects_mul_sin_pow_mul_add_chain() {
     // p must be a constant scalar weight for the pattern to be eligible.
     let weights = weights_with_scalar(&ctx, "p", 2.0);
 
-    let (patterns, skip_set) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+    let (patterns, skip_set, _dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
 
     assert!(
         patterns.contains_key("head_mul"),
@@ -149,7 +149,7 @@ fn rejects_when_intermediate_has_multiple_consumers() {
 
     let weights = weights_with_scalar(&ctx, "p", 2.0);
 
-    let (patterns, _skip_set) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+    let (patterns, _skip_set, _dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
 
     // The MulSinPowMulAdd pattern must NOT be registered against head_mul.
     assert!(
@@ -178,7 +178,7 @@ fn detects_chain_when_all_operands_are_weights() {
 
     let weights = weights_for_realistic_chain(&ctx, 8);
 
-    let (patterns, skip_set) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+    let (patterns, skip_set, _dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
 
     // Must be registered as MulSinPowMulAdd specifically (not MulAdd!).
     let info = patterns.get("head_mul").unwrap_or_else(|| {
@@ -228,7 +228,7 @@ fn rejects_non_integer_exponent() {
         GpuTensor::from_host_f32(&ctx, &[2.5], vec![1]).expect("p upload"),
     );
 
-    let (patterns, _skip_set) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+    let (patterns, _skip_set, _dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
 
     assert!(
         !patterns
@@ -411,7 +411,7 @@ fn add_mul_add_detects_with_initializer_bc() {
         GpuTensor::from_host_f32(&ctx, &[3.0], vec![1]).expect("c"),
     );
 
-    let (patterns, _skip) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+    let (patterns, _skip, _dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
 
     let info = patterns.get("add1").unwrap_or_else(|| {
         panic!(
@@ -466,7 +466,7 @@ fn add_mul_add_detects_with_constant_bc() {
     // Empty weights map — b and c come from Constant nodes, not initializers.
     let weights = HashMap::new();
 
-    let (patterns, _skip) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+    let (patterns, _skip, _dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
 
     let info = patterns.get("add1").unwrap_or_else(|| {
         panic!(
@@ -506,7 +506,7 @@ fn add_mul_add_rejects_when_b_is_computed() {
         GpuTensor::from_host_f32(&ctx, &[3.0], vec![1]).expect("c"),
     );
 
-    let (patterns, _skip) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+    let (patterns, _skip, _dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
 
     let is_add_mul_add = patterns
         .get("add1")
@@ -514,7 +514,7 @@ fn add_mul_add_rejects_when_b_is_computed() {
         .unwrap_or(false);
     assert!(
         !is_add_mul_add,
-        "AddMulAdd must NOT fuse when b is a runtime-computed value. \
+        "AddMulAdd must NOT be a static pattern when b is a runtime-computed value. \
          The static-value check exists to preserve the 'static affine \
          transform' semantic. Got patterns: {:?}",
         patterns.keys().collect::<Vec<_>>()
@@ -540,7 +540,7 @@ fn add_mul_add_rejects_when_c_is_computed() {
         GpuTensor::from_host_f32(&ctx, &[2.0], vec![1]).expect("b"),
     );
 
-    let (patterns, _skip) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
+    let (patterns, _skip, _dynamic) = detect_fused_patterns_for_tests(&nodes, &weights, &ctx);
 
     let is_add_mul_add = patterns
         .get("add1")
@@ -548,7 +548,7 @@ fn add_mul_add_rejects_when_c_is_computed() {
         .unwrap_or(false);
     assert!(
         !is_add_mul_add,
-        "AddMulAdd must NOT fuse when c is a runtime-computed value. \
+        "AddMulAdd must NOT be a static pattern when c is a runtime-computed value. \
          Got patterns: {:?}",
         patterns.keys().collect::<Vec<_>>()
     );
