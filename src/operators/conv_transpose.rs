@@ -302,7 +302,7 @@ mod tests {
         let data = result.as_slice();
 
         // ORT produces: [1, 2, 2, 4]
-        let expected = vec![1.0, 2.0, 2.0, 4.0];
+        let expected = [1.0, 2.0, 2.0, 4.0];
         assert_eq!(result.shape(), &[1, 1, 4], "Shape mismatch");
         assert_eq!(data.len(), expected.len(), "Length mismatch");
         for (i, (got, exp)) in data.iter().zip(expected.iter()).enumerate() {

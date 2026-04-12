@@ -41,7 +41,7 @@ fn test_exp_basic() {
 
     let output = result.as_slice();
     assert!((output[0] - 1.0).abs() < 0.001); // e^0 = 1
-    assert!((output[1] - 2.718).abs() < 0.01); // e^1 ≈ 2.718
+    assert!((output[1] - std::f32::consts::E).abs() < 0.01); // e^1 = e
     assert!((output[2] - 7.389).abs() < 0.01); // e^2 ≈ 7.389
 }
 

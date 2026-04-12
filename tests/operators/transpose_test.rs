@@ -30,7 +30,7 @@ fn test_transpose_1d() {
     let data = Tensor::from_vec(vec![1.0, 2.0, 3.0], vec![3]);
 
     let result = iconnx::operators::transpose::Transpose::forward(
-        &[data.clone()],
+        std::slice::from_ref(&data),
         &NodeAttributes::new(),
     );
 

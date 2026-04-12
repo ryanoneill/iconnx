@@ -128,7 +128,7 @@ fn test_scatter_nd_3d_indices_large() {
     // 19 updates, each with index depth 2
     // All first indices are 0 (valid for dim 0 of size 1)
     // Second indices are various positions in dim 1 (size 15620)
-    let mut indices_data = Vec::with_capacity(19 * 1 * 2);
+    let mut indices_data = Vec::with_capacity(19 * 2);
     for i in 0..19 {
         indices_data.push(0.0); // row index (always 0)
         indices_data.push((i * 100) as f32); // col index

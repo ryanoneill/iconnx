@@ -10,7 +10,7 @@ fn test_pow_basic() {
 
     let result = Pow::forward(&[base, exp], &NodeAttributes::new());
 
-    let expected = vec![4.0, 27.0, 2.0];
+    let expected = [4.0, 27.0, 2.0];
     for (i, (&r, &e)) in result.as_slice().iter().zip(expected.iter()).enumerate() {
         assert!((r - e).abs() < 0.001, "Pow at {}: {} vs {}", i, r, e);
     }

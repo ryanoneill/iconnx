@@ -496,7 +496,7 @@ mod tests {
         let result = output.to_host_f32(&ctx).unwrap();
 
         assert_eq!(output.shape(), &[1, 1, 5]);
-        let expected = vec![1.0, 3.0, 6.0, 5.0, 3.0];
+        let expected = [1.0, 3.0, 6.0, 5.0, 3.0];
 
         for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
             assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);
@@ -537,7 +537,7 @@ mod tests {
         let result = output.to_host_f32(&ctx).unwrap();
 
         assert_eq!(output.shape(), &[1, 1, 7]);
-        let expected = vec![1.0, 1.0, 3.0, 2.0, 5.0, 3.0, 3.0];
+        let expected = [1.0, 1.0, 3.0, 2.0, 5.0, 3.0, 3.0];
 
         for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
             assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);
@@ -626,8 +626,8 @@ mod tests {
 
         assert_eq!(output.shape(), &[1, 2, 5]);
 
-        let expected_ch0 = vec![11.0, 13.0, 16.0, 15.0, 13.0];
-        let expected_ch1 = vec![21.0, 23.0, 26.0, 25.0, 23.0];
+        let expected_ch0 = [11.0, 13.0, 16.0, 15.0, 13.0];
+        let expected_ch1 = [21.0, 23.0, 26.0, 25.0, 23.0];
 
         for (i, (r, e)) in result[0..5].iter().zip(expected_ch0.iter()).enumerate() {
             assert!(

@@ -400,7 +400,7 @@ mod tests {
         let result = c.to_host_f32(&ctx).expect("Failed to copy result");
 
         assert_eq!(c.shape(), &[2, 2]);
-        let expected = vec![19.0, 22.0, 43.0, 50.0];
+        let expected = [19.0, 22.0, 43.0, 50.0];
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (got - exp).abs() < 1e-5,
@@ -434,7 +434,7 @@ mod tests {
         let result = c.to_host_f32(&ctx).expect("Failed to copy result");
 
         assert_eq!(c.shape(), &[2, 2]);
-        let expected = vec![22.0, 28.0, 49.0, 64.0];
+        let expected = [22.0, 28.0, 49.0, 64.0];
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (got - exp).abs() < 1e-5,
@@ -465,7 +465,7 @@ mod tests {
         let c = gpu_gemm(&ctx, &mut pool, &a, &b, None, 2.0, 0.0, false, false).expect("Gemm failed");
         let result = c.to_host_f32(&ctx).expect("Failed to copy result");
 
-        let expected = vec![2.0, 4.0, 6.0, 8.0];
+        let expected = [2.0, 4.0, 6.0, 8.0];
         for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (got - exp).abs() < 1e-5,

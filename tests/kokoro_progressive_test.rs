@@ -27,8 +27,7 @@ fn run_kokoro_first_n_nodes(n: usize) -> Result<(), String> {
     }
 
     // Add first N nodes
-    for i in 0..n.min(nodes.len()) {
-        let node = &nodes[i];
+    for (i, node) in nodes.iter().enumerate().take(n) {
         let inputs: Vec<&str> = node.inputs.iter().map(|s| s.as_str()).collect();
         let outputs: Vec<&str> = node.outputs.iter().map(|s| s.as_str()).collect();
         executor.add_node_with_attributes(

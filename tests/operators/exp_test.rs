@@ -9,7 +9,7 @@ fn test_exp_basic() {
 
     let result = Exp::forward(&[data], &NodeAttributes::new());
 
-    let expected = vec![1.0, 2.7182817, 7.389056];
+    let expected = [1.0, 2.7182817, 7.389056];
     for (i, (&r, &e)) in result.as_slice().iter().zip(expected.iter()).enumerate() {
         assert!(
             (r - e).abs() < 0.001,

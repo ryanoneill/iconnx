@@ -226,8 +226,8 @@ mod tests {
         let result = output.to_host_f32(&ctx).unwrap();
 
         assert!((result[0] - 0.0).abs() < 1e-5);
-        assert!((result[1] - 0.7853981).abs() < 1e-5);
-        assert!((result[2] - (-0.7853981)).abs() < 1e-5);
+        assert!((result[1] - std::f32::consts::FRAC_PI_4).abs() < 1e-5);
+        assert!((result[2] - (-std::f32::consts::FRAC_PI_4)).abs() < 1e-5);
         assert!((result[3] - 0.4636476).abs() < 1e-5);
 
         println!("Atan test passed!");

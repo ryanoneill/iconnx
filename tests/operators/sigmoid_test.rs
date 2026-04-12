@@ -9,7 +9,7 @@ fn test_sigmoid_basic() {
 
     let result = Sigmoid::forward(&[data], &NodeAttributes::new());
 
-    let expected = vec![
+    let expected = [
         0.5,        // sigmoid(0) = 0.5
         0.7310586,  // sigmoid(1) ≈ 0.731
         0.26894143, // sigmoid(-1) ≈ 0.269

@@ -393,20 +393,20 @@ mod tests {
 
         assert_eq!(output.shape(), &[1, 2, 2, 2]);
 
-        for i in 0..4 {
+        for (i, &val) in result.iter().enumerate().take(4) {
             assert!(
-                (result[i] - 14.0).abs() < 1e-5,
+                (val - 14.0).abs() < 1e-5,
                 "Channel 0 mismatch at {}: {}",
                 i,
-                result[i]
+                val
             );
         }
-        for i in 4..8 {
+        for (i, &val) in result.iter().enumerate().take(8).skip(4) {
             assert!(
-                (result[i] - 24.0).abs() < 1e-5,
+                (val - 24.0).abs() < 1e-5,
                 "Channel 1 mismatch at {}: {}",
                 i,
-                result[i]
+                val
             );
         }
 
@@ -436,7 +436,7 @@ mod tests {
         let result = output.to_host_f32(&ctx).unwrap();
 
         assert_eq!(output.shape(), &[1, 1, 3]);
-        let expected = vec![8.0, 12.0, 16.0];
+        let expected = [8.0, 12.0, 16.0];
 
         for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
             assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);
@@ -468,7 +468,7 @@ mod tests {
         let result = output.to_host_f32(&ctx).unwrap();
 
         assert_eq!(output.shape(), &[1, 1, 3]);
-        let expected = vec![9.0, 12.0, 15.0];
+        let expected = [9.0, 12.0, 15.0];
 
         for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
             assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);
@@ -502,7 +502,7 @@ mod tests {
         let result = output.to_host_f32(&ctx).unwrap();
 
         assert_eq!(output.shape(), &[1, 1, 2, 2]);
-        let expected = vec![60.0, 68.0, 84.0, 92.0];
+        let expected = [60.0, 68.0, 84.0, 92.0];
 
         for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
             assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);

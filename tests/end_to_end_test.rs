@@ -106,7 +106,7 @@ fn test_load_kokoro_model_structure() {
     println!("Computation nodes: {}", graph.node_count());
 
     // Check which operators we can handle
-    let implemented = vec!["Add", "Mul", "Sub", "Div", "MatMul"];
+    let implemented = ["Add", "Mul", "Sub", "Div", "MatMul"];
     let can_handle: Vec<_> = operators
         .iter()
         .filter(|op| implemented.contains(&op.as_str()))

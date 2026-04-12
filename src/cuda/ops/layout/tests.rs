@@ -91,7 +91,7 @@ fn test_transpose_2d() {
     let result = output.to_host_f32(&ctx).unwrap();
 
     assert_eq!(output.shape(), &[3, 2]);
-    let expected = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
+    let expected = [1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
 
     for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
         assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);
@@ -117,7 +117,7 @@ fn test_where() {
     let output = gpu_where(&ctx, &cache, &mut pool, &condition, &x, &y).unwrap();
     let result = output.to_host_f32(&ctx).unwrap();
 
-    let expected = vec![10.0, 2.0, 30.0, 4.0, 50.0];
+    let expected = [10.0, 2.0, 30.0, 4.0, 50.0];
 
     for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
         assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);
@@ -161,7 +161,7 @@ fn test_slice_contiguous() {
     let result = output.to_host_f32(&ctx).unwrap();
 
     assert_eq!(output.shape(), &[4]);
-    let expected = vec![3.0, 4.0, 5.0, 6.0];
+    let expected = [3.0, 4.0, 5.0, 6.0];
 
     for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
         assert!((r - e).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r, e);
@@ -445,12 +445,12 @@ fn test_resize_half_pixel_300x() {
 
     // Check channel 0: input[0..70] maps to phases 0.0, 1.5, 3.0, ...
     // out[0..149] should all come from input[0] = 0.0
-    for i in 0..150 {
+    for (i, &val) in result.iter().enumerate().take(150) {
         assert!(
-            (result[i] - 0.0).abs() < 0.001,
+            (val - 0.0).abs() < 0.001,
             "Position {} should be 0.0, got {}",
             i,
-            result[i]
+            val
         );
     }
     // out[150..449] should all come from input[0] = 0.0
@@ -458,12 +458,12 @@ fn test_resize_half_pixel_300x() {
     // out=150: floor((150.5)/300 - 0.5) = floor(0.00167) = 0 -> input[0]
     // out=449: floor((449.5)/300 - 0.5) = floor(0.998) = 0 -> input[0]
     // out=450: floor((450.5)/300 - 0.5) = floor(1.00167) = 1 -> input[1] = 1.5
-    for i in 150..450 {
+    for (i, &val) in result.iter().enumerate().take(450).skip(150) {
         assert!(
-            (result[i] - 0.0).abs() < 0.001,
+            (val - 0.0).abs() < 0.001,
             "Position {} should be 0.0 (from input[0]), got {}",
             i,
-            result[i]
+            val
         );
     }
     assert!(

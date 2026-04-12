@@ -368,7 +368,7 @@ mod tests {
         let data = result.as_slice();
 
         // ORT produces: [0, 0, 1, 1, 2, 2, 3, 3]
-        let expected = vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
+        let expected = [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
         assert_eq!(data.len(), expected.len(), "Output length mismatch");
         for (i, (got, exp)) in data.iter().zip(expected.iter()).enumerate() {
             assert!(
@@ -403,7 +403,7 @@ mod tests {
 
         // ORT produces: [0, 0, 0, 1, 1, 2, 2, 3]
         // This is different from asymmetric due to half_pixel transformation
-        let expected = vec![0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0];
+        let expected = [0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0];
         assert_eq!(data.len(), expected.len(), "Output length mismatch");
         for (i, (got, exp)) in data.iter().zip(expected.iter()).enumerate() {
             assert!(
@@ -504,7 +504,7 @@ mod tests {
         let data = result.as_slice();
 
         // ORT produces: [0, 0, 1, 1, 2, 2, 3, 3]
-        let expected = vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
+        let expected = [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
         assert_eq!(data.len(), expected.len(), "Output length mismatch");
         for (i, (got, exp)) in data.iter().zip(expected.iter()).enumerate() {
             assert!(

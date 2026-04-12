@@ -34,9 +34,9 @@ fn test_extract_kokoro_weights() {
 
     // Verify tensors have correct structure
     for (name, tensor) in weights.iter().take(5) {
-        assert!(tensor.len() > 0, "Weight {} should not be empty", name);
+        assert!(!tensor.is_empty(), "Weight {} should not be empty", name);
         assert!(
-            tensor.shape().len() > 0 || tensor.len() == 1,
+            !tensor.shape().is_empty() || tensor.len() == 1,
             "Weight {} should have valid shape",
             name
         );

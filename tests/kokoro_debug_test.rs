@@ -20,8 +20,7 @@ fn test_debug_first_10_nodes() {
     let nodes = graph.nodes();
 
     println!("\n=== First 10 Kokoro Nodes ===");
-    for i in 0..10.min(nodes.len()) {
-        let node = &nodes[i];
+    for (i, node) in nodes.iter().enumerate().take(10) {
         println!("\nNode {}: {}", i, node.op_type);
         println!("  Inputs: {:?}", node.inputs);
         println!("  Outputs: {:?}", node.outputs);
@@ -66,8 +65,7 @@ fn test_run_first_constant_nodes() {
 
     // Add only first 5 nodes
     println!("\n=== Adding First 5 Nodes ===");
-    for i in 0..5.min(nodes.len()) {
-        let node = &nodes[i];
+    for (i, node) in nodes.iter().enumerate().take(5) {
         println!("Node {}: {} → {:?}", i, node.op_type, node.outputs);
 
         let inputs: Vec<&str> = node.inputs.iter().map(|s| s.as_str()).collect();
