@@ -1,18 +1,27 @@
 //! Tests for the GPU tensor validation and checkpoint infrastructure
 //!
 //! These tests verify that NaN/Inf detection and ORT comparison work correctly.
+//! Everything in this file — helpers included — is gated behind the
+//! `debug-inference` feature since that's the only configuration under which
+//! the test functions are compiled.
 
+#[cfg(feature = "debug-inference")]
 use std::collections::HashMap;
+#[cfg(feature = "debug-inference")]
 use std::path::Path;
 
+#[cfg(feature = "debug-inference")]
 use iconnx::cuda::GpuGraphExecutor;
 #[cfg(feature = "debug-inference")]
 use iconnx::cuda::checkpoints::CheckpointConfig;
 #[cfg(feature = "debug-inference")]
 use iconnx::cuda::validation::ValidationMode;
+#[cfg(feature = "debug-inference")]
 use iconnx::onnx_parser::OnnxParser;
+#[cfg(feature = "debug-inference")]
 use iconnx::tensor::Tensor;
 
+#[cfg(feature = "debug-inference")]
 fn setup_kokoro_executor() -> Option<GpuGraphExecutor> {
     let model_path = Path::new("kokoro-v1.0.onnx");
     if !model_path.exists() {
@@ -45,6 +54,7 @@ fn setup_kokoro_executor() -> Option<GpuGraphExecutor> {
     Some(executor)
 }
 
+#[cfg(feature = "debug-inference")]
 fn test_inputs() -> HashMap<String, Tensor> {
     let tokens = vec![0i64, 10, 20, 30, 0];
     let style: Vec<f32> = (0..256).map(|i| (i as f32 * 0.01).sin()).collect();
@@ -62,6 +72,7 @@ fn test_inputs() -> HashMap<String, Tensor> {
 }
 
 /// Load inputs from ORT fixture files to ensure exact match
+#[cfg(feature = "debug-inference")]
 fn load_fixture_inputs() -> HashMap<String, Tensor> {
     let fixture_dir = Path::new("tests/fixtures/ort_reference/inputs");
 

@@ -12,7 +12,7 @@ fn test_gather_axis_from_attribute() {
     // Input: [1, 11, 3121, 2], index=0 (scalar), axis=3
     // Expected output: [1, 11, 3121]
 
-    let data = Tensor::from_vec(vec![1.0; 1 * 11 * 3121 * 2], vec![1, 11, 3121, 2]);
+    let data = Tensor::from_vec(vec![1.0; 11 * 3121 * 2], vec![1, 11, 3121, 2]);
     let indices = Tensor::from_vec_i64(vec![0], vec![]); // Scalar index
 
     let mut attrs = NodeAttributes::new();
@@ -28,7 +28,7 @@ fn test_gather_axis_negative_from_attribute() {
     // Test negative axis in attributes
     // Input: [1, 11, 3121, 2], index=0, axis=-1 (same as axis=3)
 
-    let data = Tensor::from_vec(vec![2.0; 1 * 11 * 3121 * 2], vec![1, 11, 3121, 2]);
+    let data = Tensor::from_vec(vec![2.0; 11 * 3121 * 2], vec![1, 11, 3121, 2]);
     let indices = Tensor::from_vec_i64(vec![0], vec![]);
 
     let mut attrs = NodeAttributes::new();

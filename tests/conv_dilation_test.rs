@@ -41,7 +41,7 @@ fn test_conv1d_shape_with_large_dilation() {
     // Effective kernel = (7-1)*3 + 1 = 19
     // Output = (520 + 18 - 19) / 1 + 1 = 520
 
-    let input = Tensor::from_vec(vec![1.0; 1 * 256 * 520], vec![1, 256, 520]);
+    let input = Tensor::from_vec(vec![1.0; 256 * 520], vec![1, 256, 520]);
     let kernel = Tensor::from_vec(vec![0.01; 256 * 256 * 7], vec![256, 256, 7]);
 
     let mut attrs = NodeAttributes::new();
