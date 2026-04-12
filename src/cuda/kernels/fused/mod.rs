@@ -70,6 +70,7 @@ const FUSED_KERNEL_NAMES: &[&str] = &[
     // Affine transform: (x + a) * b + c
     "fused_add_mul_add_kernel",
     "fused_add_mul_add_scalar_kernel",
+    "fused_add_mul_add_bcast_c_kernel",
     // Full GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     "fused_gelu_kernel",
     // Mul-Add: y = a * b + c (fused multiply-add)
@@ -173,6 +174,29 @@ extern "C" __global__ void fused_add_mul_add_scalar_kernel(
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = (x[i] + a) * b[i] + c[i];
+    }
+}
+
+// Broadcast-c version: x, a, b have identical shape, c broadcasts via
+// a contiguous non-broadcast block. c_inner_stride is the product of
+// x dims after the non-broadcast block; c_size is the product of dims
+// in the non-broadcast block.
+// AdaIN: c=[1,C,1], x=[1,C,T] -> c_inner_stride=T, c_size=C
+// LSTM:  c=[1,1,C], x=[1,T,C] -> c_inner_stride=1, c_size=C
+extern "C" __global__ void fused_add_mul_add_bcast_c_kernel(
+    float* out,
+    const float* x,
+    const float* a,
+    const float* b,
+    const float* c,
+    size_t n,
+    size_t c_inner_stride,
+    size_t c_size
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        size_t c_idx = (i / c_inner_stride) % c_size;
+        out[i] = (x[i] + a[i]) * b[i] + c[c_idx];
     }
 }
 
