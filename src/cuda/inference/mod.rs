@@ -653,6 +653,12 @@ impl GpuGraphExecutor {
         *self.nodes_to_skip.borrow_mut() = skip_set;
         *self.dynamic_candidates.borrow_mut() = dynamic;
         *self.patterns_detected.borrow_mut() = true;
+
+        // Invalidate topo sort cache — scheduling edges from dynamic
+        // candidates may change the execution order.
+        if !self.dynamic_candidates.borrow().is_empty() {
+            *self.sorted_nodes_cache.borrow_mut() = None;
+        }
     }
 
     /// Check whether all inputs required by a dynamic AddMulAdd candidate are
@@ -4791,6 +4797,30 @@ impl GpuGraphExecutor {
             .flat_map(|n| n.outputs.iter().map(|o| (o.clone(), n.name.as_str())))
             .collect();
 
+        // Scheduling edges: for each dynamic AddMulAdd candidate, the head
+        // node must execute after the nodes producing b and c. This forces
+        // the topo sort to place b/c producers (Div/Slice) before the head
+        // (Add1), enabling Cycle 4's head-triggered fusion to fire.
+        let mut extra_deps: HashMap<String, Vec<String>> = HashMap::new();
+        for (head_name, info) in self.dynamic_candidates.borrow().iter() {
+            if let FusedPattern::AddMulAdd {
+                b_input, c_input, ..
+            } = &info.pattern
+            {
+                let mut deps = Vec::new();
+                if !b_input.is_empty() && !self.weights.contains_key(b_input) {
+                    deps.push(b_input.clone());
+                }
+                if !c_input.is_empty() && !self.weights.contains_key(c_input) {
+                    deps.push(c_input.clone());
+                }
+                if !deps.is_empty() {
+                    extra_deps.insert(head_name.clone(), deps);
+                }
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
         fn visit<'a>(
             node: &'a ExecutionNode,
             node_map: &HashMap<String, &'a ExecutionNode>,
@@ -4799,6 +4829,7 @@ impl GpuGraphExecutor {
             temp_mark: &mut HashSet<String>,
             sorted: &mut Vec<ExecutionNode>,
             weights: &HashSet<String>,
+            extra_deps: &HashMap<String, Vec<String>>,
         ) -> Result<(), CudaError> {
             if visited.contains(&node.name) {
                 return Ok(());
@@ -4827,7 +4858,28 @@ impl GpuGraphExecutor {
                             temp_mark,
                             sorted,
                             weights,
+                            extra_deps,
                         )?;
+                    }
+                }
+            }
+
+            // Visit extra scheduling dependencies (fusion-motivated edges)
+            if let Some(extra_inputs) = extra_deps.get(&node.name) {
+                for input in extra_inputs {
+                    if let Some(producer_name) = output_producers.get(input.as_str()) {
+                        if let Some(producer_node) = node_map.get(*producer_name) {
+                            visit(
+                                producer_node,
+                                node_map,
+                                output_producers,
+                                visited,
+                                temp_mark,
+                                sorted,
+                                weights,
+                                extra_deps,
+                            )?;
+                        }
                     }
                 }
             }
@@ -4852,6 +4904,7 @@ impl GpuGraphExecutor {
                 &mut temp_mark,
                 &mut sorted,
                 &weight_names,
+                &extra_deps,
             )?;
         }
 
