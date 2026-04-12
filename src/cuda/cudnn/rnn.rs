@@ -119,8 +119,8 @@ impl RnnDescriptor {
                 sys::cudnnMathType_t::CUDNN_DEFAULT_MATH,
                 input_size as i32,
                 hidden_size as i32,
-                0,  // projSize (no projection)
-                1,  // numLayers
+                hidden_size as i32, // projSize: cuDNN 9 requires hiddenSize when no projection
+                1,                  // numLayers
                 dropout.raw(),
                 1,  // auxFlags: CUDNN_RNN_PADDED_IO_ENABLED
             ))?;
@@ -677,5 +677,234 @@ pub fn cudnn_lstm_forward(
             "cuDNN LSTM with batch_size={} > 1 not yet supported (needs transpose kernel)",
             batch_size
         )))
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cuda::lstm::LstmKernelCache;
+    use crate::cuda::memory_pool::GpuMemoryPool;
+    use crate::cuda::ops::OpsKernelCache;
+
+    /// Helper: create a GpuTensor from a Vec<f32> with given shape
+    fn gpu_from_vec(
+        ctx: &IconnxCudaContext,
+        data: Vec<f32>,
+        shape: Vec<usize>,
+    ) -> GpuTensor {
+        GpuTensor::from_host_f32(ctx, &data, shape).expect("Failed to create GPU tensor")
+    }
+
+    /// Helper: download GPU tensor to host
+    fn to_host(ctx: &IconnxCudaContext, t: &GpuTensor) -> Vec<f32> {
+        t.to_host_f32(ctx).expect("Failed to download tensor")
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU with cuDNN"]
+    fn test_cudnn_lstm_matches_gpu_lstm() {
+        // Small synthetic LSTM: seq_len=3, batch=1, input_size=4, hidden=4, bidirectional
+        let ctx = IconnxCudaContext::new().expect("Failed to create CUDA context");
+        let handle = CudnnHandle::new().expect("Failed to create cuDNN handle");
+        handle
+            .set_stream(ctx.stream())
+            .expect("Failed to set stream");
+
+        let seq_len = 3;
+        let batch = 1;
+        let input_size = 4;
+        let hidden = 4;
+        let num_dirs = 2;
+
+        // Create deterministic inputs
+        let x_data: Vec<f32> = (0..seq_len * batch * input_size)
+            .map(|i| (i as f32) * 0.1 - 0.5)
+            .collect();
+        let x = gpu_from_vec(&ctx, x_data, vec![seq_len, batch, input_size]);
+
+        // Weights: W [num_dirs, 4*hidden, input_size]
+        let w_data: Vec<f32> = (0..num_dirs * 4 * hidden * input_size)
+            .map(|i| ((i as f32) * 0.02 - 0.5).sin() * 0.1)
+            .collect();
+        let w = gpu_from_vec(
+            &ctx,
+            w_data,
+            vec![num_dirs, 4 * hidden, input_size],
+        );
+
+        // Recurrence: R [num_dirs, 4*hidden, hidden]
+        let r_data: Vec<f32> = (0..num_dirs * 4 * hidden * hidden)
+            .map(|i| ((i as f32) * 0.03 + 0.7).cos() * 0.1)
+            .collect();
+        let r = gpu_from_vec(
+            &ctx,
+            r_data,
+            vec![num_dirs, 4 * hidden, hidden],
+        );
+
+        // Bias: B [num_dirs, 8*hidden]
+        let b_data: Vec<f32> = (0..num_dirs * 8 * hidden)
+            .map(|i| (i as f32) * 0.01 - 0.3)
+            .collect();
+        let b = gpu_from_vec(&ctx, b_data, vec![num_dirs, 8 * hidden]);
+
+        // Initial hidden state: h_init [num_dirs, batch, hidden]
+        let h_data: Vec<f32> = vec![0.0; num_dirs * batch * hidden];
+        let h_init = gpu_from_vec(&ctx, h_data, vec![num_dirs, batch, hidden]);
+
+        // Run gpu_lstm (reference implementation)
+        let lstm_cache = LstmKernelCache::new(&ctx).expect("Failed to create LSTM cache");
+        let ops_cache = OpsKernelCache::new(&ctx).expect("Failed to create ops cache");
+        let mut pool = GpuMemoryPool::new();
+
+        let reference_output = crate::cuda::lstm::gpu_lstm(
+            &ctx,
+            &lstm_cache,
+            &ops_cache,
+            &mut pool,
+            &x,
+            &w,
+            &r,
+            Some(&b),
+            Some(&h_init),
+            None, // c_init
+        )
+        .expect("gpu_lstm failed");
+
+        // Run cudnn_lstm_forward
+        let mut workspace = Workspace::new();
+        let packed = pack_lstm_weights_for_cudnn(
+            &handle,
+            &ctx,
+            &w,
+            &r,
+            Some(&b),
+            hidden,
+            input_size,
+            num_dirs,
+        )
+        .expect("Weight packing failed");
+
+        let cudnn_output = cudnn_lstm_forward(
+            &handle,
+            &ctx,
+            &mut workspace,
+            &packed,
+            &x,
+            Some(&h_init),
+            None, // c_init
+            hidden,
+            num_dirs,
+        )
+        .expect("cudnn_lstm_forward failed");
+
+        // Compare shapes
+        assert_eq!(
+            reference_output.shape(),
+            cudnn_output.shape(),
+            "Output shapes must match: ref={:?}, cudnn={:?}",
+            reference_output.shape(),
+            cudnn_output.shape()
+        );
+
+        // Compare values
+        let ref_data = to_host(&ctx, &reference_output);
+        let cudnn_data = to_host(&ctx, &cudnn_output);
+
+        // Track max difference for diagnostics
+        let mut max_diff: f32 = 0.0;
+
+        // Tolerance: 1e-4 because float accumulation order differs between
+        // per-timestep cuBLAS GEMMs and cuDNN's fused implementation.
+        // On long sequences the divergence grows, but for seq_len=3 it
+        // should be well within this bound.
+        let tolerance = 1e-4;
+        for (i, (r_val, c_val)) in ref_data.iter().zip(cudnn_data.iter()).enumerate() {
+            let diff = (r_val - c_val).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            assert!(
+                diff < tolerance,
+                "Mismatch at index {}: ref={}, cudnn={}, diff={} (tolerance={})",
+                i, r_val, c_val, diff, tolerance
+            );
+        }
+
+        println!(
+            "cuDNN LSTM matches gpu_lstm within {} tolerance (max_diff={}). Shape: {:?}",
+            tolerance,
+            max_diff,
+            cudnn_output.shape()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU with cuDNN"]
+    fn test_cudnn_lstm_unidirectional() {
+        // Verify unidirectional LSTM works (num_directions=1)
+        let ctx = IconnxCudaContext::new().expect("Failed to create CUDA context");
+        let handle = CudnnHandle::new().expect("Failed to create cuDNN handle");
+        handle
+            .set_stream(ctx.stream())
+            .expect("Failed to set stream");
+
+        let seq_len = 3;
+        let batch = 1;
+        let input_size = 4;
+        let hidden = 4;
+        let num_dirs = 1;
+
+        let x_data: Vec<f32> = (0..seq_len * batch * input_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
+        let x = gpu_from_vec(&ctx, x_data, vec![seq_len, batch, input_size]);
+
+        let w_data: Vec<f32> = (0..num_dirs * 4 * hidden * input_size)
+            .map(|i| ((i as f32) * 0.02).sin() * 0.1)
+            .collect();
+        let w = gpu_from_vec(&ctx, w_data, vec![num_dirs, 4 * hidden, input_size]);
+
+        let r_data: Vec<f32> = (0..num_dirs * 4 * hidden * hidden)
+            .map(|i| ((i as f32) * 0.03).cos() * 0.1)
+            .collect();
+        let r = gpu_from_vec(&ctx, r_data, vec![num_dirs, 4 * hidden, hidden]);
+
+        let mut workspace = Workspace::new();
+        let packed = pack_lstm_weights_for_cudnn(
+            &handle, &ctx, &w, &r, None, hidden, input_size, num_dirs,
+        )
+        .expect("Weight packing failed");
+
+        let output = cudnn_lstm_forward(
+            &handle, &ctx, &mut workspace, &packed, &x, None, None,
+            hidden, num_dirs,
+        )
+        .expect("cudnn_lstm_forward failed");
+
+        assert_eq!(
+            output.shape(),
+            &[seq_len, num_dirs, batch, hidden],
+            "Unidirectional output shape mismatch"
+        );
+
+        // Verify output is not all zeros (sanity check that computation ran)
+        let data = to_host(&ctx, &output);
+        let max_val = data.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            max_val > 1e-6,
+            "Output appears to be all zeros -- computation may not have run"
+        );
+
+        println!(
+            "Unidirectional cuDNN LSTM OK. Shape: {:?}, max: {}",
+            output.shape(),
+            max_val
+        );
     }
 }
