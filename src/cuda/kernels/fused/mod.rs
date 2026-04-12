@@ -71,6 +71,8 @@ const FUSED_KERNEL_NAMES: &[&str] = &[
     "fused_add_mul_add_kernel",
     "fused_add_mul_add_scalar_kernel",
     "fused_add_mul_add_bcast_c_kernel",
+    // Per-channel affine: out = scale * input + bias (Kokoro AdaIN pattern)
+    "fused_channel_affine_kernel",
     // Full GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     "fused_gelu_kernel",
     // Mul-Add: y = a * b + c (fused multiply-add)
@@ -197,6 +199,25 @@ extern "C" __global__ void fused_add_mul_add_bcast_c_kernel(
     if (i < n) {
         size_t c_idx = (i / c_inner_stride) % c_size;
         out[i] = (x[i] + a[i]) * b[i] + c[c_idx];
+    }
+}
+
+// Per-channel affine: out = scale * input + bias
+// where input is [1, C, T] (full), scale and bias are [1, C, 1] (per-channel).
+// This is the actual pattern in Kokoro's AdaIN Add->Mul->Add chains:
+// the walker's "b" is the full-shape input, "x" is the scale, "c" is the bias.
+extern "C" __global__ void fused_channel_affine_kernel(
+    float* out,
+    const float* input,
+    const float* scale,
+    const float* bias,
+    size_t n,
+    size_t T
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        size_t ch = i / T;
+        out[i] = scale[ch] * input[i] + bias[ch];
     }
 }
 
@@ -826,6 +847,39 @@ mod tests {
             Err(CudaError::FusionShapeMismatch(_)) => {} // expected
             Err(other) => panic!("expected FusionShapeMismatch, got Err: {}", other),
             Ok(_) => panic!("expected FusionShapeMismatch, got Ok"),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_fused_channel_affine_adain_pattern() {
+        let (ctx, cache, mut pool) = setup();
+
+        // AdaIN pattern: x=[1,4,1] (scale), a=[] (empty), b=[1,4,8] (input), c=[1,4,1] (bias)
+        // out[i] = x[i/8] * b[i] + c[i/8]
+        let x_data: Vec<f32> = vec![2.0, 3.0, 0.5, 1.0]; // [1, 4, 1] scale
+        let b_data: Vec<f32> = (0..32).map(|i| i as f32).collect(); // [1, 4, 8] input
+        let c_data: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0]; // [1, 4, 1] bias
+
+        let x = GpuTensor::from_host_f32(&ctx, &x_data, vec![1, 4, 1]).unwrap();
+        // For empty a, create a scalar zero tensor
+        let a = GpuTensor::from_host_f32(&ctx, &[0.0f32], vec![1]).unwrap();
+        let b = GpuTensor::from_host_f32(&ctx, &b_data, vec![1, 4, 8]).unwrap();
+        let c = GpuTensor::from_host_f32(&ctx, &c_data, vec![1, 4, 1]).unwrap();
+
+        let out = gpu_fused_add_mul_add(&ctx, &cache, &mut pool, &x, &a, &b, &c).unwrap();
+        let result = out.to_host_f32(&ctx).unwrap();
+
+        assert_eq!(out.shape(), &[1, 4, 8]);
+
+        for i in 0..32 {
+            let ch = i / 8;
+            let expected = x_data[ch] * b_data[i] + c_data[ch];
+            assert!(
+                (result[i] - expected).abs() < 1e-5,
+                "mismatch at i={}: got {} expected {} (ch={})",
+                i, result[i], expected, ch,
+            );
         }
     }
 }
