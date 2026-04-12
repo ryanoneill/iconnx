@@ -252,7 +252,7 @@ pub struct GpuGraphExecutor {
 
     /// Detected fused patterns: maps head node name to pattern info
     /// Uses RefCell for interior mutability (detected on first run)
-    fused_patterns: RefCell<HashMap<String, FusedPatternInfo>>,
+    pub(crate) fused_patterns: RefCell<HashMap<String, FusedPatternInfo>>,
     /// Set of node names to skip (they're part of a fused pattern)
     nodes_to_skip: RefCell<std::collections::HashSet<String>>,
     /// Flag to track if patterns have been detected
