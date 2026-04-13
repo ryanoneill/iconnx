@@ -8,8 +8,8 @@
 use super::context::{CudaError, IconnxCudaContext};
 use super::conv::{add_bias, gpu_conv2d, gpu_conv_transpose_2d, Conv2dParams, ConvKernelCache};
 use super::cudnn::{
-    cudnn_conv_1d, cudnn_conv_transpose_1d, ConvAlgoCache, CudnnHandle,
-    Workspace as CudnnWorkspace,
+    cudnn_conv_1d, cudnn_conv_transpose_1d, cudnn_lstm_forward, pack_lstm_weights_for_cudnn,
+    ConvAlgoCache, CudnnHandle, PackedLstmWeights, Workspace as CudnnWorkspace,
 };
 use super::cufft::StftKernelCache;
 use super::kernels::fused::{
@@ -22,7 +22,7 @@ use super::kernels::{
     gpu_log, gpu_mul, gpu_neg, gpu_pow, gpu_relu, gpu_round, gpu_sigmoid, gpu_sin, gpu_sqrt,
     gpu_sub, gpu_tanh, KernelCache,
 };
-use super::lstm::{gpu_lstm, LstmKernelCache};
+use super::lstm::LstmKernelCache;
 use super::matmul::{gpu_batched_matmul, gpu_gemm, gpu_matmul, gpu_matmul_2d_3d};
 use super::memory_pool::GpuMemoryPool;
 use super::ops::{
@@ -44,6 +44,27 @@ use cudarc::driver::sys::CUdeviceptr;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+
+/// Cache for cuDNN packed LSTM weights, keyed by (W_ptr, R_ptr) device addresses.
+///
+/// Using raw device pointers as keys: the same ONNX weight tensor always has
+/// the same GPU address within an executor's lifetime (weights are loaded once
+/// at construction and never moved). This avoids expensive tensor comparisons.
+///
+/// **Invariant:** The cache is valid only while the original W/R tensors are
+/// alive. Since the executor owns both the weights and this cache, the
+/// invariant is trivially maintained.
+struct LstmWeightCache {
+    cache: HashMap<(usize, usize), PackedLstmWeights>,
+}
+
+impl LstmWeightCache {
+    fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+}
 
 pub mod fusion;
 pub mod gpu_event_timer;
@@ -234,6 +255,8 @@ pub struct GpuGraphExecutor {
     cudnn_workspace: RefCell<CudnnWorkspace>,
     /// cuDNN algorithm selection cache (RefCell for interior mutability)
     conv_algo_cache: RefCell<ConvAlgoCache>,
+    /// cuDNN packed LSTM weight cache (RefCell for interior mutability)
+    lstm_weight_cache: RefCell<LstmWeightCache>,
 
     /// Dynamic cache for Int64 values (cleared each run due to memory pool pointer reuse)
     /// Keyed by GPU device pointer, stores computed Int64 values during a single run
@@ -423,6 +446,7 @@ impl GpuGraphExecutor {
             cudnn_handle,
             cudnn_workspace,
             conv_algo_cache: RefCell::new(ConvAlgoCache::new()),
+            lstm_weight_cache: RefCell::new(LstmWeightCache::new()),
             i64_cache: RefCell::new(HashMap::new()),
             static_i64_cache: RefCell::new(HashMap::new()),
             weights: HashMap::new(),
@@ -1691,17 +1715,46 @@ impl GpuGraphExecutor {
                 } else {
                     None
                 };
-                gpu_lstm(
+
+                let w_shape = w.shape();
+                let num_directions = w_shape[0];
+                let hidden_size = w_shape[1] / 4;
+                let input_size = w_shape[2];
+
+                // Get or create packed weights (cached by W/R device pointer pair)
+                let w_ptr = w.device_ptr(&self.ctx) as usize;
+                let r_ptr = r.device_ptr(&self.ctx) as usize;
+                let cache_key = (w_ptr, r_ptr);
+
+                let mut weight_cache = self.lstm_weight_cache.borrow_mut();
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    weight_cache.cache.entry(cache_key)
+                {
+                    let packed = pack_lstm_weights_for_cudnn(
+                        &self.cudnn_handle,
+                        &self.ctx,
+                        w,
+                        r,
+                        b,
+                        hidden_size,
+                        input_size,
+                        num_directions,
+                    )?;
+                    e.insert(packed);
+                }
+                let packed = weight_cache.cache.get(&cache_key).unwrap();
+
+                let mut workspace = self.cudnn_workspace.borrow_mut();
+                cudnn_lstm_forward(
+                    &self.cudnn_handle,
                     &self.ctx,
-                    &self.lstm_kernels,
-                    &self.ops_kernels,
-                    &mut pool,
+                    &mut workspace,
+                    packed,
                     inputs[0],
-                    w,
-                    r,
-                    b,
                     h_init,
                     c_init,
+                    hidden_size,
+                    num_directions,
                 )
             }
 

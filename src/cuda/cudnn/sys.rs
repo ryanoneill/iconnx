@@ -170,6 +170,73 @@ pub enum cudnnActivationMode_t {
 }
 
 // =============================================================================
+// RNN Types
+// =============================================================================
+
+/// RNN cell mode
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum cudnnRNNMode_t {
+    CUDNN_RNN_RELU = 0,
+    CUDNN_RNN_TANH = 1,
+    CUDNN_LSTM = 2,
+    CUDNN_GRU = 3,
+}
+
+/// RNN bias mode
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum cudnnRNNBiasMode_t {
+    CUDNN_RNN_NO_BIAS = 0,
+    CUDNN_RNN_SINGLE_INP_BIAS = 1,
+    CUDNN_RNN_DOUBLE_BIAS = 2,
+    CUDNN_RNN_SINGLE_REC_BIAS = 3,
+}
+
+/// RNN direction mode
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum cudnnDirectionMode_t {
+    CUDNN_UNIDIRECTIONAL = 0,
+    CUDNN_BIDIRECTIONAL = 1,
+}
+
+/// RNN input mode
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum cudnnRNNInputMode_t {
+    CUDNN_LINEAR_INPUT = 0,
+    CUDNN_SKIP_INPUT = 1,
+}
+
+/// RNN forward mode
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum cudnnForwardMode_t {
+    CUDNN_FWD_MODE_INFERENCE = 0,
+    CUDNN_FWD_MODE_TRAINING = 1,
+}
+
+/// RNN data layout
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum cudnnRNNDataLayout_t {
+    CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED = 0,
+    CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_PACKED = 1,
+    CUDNN_RNN_DATA_LAYOUT_BATCH_MAJOR_UNPACKED = 2,
+}
+
+/// RNN algorithm
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum cudnnRNNAlgo_t {
+    CUDNN_RNN_ALGO_STANDARD = 0,
+    CUDNN_RNN_ALGO_PERSIST_STATIC = 1,
+    CUDNN_RNN_ALGO_PERSIST_DYNAMIC = 2,
+    CUDNN_RNN_ALGO_PERSIST_STATIC_SMALL_H = 3,
+}
+
+// =============================================================================
 // Opaque Handle Types
 // =============================================================================
 
@@ -207,6 +274,27 @@ pub struct cudnnActivationStruct {
     _private: [u8; 0],
 }
 pub type cudnnActivationDescriptor_t = *mut cudnnActivationStruct;
+
+/// RNN descriptor
+#[repr(C)]
+pub struct cudnnRNNStruct {
+    _private: [u8; 0],
+}
+pub type cudnnRNNDescriptor_t = *mut cudnnRNNStruct;
+
+/// RNN data descriptor
+#[repr(C)]
+pub struct cudnnRNNDataStruct {
+    _private: [u8; 0],
+}
+pub type cudnnRNNDataDescriptor_t = *mut cudnnRNNDataStruct;
+
+/// Dropout descriptor
+#[repr(C)]
+pub struct cudnnDropoutStruct {
+    _private: [u8; 0],
+}
+pub type cudnnDropoutDescriptor_t = *mut cudnnDropoutStruct;
 
 // CUDA stream type (from CUDA driver API)
 pub type cudaStream_t = *mut c_void;
@@ -494,6 +582,139 @@ extern "C" {
         beta: *const c_void,
         yDesc: cudnnTensorDescriptor_t,
         y: *mut c_void,
+    ) -> cudnnStatus_t;
+
+    // -------------------------------------------------------------------------
+    // RNN Descriptor Management
+    // -------------------------------------------------------------------------
+
+    pub fn cudnnCreateRNNDescriptor(rnnDesc: *mut cudnnRNNDescriptor_t) -> cudnnStatus_t;
+    pub fn cudnnDestroyRNNDescriptor(rnnDesc: cudnnRNNDescriptor_t) -> cudnnStatus_t;
+
+    pub fn cudnnSetRNNDescriptor_v8(
+        rnnDesc: cudnnRNNDescriptor_t,
+        algo: cudnnRNNAlgo_t,
+        cellMode: cudnnRNNMode_t,
+        biasMode: cudnnRNNBiasMode_t,
+        dirMode: cudnnDirectionMode_t,
+        inputMode: cudnnRNNInputMode_t,
+        dataType: cudnnDataType_t,
+        mathPrec: cudnnDataType_t,
+        mathType: cudnnMathType_t,
+        inputSize: i32,
+        hiddenSize: i32,
+        projSize: i32,
+        numLayers: i32,
+        dropoutDesc: cudnnDropoutDescriptor_t,
+        auxFlags: u32,
+    ) -> cudnnStatus_t;
+
+    // -------------------------------------------------------------------------
+    // RNN Weight Space
+    // -------------------------------------------------------------------------
+
+    pub fn cudnnGetRNNWeightSpaceSize(
+        handle: cudnnHandle_t,
+        rnnDesc: cudnnRNNDescriptor_t,
+        weightSpaceSize: *mut usize,
+    ) -> cudnnStatus_t;
+
+    pub fn cudnnGetRNNWeightParams(
+        handle: cudnnHandle_t,
+        rnnDesc: cudnnRNNDescriptor_t,
+        pseudoLayer: i32,
+        weightSpaceSize: usize,
+        weightSpace: *const c_void,
+        linLayerID: i32,
+        mDesc: cudnnTensorDescriptor_t,
+        mAddr: *mut *mut c_void,
+        bDesc: cudnnTensorDescriptor_t,
+        bAddr: *mut *mut c_void,
+    ) -> cudnnStatus_t;
+
+    // -------------------------------------------------------------------------
+    // RNN Data Descriptor
+    // -------------------------------------------------------------------------
+
+    pub fn cudnnCreateRNNDataDescriptor(
+        rnnDataDesc: *mut cudnnRNNDataDescriptor_t,
+    ) -> cudnnStatus_t;
+
+    pub fn cudnnDestroyRNNDataDescriptor(
+        rnnDataDesc: cudnnRNNDataDescriptor_t,
+    ) -> cudnnStatus_t;
+
+    pub fn cudnnSetRNNDataDescriptor(
+        rnnDataDesc: cudnnRNNDataDescriptor_t,
+        dataType: cudnnDataType_t,
+        layout: cudnnRNNDataLayout_t,
+        maxSeqLength: i32,
+        batchSize: i32,
+        vectorSize: i32,
+        seqLengthArray: *const i32,
+        paddingFill: *mut c_void,
+    ) -> cudnnStatus_t;
+
+    // -------------------------------------------------------------------------
+    // RNN Temp Space and Forward
+    // -------------------------------------------------------------------------
+
+    pub fn cudnnGetRNNTempSpaceSizes(
+        handle: cudnnHandle_t,
+        rnnDesc: cudnnRNNDescriptor_t,
+        fMode: cudnnForwardMode_t,
+        xDesc: cudnnRNNDataDescriptor_t,
+        workSpaceSize: *mut usize,
+        reserveSpaceSize: *mut usize,
+    ) -> cudnnStatus_t;
+
+    pub fn cudnnRNNForward(
+        handle: cudnnHandle_t,
+        rnnDesc: cudnnRNNDescriptor_t,
+        fwdMode: cudnnForwardMode_t,
+        devSeqLengths: *const i32,
+        xDesc: cudnnRNNDataDescriptor_t,
+        x: *const c_void,
+        yDesc: cudnnRNNDataDescriptor_t,
+        y: *mut c_void,
+        hDesc: cudnnTensorDescriptor_t,
+        hx: *const c_void,
+        hy: *mut c_void,
+        cDesc: cudnnTensorDescriptor_t,
+        cx: *const c_void,
+        cy: *mut c_void,
+        weightSpaceSize: usize,
+        weightSpace: *const c_void,
+        workSpaceSize: usize,
+        workSpace: *mut c_void,
+        reserveSpaceSize: usize,
+        reserveSpace: *mut c_void,
+    ) -> cudnnStatus_t;
+
+    // -------------------------------------------------------------------------
+    // Dropout Descriptor (required for RNN even with rate=0)
+    // -------------------------------------------------------------------------
+
+    pub fn cudnnCreateDropoutDescriptor(
+        dropoutDesc: *mut cudnnDropoutDescriptor_t,
+    ) -> cudnnStatus_t;
+
+    pub fn cudnnDestroyDropoutDescriptor(
+        dropoutDesc: cudnnDropoutDescriptor_t,
+    ) -> cudnnStatus_t;
+
+    pub fn cudnnDropoutGetStatesSize(
+        handle: cudnnHandle_t,
+        sizeInBytes: *mut usize,
+    ) -> cudnnStatus_t;
+
+    pub fn cudnnSetDropoutDescriptor(
+        dropoutDesc: cudnnDropoutDescriptor_t,
+        handle: cudnnHandle_t,
+        dropout: f32,
+        states: *mut c_void,
+        stateSizeInBytes: usize,
+        seed: u64,
     ) -> cudnnStatus_t;
 }
 

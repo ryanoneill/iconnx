@@ -10,6 +10,8 @@
 #![allow(clippy::too_many_arguments)] // cuDNN APIs require many parameters
 
 mod sys;
+pub mod rnn;
+pub use rnn::*;
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use std::collections::HashMap;
