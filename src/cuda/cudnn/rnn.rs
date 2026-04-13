@@ -75,6 +75,12 @@ impl Drop for DropoutDescriptor {
     }
 }
 
+// cuDNN descriptors contain raw pointers that are not auto-Send/Sync.
+// cuDNN handles are thread-safe when used with proper stream synchronization,
+// which IconnxCudaContext enforces. Same reasoning as CudnnHandle's impls in mod.rs.
+unsafe impl Send for DropoutDescriptor {}
+unsafe impl Sync for DropoutDescriptor {}
+
 // =============================================================================
 // RnnDescriptor
 // =============================================================================
@@ -142,6 +148,9 @@ impl Drop for RnnDescriptor {
     }
 }
 
+unsafe impl Send for RnnDescriptor {}
+unsafe impl Sync for RnnDescriptor {}
+
 // =============================================================================
 // RnnDataDescriptor
 // =============================================================================
@@ -188,6 +197,9 @@ impl Drop for RnnDataDescriptor {
         }
     }
 }
+
+unsafe impl Send for RnnDataDescriptor {}
+unsafe impl Sync for RnnDataDescriptor {}
 
 // =============================================================================
 // Packed LSTM Weights
@@ -690,6 +702,18 @@ mod tests {
     use crate::cuda::lstm::LstmKernelCache;
     use crate::cuda::memory_pool::GpuMemoryPool;
     use crate::cuda::ops::OpsKernelCache;
+
+    // Compile-time assertion: cuDNN RNN types must be Send+Sync so
+    // GpuGraphExecutor (which contains them) can be used across threads.
+    const _: () = {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn check() {
+            assert_send_sync::<DropoutDescriptor>();
+            assert_send_sync::<RnnDescriptor>();
+            assert_send_sync::<RnnDataDescriptor>();
+            assert_send_sync::<PackedLstmWeights>();
+        }
+    };
 
     /// Helper: create a GpuTensor from a Vec<f32> with given shape
     fn gpu_from_vec(
