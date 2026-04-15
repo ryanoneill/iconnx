@@ -33,10 +33,29 @@ version = "0.17"
 features = ["cublas", "nvrtc", "cuda-12000"]
 optional = true
 
+# Garboard — safe Rust CUDA bindings. Migration target (see
+# docs/analysis/2026-04-14-iconnx-garboard-migration-plan.md in
+# rust-ai-explorations). Coexists with cudarc during Phase 1: this PR
+# migrates IconnxCudaContext's memory API (alloc_zeros/htod/dtoh) to
+# garboard; kernel launches, cuBLAS, and cuDNN remain on cudarc until
+# subsequent PRs migrate them one kernel cache at a time.
+[dependencies.garboard]
+git = "https://github.com/ryanoneill/garboard.git"
+branch = "main"
+features = ["cuda"]
+optional = true
+
+# bytemuck — garboard's DeviceSlice<T> requires T: bytemuck::Pod. Used by
+# iconnx for the `Pod` derive on CufftComplex and friends.
+[dependencies.bytemuck]
+version = "1.14"
+features = ["derive"]
+optional = true
+
 [features]
 default = ["cuda"]
-# Enable CUDA GPU acceleration
-cuda = ["dep:cudarc"]
+# Enable CUDA GPU acceleration.
+cuda = ["dep:cudarc", "dep:garboard", "dep:bytemuck"]
 # Enable GPU inference debugging: tensor validation, checkpoints, differential testing
 debug-inference = []
 
