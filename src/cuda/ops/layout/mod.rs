@@ -60,7 +60,7 @@ pub fn gpu_constant_of_shape_direct(
 
     // Use fill kernel to set all values
     let kernel = cache
-        .get("fill_kernel")
+        .cudarc_function("fill_kernel")
         .ok_or_else(|| CudaError::Kernel("fill_kernel not found".into()))?;
 
     let config = LaunchConfig::for_num_elems(total_elements as u32);
@@ -95,7 +95,7 @@ pub fn gpu_transpose_2d(
     let mut output = pool.get_tensor_f32(ctx, vec![cols, rows])?;
 
     let kernel = cache
-        .get("transpose_2d_kernel")
+        .cudarc_function("transpose_2d_kernel")
         .ok_or_else(|| CudaError::Kernel("transpose_2d_kernel not found".into()))?;
 
     let config = LaunchConfig::for_num_elems(total as u32);
@@ -199,7 +199,7 @@ pub fn gpu_transpose_nd(
         GpuTensor::Float32 { .. } => {
             let mut output = pool.get_tensor_f32(ctx, out_shape)?;
             let kernel = cache
-                .get("transpose_general_kernel")
+                .cudarc_function("transpose_general_kernel")
                 .ok_or_else(|| CudaError::Kernel("transpose_general_kernel not found".into()))?;
 
             unsafe {
@@ -222,7 +222,7 @@ pub fn gpu_transpose_nd(
         }
         GpuTensor::Int64 { .. } => {
             let mut output = pool.get_tensor_i64(ctx, out_shape)?;
-            let kernel = cache.get("transpose_general_i64_kernel").ok_or_else(|| {
+            let kernel = cache.cudarc_function("transpose_general_i64_kernel").ok_or_else(|| {
                 CudaError::Kernel("transpose_general_i64_kernel not found".into())
             })?;
 
@@ -249,7 +249,7 @@ pub fn gpu_transpose_nd(
             // This is a bit hacky but works for transpose which just moves data
             let mut output = pool.get_tensor_i32(ctx, out_shape)?;
             let kernel = cache
-                .get("transpose_general_kernel")
+                .cudarc_function("transpose_general_kernel")
                 .ok_or_else(|| CudaError::Kernel("transpose_general_kernel not found".into()))?;
 
             unsafe {
@@ -305,7 +305,7 @@ pub fn gpu_where(
         crate::cuda::tensor::DType::Float32 => {
             let mut output = pool.get_tensor_f32(ctx, condition.shape().to_vec())?;
             let kernel = cache
-                .get("where_kernel")
+                .cudarc_function("where_kernel")
                 .ok_or_else(|| CudaError::Kernel("where_kernel not found".into()))?;
 
             unsafe {
@@ -324,7 +324,7 @@ pub fn gpu_where(
         crate::cuda::tensor::DType::Int64 => {
             let mut output = pool.get_tensor_i64(ctx, condition.shape().to_vec())?;
             let kernel = cache
-                .get("where_i64_kernel")
+                .cudarc_function("where_i64_kernel")
                 .ok_or_else(|| CudaError::Kernel("where_i64_kernel not found".into()))?;
 
             unsafe {
@@ -343,7 +343,7 @@ pub fn gpu_where(
         crate::cuda::tensor::DType::Int32 => {
             let mut output = pool.get_tensor_i32(ctx, condition.shape().to_vec())?;
             let kernel = cache
-                .get("where_i32_kernel")
+                .cudarc_function("where_i32_kernel")
                 .ok_or_else(|| CudaError::Kernel("where_i32_kernel not found".into()))?;
 
             unsafe {
@@ -410,7 +410,7 @@ pub fn gpu_gather(
         GpuTensor::Float32 { .. } => {
             let mut output = pool.get_tensor_f32(ctx, out_shape)?;
             let kernel = cache
-                .get("gather_kernel")
+                .cudarc_function("gather_kernel")
                 .ok_or_else(|| CudaError::Kernel("gather_kernel not found".into()))?;
 
             unsafe {
@@ -430,7 +430,7 @@ pub fn gpu_gather(
         GpuTensor::Int64 { .. } => {
             let mut output = pool.get_tensor_i64(ctx, out_shape)?;
             let kernel = cache
-                .get("gather_i64_kernel")
+                .cudarc_function("gather_i64_kernel")
                 .ok_or_else(|| CudaError::Kernel("gather_i64_kernel not found".into()))?;
 
             unsafe {
@@ -487,7 +487,7 @@ pub fn gpu_gather_from_gpu(
         GpuTensor::Float32 { .. } => {
             let mut output = pool.get_tensor_f32(ctx, out_shape)?;
             let kernel = cache
-                .get("gather_kernel")
+                .cudarc_function("gather_kernel")
                 .ok_or_else(|| CudaError::Kernel("gather_kernel not found".into()))?;
 
             unsafe {
@@ -507,7 +507,7 @@ pub fn gpu_gather_from_gpu(
         GpuTensor::Int64 { .. } => {
             let mut output = pool.get_tensor_i64(ctx, out_shape)?;
             let kernel = cache
-                .get("gather_i64_kernel")
+                .cudarc_function("gather_i64_kernel")
                 .ok_or_else(|| CudaError::Kernel("gather_i64_kernel not found".into()))?;
 
             unsafe {
@@ -546,7 +546,7 @@ pub fn gpu_slice_contiguous(
     let mut output = pool.get_tensor_f32(ctx, out_shape)?;
 
     let kernel = cache
-        .get("slice_kernel")
+        .cudarc_function("slice_kernel")
         .ok_or_else(|| CudaError::Kernel("slice_kernel not found".into()))?;
 
     let config = LaunchConfig::for_num_elems(length as u32);
@@ -577,7 +577,7 @@ pub fn gpu_copy(
     let mut output = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
 
     let kernel = cache
-        .get("copy_kernel")
+        .cudarc_function("copy_kernel")
         .ok_or_else(|| CudaError::Kernel("copy_kernel not found".into()))?;
 
     let config = LaunchConfig::for_num_elems(n as u32);
@@ -668,7 +668,7 @@ pub fn gpu_concat(
         crate::cuda::tensor::DType::Float32 => {
             let mut output = pool.get_tensor_f32(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("concat_kernel")
+                .cudarc_function("concat_kernel")
                 .ok_or_else(|| CudaError::Kernel("concat_kernel not found".into()))?;
 
             let mut inp_offset: usize = 0;
@@ -706,7 +706,7 @@ pub fn gpu_concat(
         crate::cuda::tensor::DType::Int64 => {
             let mut output = pool.get_tensor_i64(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("concat_i64_kernel")
+                .cudarc_function("concat_i64_kernel")
                 .ok_or_else(|| CudaError::Kernel("concat_i64_kernel not found".into()))?;
 
             let mut inp_offset: usize = 0;
@@ -746,7 +746,7 @@ pub fn gpu_concat(
         crate::cuda::tensor::DType::Int32 => {
             let mut output = pool.get_tensor_i32(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("concat_i32_kernel")
+                .cudarc_function("concat_i32_kernel")
                 .ok_or_else(|| CudaError::Kernel("concat_i32_kernel not found".into()))?;
 
             let mut inp_offset: usize = 0;
@@ -856,7 +856,7 @@ pub fn gpu_expand(
         crate::cuda::tensor::DType::Float32 => {
             let mut output = pool.get_tensor_f32(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("expand_kernel")
+                .cudarc_function("expand_kernel")
                 .ok_or_else(|| CudaError::Kernel("expand_kernel not found".into()))?;
 
             unsafe {
@@ -878,7 +878,7 @@ pub fn gpu_expand(
         crate::cuda::tensor::DType::Int64 => {
             let mut output = pool.get_tensor_i64(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("expand_i64_kernel")
+                .cudarc_function("expand_i64_kernel")
                 .ok_or_else(|| CudaError::Kernel("expand_i64_kernel not found".into()))?;
 
             unsafe {
@@ -900,7 +900,7 @@ pub fn gpu_expand(
         crate::cuda::tensor::DType::Int32 => {
             let mut output = pool.get_tensor_i32(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("expand_i32_kernel")
+                .cudarc_function("expand_i32_kernel")
                 .ok_or_else(|| CudaError::Kernel("expand_i32_kernel not found".into()))?;
 
             unsafe {
@@ -1046,7 +1046,7 @@ fn gpu_pad_constant(
     match ndim {
         3 => {
             let kernel = cache
-                .get("pad_3d_scalar_kernel")
+                .cudarc_function("pad_3d_scalar_kernel")
                 .ok_or_else(|| CudaError::Kernel("pad_3d_scalar_kernel not found".into()))?;
 
             unsafe {
@@ -1083,7 +1083,7 @@ fn gpu_pad_constant(
         }
         4 => {
             let kernel = cache
-                .get("pad_4d_scalar_kernel")
+                .cudarc_function("pad_4d_scalar_kernel")
                 .ok_or_else(|| CudaError::Kernel("pad_4d_scalar_kernel not found".into()))?;
 
             unsafe {
@@ -1133,7 +1133,7 @@ fn gpu_pad_constant(
             let pads_begin_gpu = ctx.htod_usize(pads_begin)?;
 
             let kernel = cache
-                .get("pad_kernel")
+                .cudarc_function("pad_kernel")
                 .ok_or_else(|| CudaError::Kernel("pad_kernel not found".into()))?;
 
             unsafe {
@@ -1179,7 +1179,7 @@ fn gpu_pad_reflect(
     match ndim {
         3 => {
             let kernel = cache
-                .get("pad_reflect_3d_kernel")
+                .cudarc_function("pad_reflect_3d_kernel")
                 .ok_or_else(|| CudaError::Kernel("pad_reflect_3d_kernel not found".into()))?;
 
             unsafe {
@@ -1223,7 +1223,7 @@ fn gpu_pad_reflect(
             let pads_begin_gpu = ctx.htod_usize(pads_begin)?;
 
             let kernel = cache
-                .get("pad_reflect_kernel")
+                .cudarc_function("pad_reflect_kernel")
                 .ok_or_else(|| CudaError::Kernel("pad_reflect_kernel not found".into()))?;
 
             unsafe {
@@ -1274,7 +1274,7 @@ fn gpu_pad_edge(
     let pads_begin_gpu = ctx.htod_usize(pads_begin)?;
 
     let kernel = cache
-        .get("pad_edge_kernel")
+        .cudarc_function("pad_edge_kernel")
         .ok_or_else(|| CudaError::Kernel("pad_edge_kernel not found".into()))?;
 
     unsafe {
@@ -1324,7 +1324,7 @@ pub fn gpu_scatter_nd(
     let shape_gpu = ctx.htod_usize(&shape_vec)?;
 
     let kernel = cache
-        .get("scatter_nd_kernel")
+        .cudarc_function("scatter_nd_kernel")
         .ok_or_else(|| CudaError::Kernel("scatter_nd_kernel not found".into()))?;
 
     let total = num_updates * slice_size;
@@ -1437,7 +1437,7 @@ pub fn gpu_resize(
             match ndim {
                 3 => {
                     let kernel = cache
-                        .get("resize_linear_3d_kernel")
+                        .cudarc_function("resize_linear_3d_kernel")
                         .ok_or_else(|| {
                             CudaError::Kernel("resize_linear_3d_kernel not found".into())
                         })?;
@@ -1475,7 +1475,7 @@ pub fn gpu_resize(
                 }
                 4 => {
                     let kernel = cache
-                        .get("resize_linear_4d_kernel")
+                        .cudarc_function("resize_linear_4d_kernel")
                         .ok_or_else(|| {
                             CudaError::Kernel("resize_linear_4d_kernel not found".into())
                         })?;
@@ -1528,7 +1528,7 @@ pub fn gpu_resize(
             match ndim {
                 3 => {
                     let kernel = cache
-                        .get("resize_3d_scalar_kernel")
+                        .cudarc_function("resize_3d_scalar_kernel")
                         .ok_or_else(|| {
                             CudaError::Kernel("resize_3d_scalar_kernel not found".into())
                         })?;
@@ -1571,7 +1571,7 @@ pub fn gpu_resize(
                 }
                 4 => {
                     let kernel = cache
-                        .get("resize_4d_scalar_kernel")
+                        .cudarc_function("resize_4d_scalar_kernel")
                         .ok_or_else(|| {
                             CudaError::Kernel("resize_4d_scalar_kernel not found".into())
                         })?;
@@ -1626,7 +1626,7 @@ pub fn gpu_resize(
                     let scales_gpu = ctx.htod(scales)?;
 
                     let kernel = cache
-                        .get("resize_nearest_kernel")
+                        .cudarc_function("resize_nearest_kernel")
                         .ok_or_else(|| {
                             CudaError::Kernel("resize_nearest_kernel not found".into())
                         })?;
@@ -1856,7 +1856,7 @@ pub fn gpu_slice_nd(
         (3, crate::cuda::tensor::DType::Float32) => {
             let mut output = pool.get_tensor_f32(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("slice_3d_scalar_kernel")
+                .cudarc_function("slice_3d_scalar_kernel")
                 .ok_or_else(|| CudaError::Kernel("slice_3d_scalar_kernel not found".into()))?;
 
             unsafe {
@@ -1892,7 +1892,7 @@ pub fn gpu_slice_nd(
         (3, crate::cuda::tensor::DType::Int64) => {
             let mut output = pool.get_tensor_i64(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("slice_3d_i64_scalar_kernel")
+                .cudarc_function("slice_3d_i64_scalar_kernel")
                 .ok_or_else(|| CudaError::Kernel("slice_3d_i64_scalar_kernel not found".into()))?;
 
             unsafe {
@@ -1924,7 +1924,7 @@ pub fn gpu_slice_nd(
         (4, crate::cuda::tensor::DType::Float32) => {
             let mut output = pool.get_tensor_f32(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("slice_4d_scalar_kernel")
+                .cudarc_function("slice_4d_scalar_kernel")
                 .ok_or_else(|| CudaError::Kernel("slice_4d_scalar_kernel not found".into()))?;
 
             unsafe {
@@ -1964,7 +1964,7 @@ pub fn gpu_slice_nd(
         (4, crate::cuda::tensor::DType::Int64) => {
             let mut output = pool.get_tensor_i64(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("slice_4d_i64_scalar_kernel")
+                .cudarc_function("slice_4d_i64_scalar_kernel")
                 .ok_or_else(|| CudaError::Kernel("slice_4d_i64_scalar_kernel not found".into()))?;
 
             unsafe {
@@ -2006,7 +2006,7 @@ pub fn gpu_slice_nd(
 
             let mut output = pool.get_tensor_f32(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("slice_nd_kernel")
+                .cudarc_function("slice_nd_kernel")
                 .ok_or_else(|| CudaError::Kernel("slice_nd_kernel not found".into()))?;
 
             unsafe {
@@ -2034,7 +2034,7 @@ pub fn gpu_slice_nd(
 
             let mut output = pool.get_tensor_i64(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("slice_nd_i64_kernel")
+                .cudarc_function("slice_nd_i64_kernel")
                 .ok_or_else(|| CudaError::Kernel("slice_nd_i64_kernel not found".into()))?;
 
             unsafe {
@@ -2062,7 +2062,7 @@ pub fn gpu_slice_nd(
 
             let mut output = pool.get_tensor_i32(ctx, out_shape.clone())?;
             let kernel = cache
-                .get("slice_nd_i32_kernel")
+                .cudarc_function("slice_nd_i32_kernel")
                 .ok_or_else(|| CudaError::Kernel("slice_nd_i32_kernel not found".into()))?;
 
             unsafe {
