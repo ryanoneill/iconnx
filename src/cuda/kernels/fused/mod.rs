@@ -18,47 +18,41 @@
 //!   through `pub use wrappers::*` so external callers see a flat namespace.
 
 use crate::cuda::context::{CudaError, IconnxCudaContext};
-use cudarc::driver::{CudaFunction, CudaModule, LaunchConfig};
-use cudarc::nvrtc::compile_ptx;
-use std::collections::HashMap;
-use std::sync::Arc;
+use garboard::{LaunchConfig, Module, Program};
 
 pub(super) mod wrappers;
 pub use wrappers::*;
 
-/// Cache for fused kernels
+/// Compiled fused kernels loaded as a garboard `Module`.
 pub struct FusedKernelCache {
-    #[allow(dead_code)]
-    module: Arc<CudaModule>,
-    functions: HashMap<&'static str, CudaFunction>,
+    module: Module<'static>,
 }
 
 impl FusedKernelCache {
-    /// Compile all fused kernels and create the cache
+    /// Compile all fused kernels and create the cache.
     pub fn new(ctx: &IconnxCudaContext) -> Result<Self, CudaError> {
-        let ptx = compile_ptx(FUSED_KERNELS)
-            .map_err(|e| CudaError::Kernel(format!("NVRTC fused kernel compilation failed: {:?}", e)))?;
+        let program = Program::compile_for_device(FUSED_KERNELS, ctx.garboard_device(), &[])
+            .map_err(|e| {
+                CudaError::Kernel(format!("NVRTC fused kernel compilation failed: {}", e))
+            })?;
 
         let module = ctx
-            .context()
-            .load_module(ptx)
+            .garboard_device()
+            .load_module(&program)
             .map_err(|e| CudaError::Kernel(format!("Fused module load failed: {}", e)))?;
 
-        let mut functions = HashMap::new();
-
         for name in FUSED_KERNEL_NAMES {
-            let func = module.load_function(name).map_err(|e| {
+            module.function(name).map_err(|e| {
                 CudaError::Kernel(format!("Failed to load fused kernel '{}': {}", name, e))
             })?;
-            functions.insert(*name, func);
         }
 
-        Ok(Self { module, functions })
+        Ok(Self { module })
     }
 
-    /// Get a compiled kernel function by name
-    pub fn get(&self, name: &'static str) -> Option<&CudaFunction> {
-        self.functions.get(name)
+    /// Access to the underlying module for launch sites.
+    pub(super) fn module(&self) -> &Module<'static> {
+        &self.module
     }
 }
 
