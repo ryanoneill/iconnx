@@ -9,14 +9,8 @@
 use std::ffi::c_int;
 use std::ptr;
 
-use cudarc::driver::{
-    CudaFunction, CudaModule, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
-};
-use cudarc::nvrtc::compile_ptx;
-use std::collections::HashMap;
-use std::sync::Arc;
+use cudarc::driver::{DeviceRepr, ValidAsZeroBits};
 
-use super::bridge::GbKernelArg;
 use super::context::{CudaError, IconnxCudaContext};
 use super::tensor::GpuTensor;
 
@@ -70,38 +64,38 @@ extern "C" __global__ void unpack_complex_kernel(
 
 const STFT_KERNEL_NAMES: &[&str] = &["window_frames_kernel", "unpack_complex_kernel"];
 
-/// Kernel cache for STFT operations
+/// STFT kernel cache as a garboard `Module`.
 pub struct StftKernelCache {
-    #[allow(dead_code)]
-    module: Arc<CudaModule>,
-    functions: HashMap<&'static str, CudaFunction>,
+    module: garboard::Module<'static>,
 }
 
 impl StftKernelCache {
-    /// Compile STFT kernels
+    /// Compile STFT kernels.
     pub fn new(ctx: &IconnxCudaContext) -> Result<Self, CudaError> {
-        let ptx = compile_ptx(STFT_KERNELS)
-            .map_err(|e| CudaError::Kernel(format!("STFT kernel compilation failed: {:?}", e)))?;
+        let program = garboard::Program::compile_for_device(
+            STFT_KERNELS,
+            ctx.garboard_device(),
+            &[],
+        )
+        .map_err(|e| CudaError::Kernel(format!("STFT kernel compilation failed: {}", e)))?;
 
         let module = ctx
-            .context()
-            .load_module(ptx)
+            .garboard_device()
+            .load_module(&program)
             .map_err(|e| CudaError::Kernel(format!("Module load failed: {}", e)))?;
 
-        let mut functions = HashMap::new();
-
         for name in STFT_KERNEL_NAMES {
-            let func = module.load_function(name).map_err(|e| {
+            module.function(name).map_err(|e| {
                 CudaError::Kernel(format!("Failed to load kernel '{}': {}", name, e))
             })?;
-            functions.insert(*name, func);
         }
 
-        Ok(Self { module, functions })
+        Ok(Self { module })
     }
 
-    pub fn get(&self, name: &'static str) -> Option<&CudaFunction> {
-        self.functions.get(name)
+    /// Access to the underlying module for launch sites.
+    pub(crate) fn module(&self) -> &garboard::Module<'static> {
+        &self.module
     }
 }
 
@@ -388,54 +382,62 @@ pub fn gpu_stft(
     // Output shape: [num_frames, fft_size]
     let mut windowed_frames = GpuTensor::zeros_f32(ctx, vec![num_frames, fft_size])?;
 
-    let window_kernel = cache
-        .get("window_frames_kernel")
-        .ok_or_else(|| CudaError::Kernel("window_frames_kernel not found".into()))?;
-
-    // Launch config: grid (ceil(fft_size/256), num_frames), block (256)
-    // CUDA grid Y dimension limit is 65535, so we need to chunk if num_frames > 65535
+    // Launch config: grid (ceil(fft_size/256), num_frames), block (256).
+    // CUDA grid Y dimension limit is 65535, so we chunk if num_frames > 65535.
     let threads_per_block = 256u32;
     let blocks_x = (fft_size as u32).div_ceil(threads_per_block);
 
     const MAX_FRAMES_PER_LAUNCH: usize = 65535;
 
-    // Process frames in chunks to avoid exceeding CUDA grid limits
+    // SAFETY: window_frames_kernel signature is
+    // `(float* out, const float* signal, const float* window, int signal_length,
+    //   int fft_size, int hop_size, int chunk_frames, int frame_offset,
+    //   int chunk_offset_elements)`.
+    let window_kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, f32>,
+            i32, i32, i32, i32, i32, i32,
+        )>("window_frames_kernel")
+    }
+    .map_err(|e| CudaError::Kernel(format!("window_frames_kernel lookup failed: {}", e)))?;
+
+    // Process frames in chunks to avoid exceeding CUDA grid limits.
     let mut frame_offset = 0usize;
     while frame_offset < num_frames {
         let chunk_frames = (num_frames - frame_offset).min(MAX_FRAMES_PER_LAUNCH);
 
-        let config = LaunchConfig {
+        let config = garboard::LaunchConfig {
             grid_dim: (blocks_x, chunk_frames as u32, 1),
             block_dim: (threads_per_block, 1, 1),
             shared_mem_bytes: 0,
         };
 
-        // Get pointer to the start of this chunk in the output
         let chunk_offset_elements = frame_offset * fft_size;
 
-        let out_arg = GbKernelArg::new_mut(windowed_frames.data_f32_mut()?);
-        let signal_arg = GbKernelArg::new(signal.data_f32()?);
-        let window_arg = GbKernelArg::new(window.data_f32()?);
-        unsafe {
-            ctx.stream()
-                .launch_builder(window_kernel)
-                .arg(&out_arg)
-                .arg(&signal_arg)
-                .arg(&window_arg)
-                .arg(&(signal_length as i32))
-                .arg(&(fft_size as i32))
-                .arg(&(hop_size as i32))
-                .arg(&(chunk_frames as i32))
-                .arg(&(frame_offset as i32)) // New: frame offset parameter
-                .arg(&(chunk_offset_elements as i32)) // New: output offset
-                .launch(config)
-                .map_err(|e| {
-                    CudaError::Kernel(format!(
-                        "window_frames launch failed (chunk at offset {}): {}",
-                        frame_offset, e
-                    ))
-                })?;
-        }
+        window_kernel
+            .launch(
+                ctx.garboard_stream(),
+                &config,
+                (
+                    windowed_frames.data_f32_mut()?,
+                    signal.data_f32()?,
+                    window.data_f32()?,
+                    signal_length as i32,
+                    fft_size as i32,
+                    hop_size as i32,
+                    chunk_frames as i32,
+                    frame_offset as i32,
+                    chunk_offset_elements as i32,
+                ),
+            )
+            .map_err(|e| {
+                CudaError::Kernel(format!(
+                    "window_frames launch failed (chunk at offset {}): {}",
+                    frame_offset, e
+                ))
+            })?;
 
         frame_offset += chunk_frames;
     }
@@ -458,48 +460,55 @@ pub fn gpu_stft(
         plan.exec_r2c(input_ptr as *mut f32, output_ptr as *mut CufftComplex)?;
     }
 
-    // Step 3: Unpack complex results to [frames, bins, 2] format
+    // Step 3: Unpack complex results to [frames, bins, 2] format.
     let mut output = GpuTensor::zeros_f32(ctx, vec![num_frames, output_bins, 2])?;
-
-    let unpack_kernel = cache
-        .get("unpack_complex_kernel")
-        .ok_or_else(|| CudaError::Kernel("unpack_complex_kernel not found".into()))?;
 
     let bins_blocks = (output_bins as u32).div_ceil(threads_per_block);
 
-    // Process frames in chunks to avoid exceeding CUDA grid limits
+    // SAFETY: unpack_complex_kernel signature is
+    // `(float* out, const CufftComplex* fft_out, int chunk_frames,
+    //   int output_bins, int frame_offset, int output_offset_elements)`.
+    let unpack_kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, CufftComplex>,
+            i32, i32, i32, i32,
+        )>("unpack_complex_kernel")
+    }
+    .map_err(|e| CudaError::Kernel(format!("unpack_complex_kernel lookup failed: {}", e)))?;
+
+    // Process frames in chunks to avoid exceeding CUDA grid limits.
     let mut frame_offset = 0usize;
     while frame_offset < num_frames {
         let chunk_frames = (num_frames - frame_offset).min(MAX_FRAMES_PER_LAUNCH);
 
-        let unpack_config = LaunchConfig {
+        let unpack_config = garboard::LaunchConfig {
             grid_dim: (bins_blocks, chunk_frames as u32, 1),
             block_dim: (threads_per_block, 1, 1),
             shared_mem_bytes: 0,
         };
 
-        // Output offset in elements: frame_offset * num_bins * 2 (for real/imag pairs)
         let output_offset_elements = frame_offset * output_bins * 2;
 
-        let out_arg = GbKernelArg::new_mut(output.data_f32_mut()?);
-        let fft_arg = GbKernelArg::<CufftComplex>::new(&fft_output);
-        unsafe {
-            ctx.stream()
-                .launch_builder(unpack_kernel)
-                .arg(&out_arg)
-                .arg(&fft_arg)
-                .arg(&(chunk_frames as i32))
-                .arg(&(output_bins as i32))
-                .arg(&(frame_offset as i32))
-                .arg(&(output_offset_elements as i32))
-                .launch(unpack_config)
-                .map_err(|e| {
-                    CudaError::Kernel(format!(
-                        "unpack_complex launch failed (chunk at offset {}): {}",
-                        frame_offset, e
-                    ))
-                })?;
-        }
+        unpack_kernel
+            .launch(
+                ctx.garboard_stream(),
+                &unpack_config,
+                (
+                    output.data_f32_mut()?,
+                    &fft_output,
+                    chunk_frames as i32,
+                    output_bins as i32,
+                    frame_offset as i32,
+                    output_offset_elements as i32,
+                ),
+            )
+            .map_err(|e| {
+                CudaError::Kernel(format!(
+                    "unpack_complex launch failed (chunk at offset {}): {}",
+                    frame_offset, e
+                ))
+            })?;
 
         frame_offset += chunk_frames;
     }
@@ -574,8 +583,8 @@ mod tests {
         let ctx = IconnxCudaContext::new().expect("Failed to create CUDA context");
         let cache = StftKernelCache::new(&ctx).expect("Failed to compile STFT kernels");
 
-        assert!(cache.get("window_frames_kernel").is_some());
-        assert!(cache.get("unpack_complex_kernel").is_some());
+        assert!(cache.module().function("window_frames_kernel").is_ok());
+        assert!(cache.module().function("unpack_complex_kernel").is_ok());
 
         println!("STFT kernels compiled successfully!");
     }
