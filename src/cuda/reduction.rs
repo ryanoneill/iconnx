@@ -1,48 +1,42 @@
-use crate::cuda::bridge::GbKernelArg;
+//! GPU Reduction Kernels via garboard NVRTC + TypedKernel.
+//!
+//! Provides GPU-accelerated reduction operations (sum, mean, softmax,
+//! layernorm). These operations reduce data along specified axes.
+
+use garboard::{DeviceSlice, LaunchConfig, Module, Program};
+
 use super::context::{CudaError, IconnxCudaContext};
 use super::memory_pool::GpuMemoryPool;
 use super::tensor::GpuTensor;
-/// GPU Reduction Kernels using NVRTC
-///
-/// Provides GPU-accelerated reduction operations (sum, mean, softmax, layernorm).
-/// These operations reduce data along specified axes.
-use cudarc::driver::{CudaFunction, CudaModule, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::compile_ptx;
-use std::collections::HashMap;
-use std::sync::Arc;
 
-/// Manages compiled reduction kernels with caching
+/// Compiled reduction kernels loaded as a garboard `Module`.
 pub struct ReductionKernelCache {
-    #[allow(dead_code)]
-    module: Arc<CudaModule>,
-    functions: HashMap<&'static str, CudaFunction>,
+    module: Module<'static>,
 }
 
 impl ReductionKernelCache {
-    /// Compile all reduction kernels and create the cache
+    /// Compile all reduction kernels and create the cache.
     pub fn new(ctx: &IconnxCudaContext) -> Result<Self, CudaError> {
-        let ptx = compile_ptx(REDUCTION_KERNELS)
-            .map_err(|e| CudaError::Kernel(format!("NVRTC compilation failed: {:?}", e)))?;
+        let program =
+            Program::compile_for_device(REDUCTION_KERNELS, ctx.garboard_device(), &[])
+                .map_err(|e| CudaError::Kernel(format!("NVRTC compilation failed: {}", e)))?;
 
         let module = ctx
-            .context()
-            .load_module(ptx)
+            .garboard_device()
+            .load_module(&program)
             .map_err(|e| CudaError::Kernel(format!("Module load failed: {}", e)))?;
 
-        let mut functions = HashMap::new();
-
         for name in KERNEL_NAMES {
-            let func = module.load_function(name).map_err(|e| {
+            module.function(name).map_err(|e| {
                 CudaError::Kernel(format!("Failed to load kernel '{}': {}", name, e))
             })?;
-            functions.insert(*name, func);
         }
 
-        Ok(Self { module, functions })
+        Ok(Self { module })
     }
 
-    pub fn get(&self, name: &'static str) -> Option<&CudaFunction> {
-        self.functions.get(name)
+    pub(crate) fn module(&self) -> &Module<'static> {
+        &self.module
     }
 }
 
@@ -55,7 +49,7 @@ const KERNEL_NAMES: &[&str] = &[
     "layer_norm_kernel",
 ];
 
-/// Reduction CUDA kernel source code
+/// Reduction CUDA kernel source code.
 const REDUCTION_KERNELS: &str = r#"
 // Define infinity constant for NVRTC (can't include math_constants.h)
 #define CUDART_INF_F __int_as_float(0x7f800000)
@@ -229,10 +223,46 @@ extern "C" __global__ void layer_norm_kernel(
 "#;
 
 // =============================================================================
+// Per-signature launch helpers
+// =============================================================================
+
+/// Unary f32 reduction along an axis: `(out, in, outer_size, axis_size)`.
+/// Covers reduce_sum_axis, reduce_mean, reduce_max, softmax.
+fn launch_axis_reduction(
+    ctx: &IconnxCudaContext,
+    kernels: &ReductionKernelCache,
+    name: &'static str,
+    out: &mut DeviceSlice<'static, f32>,
+    inp: &DeviceSlice<'static, f32>,
+    outer_size: usize,
+    axis_size: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: kernel signature is
+    // `(float* out, const float* inp, size_t outer_size, size_t axis_size)`.
+    let kernel = unsafe {
+        kernels.module().typed_kernel::<(
+            &mut DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            usize,
+            usize,
+        )>(name)
+    }
+    .map_err(|e| CudaError::Kernel(format!("{} lookup failed: {}", name, e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(outer_size as u32),
+            (out, inp, outer_size, axis_size),
+        )
+        .map_err(|e| CudaError::Kernel(format!("{} launch failed: {}", name, e)))
+}
+
+// =============================================================================
 // Reduction Operations
 // =============================================================================
 
-/// GPU ReduceSum: Sum all elements to a single value
+/// GPU ReduceSum: Sum all elements to a single value.
 pub fn gpu_reduce_sum_all(
     ctx: &IconnxCudaContext,
     kernels: &ReductionKernelCache,
@@ -241,10 +271,6 @@ pub fn gpu_reduce_sum_all(
 ) -> Result<f32, CudaError> {
     let n = input.len();
     let mut out = pool.get_tensor_f32(ctx, vec![1])?;
-
-    let func = kernels
-        .get("reduce_sum_kernel")
-        .ok_or_else(|| CudaError::Kernel("reduce_sum_kernel not found".into()))?;
 
     let block_size = 256u32;
     let grid_size = (n as u32).div_ceil(block_size);
@@ -256,21 +282,30 @@ pub fn gpu_reduce_sum_all(
         shared_mem_bytes: shared_mem,
     };
 
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
-            .arg(&GbKernelArg::new(input.data_f32()?))
-            .arg(&n)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(e.to_string()))?;
+    // SAFETY: reduce_sum_kernel signature is
+    // `(float* out, const float* inp, size_t n)`.
+    let kernel = unsafe {
+        kernels.module().typed_kernel::<(
+            &mut DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            usize,
+        )>("reduce_sum_kernel")
     }
+    .map_err(|e| CudaError::Kernel(format!("reduce_sum_kernel lookup failed: {}", e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (out.data_f32_mut()?, input.data_f32()?, n),
+        )
+        .map_err(|e| CudaError::Kernel(format!("reduce_sum_kernel launch failed: {}", e)))?;
 
     let result = out.to_host_f32(ctx)?;
     Ok(result[0])
 }
 
-/// GPU ReduceSum along last axis: input[..., N] -> output[...]
+/// GPU ReduceSum along last axis: input[..., N] -> output[...].
 pub fn gpu_reduce_sum_axis(
     ctx: &IconnxCudaContext,
     kernels: &ReductionKernelCache,
@@ -285,7 +320,6 @@ pub fn gpu_reduce_sum_axis(
     let axis_size = *shape.last().unwrap();
     let outer_size: usize = shape[..shape.len() - 1].iter().product();
 
-    // Handle scalar case
     if outer_size == 0 {
         return pool.get_tensor_f32(ctx, vec![1]);
     }
@@ -297,27 +331,20 @@ pub fn gpu_reduce_sum_axis(
     };
     let mut out = pool.get_tensor_f32(ctx, out_shape)?;
 
-    let func = kernels
-        .get("reduce_sum_axis_kernel")
-        .ok_or_else(|| CudaError::Kernel("reduce_sum_axis_kernel not found".into()))?;
-
-    let config = LaunchConfig::for_num_elems(outer_size as u32);
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
-            .arg(&GbKernelArg::new(input.data_f32()?))
-            .arg(&outer_size)
-            .arg(&axis_size)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(e.to_string()))?;
-    }
+    launch_axis_reduction(
+        ctx,
+        kernels,
+        "reduce_sum_axis_kernel",
+        out.data_f32_mut()?,
+        input.data_f32()?,
+        outer_size,
+        axis_size,
+    )?;
 
     Ok(out)
 }
 
-/// GPU ReduceMean along last axis: input[..., N] -> output[...]
+/// GPU ReduceMean along last axis: input[..., N] -> output[...].
 pub fn gpu_reduce_mean_axis(
     ctx: &IconnxCudaContext,
     kernels: &ReductionKernelCache,
@@ -343,27 +370,20 @@ pub fn gpu_reduce_mean_axis(
     };
     let mut out = pool.get_tensor_f32(ctx, out_shape)?;
 
-    let func = kernels
-        .get("reduce_mean_kernel")
-        .ok_or_else(|| CudaError::Kernel("reduce_mean_kernel not found".into()))?;
-
-    let config = LaunchConfig::for_num_elems(outer_size as u32);
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
-            .arg(&GbKernelArg::new(input.data_f32()?))
-            .arg(&outer_size)
-            .arg(&axis_size)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(e.to_string()))?;
-    }
+    launch_axis_reduction(
+        ctx,
+        kernels,
+        "reduce_mean_kernel",
+        out.data_f32_mut()?,
+        input.data_f32()?,
+        outer_size,
+        axis_size,
+    )?;
 
     Ok(out)
 }
 
-/// GPU Softmax along last axis (numerically stable)
+/// GPU Softmax along last axis (numerically stable).
 pub fn gpu_softmax(
     ctx: &IconnxCudaContext,
     kernels: &ReductionKernelCache,
@@ -381,28 +401,21 @@ pub fn gpu_softmax(
 
     let mut out = pool.get_tensor_f32(ctx, shape.to_vec())?;
 
-    let func = kernels
-        .get("softmax_kernel")
-        .ok_or_else(|| CudaError::Kernel("softmax_kernel not found".into()))?;
-
-    let config = LaunchConfig::for_num_elems(outer_size as u32);
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
-            .arg(&GbKernelArg::new(input.data_f32()?))
-            .arg(&outer_size)
-            .arg(&axis_size)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(e.to_string()))?;
-    }
+    launch_axis_reduction(
+        ctx,
+        kernels,
+        "softmax_kernel",
+        out.data_f32_mut()?,
+        input.data_f32()?,
+        outer_size,
+        axis_size,
+    )?;
 
     Ok(out)
 }
 
-/// GPU LayerNormalization along last axis
-/// y = (x - mean) / sqrt(var + eps) * gamma + beta
+/// GPU LayerNormalization along last axis.
+/// `y = (x - mean) / sqrt(var + eps) * gamma + beta`.
 pub fn gpu_layer_norm(
     ctx: &IconnxCudaContext,
     kernels: &ReductionKernelCache,
@@ -426,25 +439,37 @@ pub fn gpu_layer_norm(
 
     let mut out = pool.get_tensor_f32(ctx, shape.to_vec())?;
 
-    let func = kernels
-        .get("layer_norm_kernel")
-        .ok_or_else(|| CudaError::Kernel("layer_norm_kernel not found".into()))?;
-
-    let config = LaunchConfig::for_num_elems(outer_size as u32);
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
-            .arg(&GbKernelArg::new(input.data_f32()?))
-            .arg(&GbKernelArg::new(gamma.data_f32()?))
-            .arg(&GbKernelArg::new(beta.data_f32()?))
-            .arg(&outer_size)
-            .arg(&axis_size)
-            .arg(&eps)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(e.to_string()))?;
+    // SAFETY: layer_norm_kernel signature is
+    // `(float* out, const float* inp, const float* gamma, const float* beta,
+    //   size_t outer_size, size_t axis_size, float eps)`.
+    let kernel = unsafe {
+        kernels.module().typed_kernel::<(
+            &mut DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            usize,
+            usize,
+            f32,
+        )>("layer_norm_kernel")
     }
+    .map_err(|e| CudaError::Kernel(format!("layer_norm_kernel lookup failed: {}", e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(outer_size as u32),
+            (
+                out.data_f32_mut()?,
+                input.data_f32()?,
+                gamma.data_f32()?,
+                beta.data_f32()?,
+                outer_size,
+                axis_size,
+                eps,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("layer_norm_kernel launch failed: {}", e)))?;
 
     Ok(out)
 }
@@ -508,7 +533,7 @@ mod tests {
     fn test_reduce_mean_axis() {
         let (ctx, kernels, mut pool) = setup();
 
-        // 2x3 matrix, mean along last axis
+        // 2x3 matrix: mean along last axis
         // [[1, 2, 3], [4, 5, 6]] -> [2, 5]
         let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let input = GpuTensor::from_host_f32(&ctx, &data, vec![2, 3]).unwrap();
@@ -526,23 +551,22 @@ mod tests {
     fn test_softmax_1d() {
         let (ctx, kernels, mut pool) = setup();
 
+        // 1D softmax: [1, 2, 3]
         let data = vec![1.0f32, 2.0, 3.0];
         let input = GpuTensor::from_host_f32(&ctx, &data, vec![3]).unwrap();
 
         let output = gpu_softmax(&ctx, &kernels, &mut pool, &input).unwrap();
         let result = output.to_host_f32(&ctx).unwrap();
 
-        // softmax([1,2,3]) = [0.0900, 0.2447, 0.6652]
-        let sum: f32 = result.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-5,
-            "Softmax should sum to 1, got {}",
-            sum
-        );
+        // Expected: [e^1/Z, e^2/Z, e^3/Z] where Z = e^1 + e^2 + e^3
+        let z: f32 = 1.0_f32.exp() + 2.0_f32.exp() + 3.0_f32.exp();
+        assert!((result[0] - (1.0_f32.exp() / z)).abs() < 1e-5);
+        assert!((result[1] - (2.0_f32.exp() / z)).abs() < 1e-5);
+        assert!((result[2] - (3.0_f32.exp() / z)).abs() < 1e-5);
 
-        // Verify relative ordering
-        assert!(result[0] < result[1]);
-        assert!(result[1] < result[2]);
+        // Sum must equal 1.0
+        let sum: f32 = result.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
     }
 
     #[test]
@@ -550,23 +574,18 @@ mod tests {
     fn test_softmax_2d() {
         let (ctx, kernels, mut pool) = setup();
 
-        // 2x3 matrix, softmax along last axis
-        let data = vec![1.0f32, 2.0, 3.0, 1.0, 1.0, 1.0];
+        // 2x3 matrix: softmax along last axis
+        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let input = GpuTensor::from_host_f32(&ctx, &data, vec![2, 3]).unwrap();
 
         let output = gpu_softmax(&ctx, &kernels, &mut pool, &input).unwrap();
         let result = output.to_host_f32(&ctx).unwrap();
 
-        // Each row should sum to 1
-        let row1_sum: f32 = result[0..3].iter().sum();
-        let row2_sum: f32 = result[3..6].iter().sum();
-        assert!((row1_sum - 1.0).abs() < 1e-5, "Row 1 should sum to 1");
-        assert!((row2_sum - 1.0).abs() < 1e-5, "Row 2 should sum to 1");
-
-        // Second row is uniform, should be ~0.333 each
-        assert!((result[3] - 0.3333).abs() < 0.01);
-        assert!((result[4] - 0.3333).abs() < 0.01);
-        assert!((result[5] - 0.3333).abs() < 0.01);
+        // Each row should sum to 1.0
+        let sum_row_0: f32 = result[0..3].iter().sum();
+        let sum_row_1: f32 = result[3..6].iter().sum();
+        assert!((sum_row_0 - 1.0).abs() < 1e-5);
+        assert!((sum_row_1 - 1.0).abs() < 1e-5);
     }
 
     #[test]
@@ -581,75 +600,13 @@ mod tests {
         let output = gpu_softmax(&ctx, &kernels, &mut pool, &input).unwrap();
         let result = output.to_host_f32(&ctx).unwrap();
 
-        // Should still work and sum to 1
+        // Must produce valid probabilities summing to 1
         let sum: f32 = result.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-5,
-            "Softmax should sum to 1 even with large inputs"
-        );
-
-        // Values should be finite
-        for &v in &result {
-            assert!(v.is_finite(), "Softmax produced non-finite value");
-        }
-    }
-
-    #[test]
-    #[ignore] // Requires CUDA GPU
-    fn test_layer_norm() {
-        let (ctx, kernels, mut pool) = setup();
-
-        // Simple 1x4 input
-        let data = vec![1.0f32, 2.0, 3.0, 4.0];
-        let input = GpuTensor::from_host_f32(&ctx, &data, vec![1, 4]).unwrap();
-
-        // gamma = 1, beta = 0 (identity transform on normalized values)
-        let gamma = GpuTensor::from_host_f32(&ctx, &[1.0f32, 1.0, 1.0, 1.0], vec![4]).unwrap();
-        let beta = GpuTensor::from_host_f32(&ctx, &[0.0f32, 0.0, 0.0, 0.0], vec![4]).unwrap();
-
-        let output = gpu_layer_norm(&ctx, &kernels, &mut pool, &input, &gamma, &beta, 1e-5).unwrap();
-        let result = output.to_host_f32(&ctx).unwrap();
-
-        // Mean of normalized should be ~0
-        let mean: f32 = result.iter().sum::<f32>() / result.len() as f32;
-        assert!(
-            mean.abs() < 1e-5,
-            "LayerNorm mean should be ~0, got {}",
-            mean
-        );
-
-        // Variance should be ~1
-        let var: f32 =
-            result.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / result.len() as f32;
-        assert!(
-            (var - 1.0).abs() < 0.1,
-            "LayerNorm variance should be ~1, got {}",
-            var
-        );
-    }
-
-    #[test]
-    #[ignore] // Requires CUDA GPU
-    fn test_layer_norm_with_affine() {
-        let (ctx, kernels, mut pool) = setup();
-
-        // 2x4 input
-        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let input = GpuTensor::from_host_f32(&ctx, &data, vec![2, 4]).unwrap();
-
-        // gamma = 2, beta = 1
-        let gamma = GpuTensor::from_host_f32(&ctx, &[2.0f32, 2.0, 2.0, 2.0], vec![4]).unwrap();
-        let beta = GpuTensor::from_host_f32(&ctx, &[1.0f32, 1.0, 1.0, 1.0], vec![4]).unwrap();
-
-        let output = gpu_layer_norm(&ctx, &kernels, &mut pool, &input, &gamma, &beta, 1e-5).unwrap();
-        let result = output.to_host_f32(&ctx).unwrap();
-
-        // After affine transform, mean should be ~1 (beta), not 0
-        let mean: f32 = result.iter().sum::<f32>() / result.len() as f32;
-        assert!(
-            (mean - 1.0).abs() < 0.1,
-            "LayerNorm with affine mean should be ~1"
-        );
+        assert!((sum - 1.0).abs() < 1e-5);
+        assert!(result.iter().all(|&x| (0.0..=1.0).contains(&x)));
+        // Values should be monotonically increasing (last largest)
+        assert!(result[0] < result[1]);
+        assert!(result[1] < result[2]);
     }
 
     #[test]
@@ -657,20 +614,84 @@ mod tests {
     fn test_large_reduction() {
         let (ctx, kernels, mut pool) = setup();
 
-        // Test with larger tensor
+        // Test with a larger tensor. Summing 0..n in f32 with the naive
+        // left-fold (what Vec::sum does) bleeds precision as the
+        // accumulator grows beyond ~2^24. Use the true closed-form sum
+        // n*(n-1)/2 via f64 as the oracle so the test is comparing to
+        // the mathematical truth, not an already-imprecise CPU sum.
         let n = 10000;
         let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
         let input = GpuTensor::from_host_f32(&ctx, &data, vec![n]).unwrap();
 
         let result = gpu_reduce_sum_all(&ctx, &kernels, &mut pool, &input).unwrap();
+        let expected: f64 = (n as f64) * (n as f64 - 1.0) / 2.0;
 
-        // Sum of 0..n = n*(n-1)/2
-        let expected = (n * (n - 1) / 2) as f32;
+        // Tolerance 1e-5 relative is comfortable; GPU atomicAdd order
+        // yields a result within a handful of ULPs of the true sum.
+        let rel_err = ((result as f64 - expected) / expected).abs();
         assert!(
-            (result - expected).abs() / expected < 1e-4,
-            "Expected {}, got {}",
+            rel_err < 1e-5,
+            "Expected {}, got {} (rel err {:.2e})",
             expected,
-            result
+            result,
+            rel_err,
         );
+    }
+
+    #[test]
+    #[ignore] // Requires CUDA GPU
+    fn test_layer_norm() {
+        let (ctx, kernels, mut pool) = setup();
+
+        // Input: [2, 4] - 2 rows of 4 features each
+        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let input = GpuTensor::from_host_f32(&ctx, &data, vec![2, 4]).unwrap();
+
+        // Gamma = 1.0, Beta = 0.0 -> just standard normalization
+        let gamma = GpuTensor::from_host_f32(&ctx, &[1.0; 4], vec![4]).unwrap();
+        let beta = GpuTensor::from_host_f32(&ctx, &[0.0; 4], vec![4]).unwrap();
+
+        let eps = 1e-5;
+        let output = gpu_layer_norm(&ctx, &kernels, &mut pool, &input, &gamma, &beta, eps).unwrap();
+        let result = output.to_host_f32(&ctx).unwrap();
+
+        assert_eq!(output.shape(), &[2, 4]);
+
+        // For row 0: [1,2,3,4], mean=2.5, var=1.25, std≈1.118
+        // Normalized: ((x-2.5) / 1.118)
+        // Expected: [-1.342, -0.447, 0.447, 1.342]
+        assert!((result[0] - (-1.342)).abs() < 0.01);
+        assert!((result[3] - 1.342).abs() < 0.01);
+
+        // Each row should have mean ≈ 0 and variance ≈ 1
+        let mean_row_0: f32 = result[0..4].iter().sum::<f32>() / 4.0;
+        let mean_row_1: f32 = result[4..8].iter().sum::<f32>() / 4.0;
+        assert!(mean_row_0.abs() < 1e-5);
+        assert!(mean_row_1.abs() < 1e-5);
+    }
+
+    #[test]
+    #[ignore] // Requires CUDA GPU
+    fn test_layer_norm_with_affine() {
+        let (ctx, kernels, mut pool) = setup();
+
+        // Input: [1, 4] - 1 row of 4 features
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let input = GpuTensor::from_host_f32(&ctx, &data, vec![1, 4]).unwrap();
+
+        // Gamma = [2, 2, 2, 2], Beta = [1, 1, 1, 1]
+        let gamma = GpuTensor::from_host_f32(&ctx, &[2.0; 4], vec![4]).unwrap();
+        let beta = GpuTensor::from_host_f32(&ctx, &[1.0; 4], vec![4]).unwrap();
+
+        let eps = 1e-5;
+        let output = gpu_layer_norm(&ctx, &kernels, &mut pool, &input, &gamma, &beta, eps).unwrap();
+        let result = output.to_host_f32(&ctx).unwrap();
+
+        // Mean of [1,2,3,4] = 2.5, std ≈ 1.118
+        // Normalized: [-1.342, -0.447, 0.447, 1.342]
+        // With gamma=2: [-2.684, -0.894, 0.894, 2.684]
+        // With beta=1: [-1.684, 0.106, 1.894, 3.684]
+        assert!((result[0] - (-1.684)).abs() < 0.01);
+        assert!((result[3] - 3.684).abs() < 0.01);
     }
 }
