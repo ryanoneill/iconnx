@@ -97,6 +97,13 @@ fn test_run_first_50_nodes() {
 #[test]
 #[ignore] // Might be slow
 fn test_run_first_100_nodes() {
+    // Skip gracefully when the kokoro model isn't available locally —
+    // same pattern as test_run_full_kokoro. Only a true execution
+    // failure should panic.
+    if !Path::new("kokoro-v1.0.onnx").exists() {
+        println!("⚠️  Kokoro model not found, skipping");
+        return;
+    }
     println!("\n🚀 Testing first 100 Kokoro nodes...");
     match run_kokoro_first_n_nodes(100) {
         Ok(_) => println!("✅ SUCCESS: First 100 nodes executed!"),

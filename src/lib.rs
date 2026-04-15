@@ -19,7 +19,7 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
+//! ```text
 //! use iconnx::{OnnxParser, GpuGraphExecutor, Tensor};
 //!
 //! // Load ONNX model

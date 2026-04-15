@@ -23,7 +23,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```text
 //! let mut timer = GpuEventTimer::new(
 //!     ctx.context().clone(),
 //!     ctx.stream(),

@@ -335,7 +335,7 @@ impl Tensor {
     /// Useful for operations like Concat, Unsqueeze, Reshape that preserve dtype.
     ///
     /// # Example
-    /// ```ignore
+    /// ```text
     /// tensor.map_preserving_dtype(|arr_f32| {
     ///     // Operate on Float32 array
     ///     arr_f32.clone()

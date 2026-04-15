@@ -49,7 +49,7 @@ use garboard::DeviceSlice;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// let out_arg = GbKernelArg::new(output.data_f32_mut()?);
 /// let in_arg = GbKernelArg::new(input.data_f32()?);
 /// unsafe {
