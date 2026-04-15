@@ -487,12 +487,18 @@ mod tests {
             dilation: 1,
         };
 
+        // `gpu_conv_transpose_1d` signature is (input, kernel, ...). ConvTranspose
+        // of input [1, 2, 3] with all-ones kernel [1, 1, 1] (stride 1):
+        //   pos 0 (1): writes [1, 1, 1, _, _]
+        //   pos 1 (2): writes [_, 2, 2, 2, _]
+        //   pos 2 (3): writes [_, _, 3, 3, 3]
+        //   sum:              [1, 3, 6, 5, 3]
         let output = gpu_conv_transpose_1d(
             &ctx,
             &cache,
             &mut pool,
-            &kernel_tensor,
             &input_tensor,
+            &kernel_tensor,
             None,
             &params,
             0,
@@ -528,12 +534,19 @@ mod tests {
             dilation: 1,
         };
 
+        // ConvTranspose of input [1, 2, 3] with kernel [1, 1, 1] at stride 2.
+        // Step positions 0, 2, 4 (stride-spaced); output length =
+        // (3-1)*2 + 3 = 7.
+        //   pos 0 (1): writes [1, 1, 1, _, _, _, _]
+        //   pos 2 (2): writes [_, _, 2, 2, 2, _, _]
+        //   pos 4 (3): writes [_, _, _, _, 3, 3, 3]
+        //   sum:              [1, 1, 3, 2, 5, 3, 3]
         let output = gpu_conv_transpose_1d(
             &ctx,
             &cache,
             &mut pool,
-            &kernel_tensor,
             &input_tensor,
+            &kernel_tensor,
             None,
             &params,
             0,
@@ -571,12 +584,19 @@ mod tests {
             pad_w: 0,
         };
 
+        // `gpu_conv_transpose_2d` signature is (input, kernel, ...). Input
+        // [[1, 2], [3, 4]] with all-ones 2x2 kernel at stride 1:
+        //   (0,0)→1: places [[1,1],[1,1]] at rows 0..2, cols 0..2
+        //   (0,1)→2: places [[2,2],[2,2]] at rows 0..2, cols 1..3
+        //   (1,0)→3: places [[3,3],[3,3]] at rows 1..3, cols 0..2
+        //   (1,1)→4: places [[4,4],[4,4]] at rows 1..3, cols 1..3
+        //   sum: [[1, 3, 2], [4, 10, 6], [3, 7, 4]]
         let output = gpu_conv_transpose_2d(
             &ctx,
             &cache,
             &mut pool,
-            &kernel_tensor,
             &input_tensor,
+            &kernel_tensor,
             None,
             &params,
             0,
@@ -616,12 +636,17 @@ mod tests {
             dilation: 1,
         };
 
+        // Input [1, 2, 3] (1 in-channel) with kernel [[1,1,1],[1,1,1]]
+        // (1 in-channel × 2 out-channels × kernel 3) at stride 1:
+        //   per-out-channel base: ConvTranspose of [1,2,3] with [1,1,1] = [1, 3, 6, 5, 3]
+        //   out_ch 0 += bias 10 → [11, 13, 16, 15, 13]
+        //   out_ch 1 += bias 20 → [21, 23, 26, 25, 23]
         let output = gpu_conv_transpose_1d(
             &ctx,
             &cache,
             &mut pool,
-            &kernel_tensor,
             &input_tensor,
+            &kernel_tensor,
             Some(&bias_tensor),
             &params,
             0,
