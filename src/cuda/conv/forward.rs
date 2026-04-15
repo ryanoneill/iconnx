@@ -1,13 +1,14 @@
 //! Forward convolution operations (im2col + GEMM)
 
-use crate::cuda::bridge::GbKernelArg;
 use super::cache::ConvKernelCache;
 use super::params::{Conv1dParams, Conv2dParams};
+use crate::cuda::bridge::GbKernelArg;
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::matmul::gpu_gemm;
 use crate::cuda::memory_pool::GpuMemoryPool;
 use crate::cuda::tensor::GpuTensor;
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+use garboard::{DeviceSlice, LaunchConfig};
 
 /// GPU im2col transformation for 2D convolution
 ///
@@ -37,15 +38,16 @@ pub fn gpu_im2col(
     // Allocate output
     let mut output = pool.get_tensor_f32(ctx, vec![col_height, col_width])?;
 
-    let kernel = cache
-        .get("im2col_kernel")
+    // 14 parameters — exceeds garboard's `KernelArgs` 12-tuple cap, so
+    // this launch uses cudarc via the GbKernelArg bridge. Will migrate
+    // to `module.typed_kernel` once garboard's tuple impls go up.
+    let func = cache
+        .cudarc_function("im2col_kernel")
         .ok_or_else(|| CudaError::Kernel("im2col_kernel not found".to_string()))?;
-
-    let config = LaunchConfig::for_num_elems(col_width as u32);
 
     unsafe {
         ctx.stream()
-            .launch_builder(kernel)
+            .launch_builder(func)
             .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
             .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&batch_size)
@@ -60,7 +62,7 @@ pub fn gpu_im2col(
             .arg(&params.pad_w)
             .arg(&out_h)
             .arg(&out_w)
-            .launch(config)
+            .launch(CudarcLaunchConfig::for_num_elems(col_width as u32))
             .map_err(|e| CudaError::Kernel(format!("im2col launch failed: {}", e)))?;
     }
 
@@ -93,28 +95,37 @@ pub fn gpu_im2col_1d(
 
     let mut output = pool.get_tensor_f32(ctx, vec![col_height, col_width])?;
 
-    let kernel = cache
-        .get("im2col_1d_kernel")
-        .ok_or_else(|| CudaError::Kernel("im2col_1d_kernel not found".to_string()))?;
-
-    let config = LaunchConfig::for_num_elems(col_width as u32);
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(kernel)
-            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-            .arg(&GbKernelArg::new(input.data_f32()?))
-            .arg(&batch_size)
-            .arg(&channels)
-            .arg(&length)
-            .arg(&params.kernel_size)
-            .arg(&params.stride)
-            .arg(&params.padding)
-            .arg(&params.dilation)
-            .arg(&out_length)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(format!("im2col_1d launch failed: {}", e)))?;
+    // SAFETY: im2col_1d_kernel signature is
+    // `(float* out, const float* inp, size_t N, size_t C, size_t L,
+    //   size_t K, size_t stride, size_t pad, size_t dilation, size_t out_L)`.
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            usize, usize, usize,
+            usize, usize, usize, usize, usize,
+        )>("im2col_1d_kernel")
     }
+    .map_err(|e| CudaError::Kernel(format!("im2col_1d_kernel lookup failed: {}", e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(col_width as u32),
+            (
+                output.data_f32_mut()?,
+                input.data_f32()?,
+                batch_size,
+                channels,
+                length,
+                params.kernel_size,
+                params.stride,
+                params.padding,
+                params.dilation,
+                out_length,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("im2col_1d launch failed: {}", e)))?;
 
     Ok(output)
 }
@@ -289,24 +300,32 @@ pub fn add_bias(
     out_channels: usize,
     spatial_size: usize,
 ) -> Result<(), CudaError> {
-    let bias_kernel = cache
-        .get("add_bias_kernel")
-        .ok_or_else(|| CudaError::Kernel("add_bias_kernel not found".to_string()))?;
-
     let total_elements = batch_size * out_channels * spatial_size;
-    let config = LaunchConfig::for_num_elems(total_elements as u32);
 
-    unsafe {
-        ctx.stream()
-            .launch_builder(bias_kernel)
-            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-            .arg(&GbKernelArg::new(bias.data_f32()?))
-            .arg(&batch_size)
-            .arg(&out_channels)
-            .arg(&spatial_size)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(format!("add_bias launch failed: {}", e)))?;
+    // SAFETY: add_bias_kernel signature is
+    // `(float* output, const float* bias, size_t batch, size_t C, size_t spatial)`.
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            usize, usize, usize,
+        )>("add_bias_kernel")
     }
+    .map_err(|e| CudaError::Kernel(format!("add_bias_kernel lookup failed: {}", e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(total_elements as u32),
+            (
+                output.data_f32_mut()?,
+                bias.data_f32()?,
+                batch_size,
+                out_channels,
+                spatial_size,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("add_bias launch failed: {}", e)))?;
 
     Ok(())
 }
