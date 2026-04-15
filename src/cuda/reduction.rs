@@ -1,3 +1,4 @@
+use crate::cuda::bridge::GbKernelArg;
 use super::context::{CudaError, IconnxCudaContext};
 use super::memory_pool::GpuMemoryPool;
 use super::tensor::GpuTensor;
@@ -258,8 +259,8 @@ pub fn gpu_reduce_sum_all(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(config)
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -305,8 +306,8 @@ pub fn gpu_reduce_sum_axis(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&outer_size)
             .arg(&axis_size)
             .launch(config)
@@ -351,8 +352,8 @@ pub fn gpu_reduce_mean_axis(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&outer_size)
             .arg(&axis_size)
             .launch(config)
@@ -389,8 +390,8 @@ pub fn gpu_softmax(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&outer_size)
             .arg(&axis_size)
             .launch(config)
@@ -434,10 +435,10 @@ pub fn gpu_layer_norm(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
-            .arg(gamma.data_f32()?)
-            .arg(beta.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
+            .arg(&GbKernelArg::new(gamma.data_f32()?))
+            .arg(&GbKernelArg::new(beta.data_f32()?))
             .arg(&outer_size)
             .arg(&axis_size)
             .arg(&eps)

@@ -8,9 +8,11 @@
 //! All validation is performed on-device to minimize data transfers.
 //! This module is compile-gated behind the `debug-inference` feature.
 
+use super::bridge::GbKernelArg;
 use super::context::{CudaError, IconnxCudaContext};
 use super::tensor::GpuTensor;
-use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
+use garboard::DeviceSlice;
 use std::sync::Arc;
 
 /// Validation mode flags
@@ -337,7 +339,7 @@ impl ValidationKernelCache {
     /// Returns (nan_count, inf_count, min, max, mean)
     pub fn validate_f32(
         &self,
-        data: &CudaSlice<f32>,
+        data: &DeviceSlice<'static, f32>,
         len: usize,
         ctx: &IconnxCudaContext,
     ) -> Result<(usize, usize, f32, f32, f32), CudaError> {
@@ -354,7 +356,7 @@ impl ValidationKernelCache {
 
         // Calculate grid dimensions
         let block_size = 256usize;
-        let grid_size = ((len + block_size - 1) / block_size).min(1024);
+        let grid_size = len.div_ceil(block_size).min(1024);
 
         // Launch kernel using stream.launch_builder pattern
         let cfg = LaunchConfig {
@@ -368,13 +370,13 @@ impl ValidationKernelCache {
         unsafe {
             ctx.stream()
                 .launch_builder(&self.validate_f32)
-                .arg(data)
+                .arg(&GbKernelArg::new(data))
                 .arg(&len_u32)
-                .arg(&mut nan_count)
-                .arg(&mut inf_count)
-                .arg(&mut min_val)
-                .arg(&mut max_val)
-                .arg(&mut sum)
+                .arg(&GbKernelArg::new_mut(&mut nan_count))
+                .arg(&GbKernelArg::new_mut(&mut inf_count))
+                .arg(&GbKernelArg::new_mut(&mut min_val))
+                .arg(&GbKernelArg::new_mut(&mut max_val))
+                .arg(&GbKernelArg::new_mut(&mut sum))
                 .launch(cfg)
                 .map_err(|e| CudaError::Kernel(format!("Validation kernel launch failed: {}", e)))?;
         }

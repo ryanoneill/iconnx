@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)] // cuBLAS GEMM requires many parameters
 #![allow(clippy::needless_range_loop)] // Explicit indexing is clearer for matrix operations
 
+use super::bridge::CudarcView;
 use super::context::{CudaError, IconnxCudaContext};
 use super::memory_pool::GpuMemoryPool;
 use super::tensor::GpuTensor;
@@ -68,13 +69,22 @@ pub fn gpu_matmul(
         ldc: n as i32, // leading dim of output
     };
 
-    // Safety: gemm is unsafe because it operates on raw device pointers
-    // We ensure the shapes and leading dimensions are correct above
+    // Safety: gemm is unsafe because it operates on raw device pointers.
+    // We ensure the shapes and leading dimensions are correct above. The
+    // `CudarcView`s wrap garboard slices as temporary cudarc views for the
+    // call; their Drop leaks the cudarc handle so garboard retains
+    // ownership of the underlying allocation.
+    let b_view = unsafe { CudarcView::borrow(ctx.stream(), b.data_f32()?) };
+    let a_view = unsafe { CudarcView::borrow(ctx.stream(), a.data_f32()?) };
+    let mut c_view = unsafe { CudarcView::borrow_mut(ctx.stream(), c.data_f32_mut()?) };
     unsafe {
         ctx.cublas()
-            .gemm(config, b.data_f32()?, a.data_f32()?, c.data_f32_mut()?)
+            .gemm(config, b_view.as_slice(), a_view.as_slice(), c_view.as_mut_slice())
             .map_err(|e| CudaError::Cublas(e.to_string()))?;
     }
+    drop(c_view);
+    drop(a_view);
+    drop(b_view);
 
     Ok(c)
 }
@@ -199,11 +209,23 @@ pub fn gpu_gemm(
         ldc,
     };
 
+    let b_view = unsafe { CudarcView::borrow(ctx.stream(), b.data_f32()?) };
+    let a_view = unsafe { CudarcView::borrow(ctx.stream(), a.data_f32()?) };
+    let mut out_view =
+        unsafe { CudarcView::borrow_mut(ctx.stream(), output.data_f32_mut()?) };
     unsafe {
         ctx.cublas()
-            .gemm(config, b.data_f32()?, a.data_f32()?, output.data_f32_mut()?)
+            .gemm(
+                config,
+                b_view.as_slice(),
+                a_view.as_slice(),
+                out_view.as_mut_slice(),
+            )
             .map_err(|e| CudaError::Cublas(e.to_string()))?;
     }
+    drop(out_view);
+    drop(a_view);
+    drop(b_view);
 
     Ok(output)
 }
@@ -268,13 +290,26 @@ pub fn gpu_matmul_2d_3d(
         stride_c,
     };
 
-    // Safety: gemm_strided_batched is unsafe because it operates on raw device pointers
-    // We ensure shapes, strides, and leading dimensions are correct above
+    // Safety: gemm_strided_batched is unsafe because it operates on raw
+    // device pointers. We ensure shapes, strides, and leading dimensions
+    // are correct above. The `CudarcView`s wrap garboard slices as
+    // temporary cudarc views for the call.
+    let b_view = unsafe { CudarcView::borrow(ctx.stream(), b.data_f32()?) };
+    let a_view = unsafe { CudarcView::borrow(ctx.stream(), a.data_f32()?) };
+    let mut c_view = unsafe { CudarcView::borrow_mut(ctx.stream(), c.data_f32_mut()?) };
     unsafe {
         ctx.cublas()
-            .gemm_strided_batched(config, b.data_f32()?, a.data_f32()?, c.data_f32_mut()?)
+            .gemm_strided_batched(
+                config,
+                b_view.as_slice(),
+                a_view.as_slice(),
+                c_view.as_mut_slice(),
+            )
             .map_err(|e| CudaError::Cublas(e.to_string()))?;
     }
+    drop(c_view);
+    drop(a_view);
+    drop(b_view);
 
     Ok(c)
 }
@@ -358,13 +393,26 @@ pub fn gpu_batched_matmul(
         stride_c,
     };
 
-    // Safety: gemm_strided_batched is unsafe because it operates on raw device pointers
-    // We ensure shapes, strides, and leading dimensions are correct above
+    // Safety: gemm_strided_batched is unsafe because it operates on raw
+    // device pointers. We ensure shapes, strides, and leading dimensions
+    // are correct above. The `CudarcView`s wrap garboard slices as
+    // temporary cudarc views for the call.
+    let b_view = unsafe { CudarcView::borrow(ctx.stream(), b.data_f32()?) };
+    let a_view = unsafe { CudarcView::borrow(ctx.stream(), a.data_f32()?) };
+    let mut c_view = unsafe { CudarcView::borrow_mut(ctx.stream(), c.data_f32_mut()?) };
     unsafe {
         ctx.cublas()
-            .gemm_strided_batched(config, b.data_f32()?, a.data_f32()?, c.data_f32_mut()?)
+            .gemm_strided_batched(
+                config,
+                b_view.as_slice(),
+                a_view.as_slice(),
+                c_view.as_mut_slice(),
+            )
             .map_err(|e| CudaError::Cublas(e.to_string()))?;
     }
+    drop(c_view);
+    drop(a_view);
+    drop(b_view);
 
     Ok(c)
 }

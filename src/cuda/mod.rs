@@ -1,10 +1,16 @@
-/// CUDA GPU acceleration module for Iconnx
+/// CUDA GPU acceleration module for Iconnx.
 ///
-/// Provides GPU-accelerated inference using cudarc for CUDA bindings.
+/// Provides GPU-accelerated inference on top of garboard (memory and
+/// device management) with cudarc (kernel launches, cuBLAS, cuDNN)
+/// migrating over per the Phase 1 plan.
+///
 /// Key components:
-/// - IconnxCudaContext: Device management and memory allocation
-/// - GpuTensor: GPU tensor storage (CudaSlice wrapper)
+/// - `IconnxCudaContext` — Device management and memory allocation
+/// - `GpuTensor` — GPU tensor storage (wraps garboard `DeviceSlice`)
+/// - `bridge::CudarcView` — RAII adapter from garboard slices to cudarc
+///   slices for the duration of the migration
 /// - Operators: GPU-accelerated operator implementations
+pub(crate) mod bridge;
 mod context;
 mod conv;
 pub mod cudnn;

@@ -16,6 +16,7 @@ use cudarc::nvrtc::compile_ptx;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::bridge::GbKernelArg;
 use super::context::{CudaError, IconnxCudaContext};
 use super::tensor::GpuTensor;
 
@@ -158,7 +159,7 @@ pub type CufftHandle = c_int;
 
 /// Complex number for cuFFT (single precision)
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CufftComplex {
     pub x: f32, // real
     pub y: f32, // imaginary
@@ -355,8 +356,6 @@ pub fn gpu_stft(
     hop_size: usize,
     onesided: bool,
 ) -> Result<GpuTensor, CudaError> {
-    use cudarc::driver::DevicePtrMut;
-
     let signal_shape = signal.shape();
 
     // Currently only support 1D signal
@@ -414,12 +413,15 @@ pub fn gpu_stft(
         // Get pointer to the start of this chunk in the output
         let chunk_offset_elements = frame_offset * fft_size;
 
+        let out_arg = GbKernelArg::new_mut(windowed_frames.data_f32_mut()?);
+        let signal_arg = GbKernelArg::new(signal.data_f32()?);
+        let window_arg = GbKernelArg::new(window.data_f32()?);
         unsafe {
             ctx.stream()
                 .launch_builder(window_kernel)
-                .arg(windowed_frames.data_f32_mut()?)
-                .arg(signal.data_f32()?)
-                .arg(window.data_f32()?)
+                .arg(&out_arg)
+                .arg(&signal_arg)
+                .arg(&window_arg)
                 .arg(&(signal_length as i32))
                 .arg(&(fft_size as i32))
                 .arg(&(hop_size as i32))
@@ -444,12 +446,15 @@ pub fn gpu_stft(
     // Allocate output buffer for complex FFT results
     // R2C produces num_frames * (fft_size/2+1) complex values
     let complex_output_size = num_frames * (fft_size / 2 + 1);
-    let mut fft_output = ctx.alloc_zeros::<CufftComplex>(complex_output_size)?;
+    let fft_output = ctx.alloc_zeros::<CufftComplex>(complex_output_size)?;
 
     unsafe {
-        let (input_ptr, _input_guard) =
-            windowed_frames.data_f32_mut()?.device_ptr_mut(ctx.stream());
-        let (output_ptr, _output_guard) = fft_output.device_ptr_mut(ctx.stream());
+        // Raw-pointer FFI: garboard's `as_raw_device_ptr` returns the
+        // underlying CUdeviceptr. cuFFT's `exec_r2c` runs synchronously
+        // with respect to the default stream (implicit via the context),
+        // so no separate stream-sync guard is required here.
+        let input_ptr = windowed_frames.data_f32_mut()?.as_raw_device_ptr();
+        let output_ptr = fft_output.as_raw_device_ptr();
         plan.exec_r2c(input_ptr as *mut f32, output_ptr as *mut CufftComplex)?;
     }
 
@@ -476,11 +481,13 @@ pub fn gpu_stft(
         // Output offset in elements: frame_offset * num_bins * 2 (for real/imag pairs)
         let output_offset_elements = frame_offset * output_bins * 2;
 
+        let out_arg = GbKernelArg::new_mut(output.data_f32_mut()?);
+        let fft_arg = GbKernelArg::<CufftComplex>::new(&fft_output);
         unsafe {
             ctx.stream()
                 .launch_builder(unpack_kernel)
-                .arg(output.data_f32_mut()?)
-                .arg(&fft_output)
+                .arg(&out_arg)
+                .arg(&fft_arg)
                 .arg(&(chunk_frames as i32))
                 .arg(&(output_bins as i32))
                 .arg(&(frame_offset as i32))
@@ -503,7 +510,6 @@ pub fn gpu_stft(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cudarc::driver::DevicePtrMut;
 
     #[test]
     #[ignore = "requires CUDA GPU with cuFFT"]
@@ -528,28 +534,26 @@ mod tests {
 
         // Create input: simple impulse at position 0
         let input_data = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let mut input_gpu = ctx.htod(&input_data).expect("Failed to upload input");
+        let input_gpu = ctx.htod(&input_data).expect("Failed to upload input");
 
         // Allocate output (R2C produces N/2+1 complex values)
         let output_size = fft_size / 2 + 1;
-        let mut output_gpu = ctx
+        let output_gpu = ctx
             .alloc_zeros::<CufftComplex>(output_size)
             .expect("Failed to allocate output");
 
-        // Execute FFT
-        // SAFETY: device_ptr_mut requires passing the stream and returns a SyncOnDrop guard
-        // that ensures synchronization when dropped. We hold the guards until after exec_r2c.
+        // Execute FFT. Raw-pointer FFI to cuFFT; the default stream
+        // synchronization is implicit here.
         unsafe {
-            let (input_ptr, _input_guard) = input_gpu.device_ptr_mut(ctx.stream());
-            let (output_ptr, _output_guard) = output_gpu.device_ptr_mut(ctx.stream());
+            let input_ptr = input_gpu.as_raw_device_ptr();
+            let output_ptr = output_gpu.as_raw_device_ptr();
             plan.exec_r2c(input_ptr as *mut f32, output_ptr as *mut CufftComplex)
                 .expect("FFT execution failed");
         }
 
-        // Copy back results
+        // Copy back results via garboard's device-to-host.
         let result: Vec<CufftComplex> = ctx
-            .stream()
-            .memcpy_dtov(&output_gpu)
+            .dtoh(&output_gpu)
             .expect("Failed to download result");
 
         // For an impulse at position 0, FFT should give all 1s (DC + positive freqs)

@@ -13,7 +13,8 @@ mod sys;
 pub mod rnn;
 pub use rnn::*;
 
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::CudaStream;
+use garboard::DeviceSlice;
 use std::collections::HashMap;
 use std::os::raw::c_int;
 use std::ptr;
@@ -358,7 +359,7 @@ impl Drop for ConvolutionDescriptor {
 
 /// Workspace buffer for cuDNN operations
 pub struct Workspace {
-    buffer: Option<CudaSlice<u8>>,
+    buffer: Option<DeviceSlice<'static, u8>>,
     size: usize,
 }
 
@@ -375,7 +376,6 @@ impl Workspace {
     pub fn ensure_size(&mut self, ctx: &IconnxCudaContext, size: usize) -> Result<(), CudaError> {
         if size > self.size {
             let buffer = ctx
-                .stream()
                 .alloc_zeros::<u8>(size)
                 .map_err(|e| CudaError::Memory(format!("Workspace alloc failed: {}", e)))?;
             self.buffer = Some(buffer);
@@ -384,13 +384,12 @@ impl Workspace {
         Ok(())
     }
 
-    /// Get raw pointer (null if empty)
-    pub fn ptr(&mut self, stream: &CudaStream) -> *mut std::ffi::c_void {
-        match &mut self.buffer {
-            Some(buf) => {
-                let (ptr, _guard) = buf.device_ptr_mut(stream);
-                ptr as *mut std::ffi::c_void
-            }
+    /// Get raw pointer (null if empty). Post-garboard migration this does
+    /// not need a stream argument — garboard's `as_raw_device_ptr` returns
+    /// the plain `CUdeviceptr` without cudarc's per-slice sync tracking.
+    pub fn ptr(&self) -> *mut std::ffi::c_void {
+        match &self.buffer {
+            Some(buf) => buf.as_raw_device_ptr() as *mut std::ffi::c_void,
             None => ptr::null_mut(),
         }
     }
@@ -684,14 +683,15 @@ pub fn cudnn_conv_transpose_1d(
     // Allocate output
     let mut output = GpuTensor::zeros_f32(ctx, vec![batch, out_channels, out_length])?;
 
-    // Perform convolution backward data (transposed convolution)
-    // Use a block to ensure guards are dropped before returning output
+    // Perform convolution backward data (transposed convolution).
+    // Post-garboard: device pointers come straight from garboard slices
+    // (plain `CUdeviceptr`); lifetime of the underlying allocations is
+    // the function's scope, which covers the synchronous cuDNN call.
     {
-        let stream = ctx.stream();
-        let (kernel_ptr, _kernel_guard) = kernel.data_f32()?.device_ptr(stream);
-        let (input_ptr, _input_guard) = input.data_f32()?.device_ptr(stream);
-        let (output_ptr, _output_guard) = output.data_f32_mut()?.device_ptr_mut(stream);
-        let workspace_ptr = workspace.ptr(stream);
+        let kernel_ptr = kernel.data_f32()?.as_raw_device_ptr();
+        let input_ptr = input.data_f32()?.as_raw_device_ptr();
+        let output_ptr = output.data_f32_mut()?.as_raw_device_ptr();
+        let workspace_ptr = workspace.ptr();
 
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
@@ -841,14 +841,13 @@ pub fn cudnn_conv_1d(
     // Allocate output
     let mut output = GpuTensor::zeros_f32(ctx, vec![batch, out_channels, out_length])?;
 
-    // Perform convolution forward
-    // Use a block to ensure guards are dropped before returning output
+    // Perform convolution forward. Device pointers come from garboard
+    // slices; the synchronous cuDNN call completes within this scope.
     {
-        let stream = ctx.stream();
-        let (input_ptr, _input_guard) = input.data_f32()?.device_ptr(stream);
-        let (kernel_ptr, _kernel_guard) = kernel.data_f32()?.device_ptr(stream);
-        let (output_ptr, _output_guard) = output.data_f32_mut()?.device_ptr_mut(stream);
-        let workspace_ptr = workspace.ptr(stream);
+        let input_ptr = input.data_f32()?.as_raw_device_ptr();
+        let kernel_ptr = kernel.data_f32()?.as_raw_device_ptr();
+        let output_ptr = output.data_f32_mut()?.as_raw_device_ptr();
+        let workspace_ptr = workspace.ptr();
 
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;

@@ -9,7 +9,7 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use garboard::DeviceSlice;
 
 use super::sys;
 use super::{check_cudnn, CudnnHandle, TensorDescriptor, Workspace};
@@ -24,7 +24,7 @@ use crate::cuda::tensor::GpuTensor;
 /// Always configured with dropout rate 0.0 for inference.
 pub struct DropoutDescriptor {
     desc: sys::cudnnDropoutDescriptor_t,
-    _states: CudaSlice<u8>,
+    _states: DeviceSlice<'static, u8>,
 }
 
 impl DropoutDescriptor {
@@ -42,11 +42,10 @@ impl DropoutDescriptor {
             ))?;
         }
 
-        let mut states = ctx.alloc_zeros::<u8>(state_size.max(1))?;
+        let states = ctx.alloc_zeros::<u8>(state_size.max(1))?;
 
         {
-            let stream = ctx.stream();
-            let (states_ptr, _guard) = states.device_ptr_mut(stream);
+            let states_ptr = states.as_raw_device_ptr();
             unsafe {
                 check_cudnn(sys::cudnnSetDropoutDescriptor(
                     desc,
@@ -218,7 +217,7 @@ unsafe impl Sync for RnnDataDescriptor {}
 /// this invariant is trivially satisfied.
 pub struct PackedLstmWeights {
     /// Packed weight buffer on GPU
-    buffer: CudaSlice<u8>,
+    buffer: DeviceSlice<'static, u8>,
     /// Size in bytes
     size: usize,
     /// RNN descriptor that was used to create this packing
@@ -237,12 +236,16 @@ impl PackedLstmWeights {
         &self.rnn_desc
     }
 
-    /// Get the device pointer and guard for the packed weight buffer
-    pub(crate) fn buffer_device_ptr<'a>(
-        &'a self,
-        stream: &'a CudaStream,
-    ) -> (cudarc::driver::sys::CUdeviceptr, impl Drop + 'a) {
-        self.buffer.device_ptr(stream)
+    /// Get the device pointer for the packed weight buffer.
+    ///
+    /// Post-garboard migration this is a plain `CUdeviceptr` — the
+    /// previous `(ptr, SyncOnDrop)` tuple from cudarc is no longer
+    /// needed since garboard does not do per-slice stream-event
+    /// tracking. The caller must not free or reuse the buffer while a
+    /// cuDNN call is in flight against it; ordering is provided by the
+    /// single-stream execution model.
+    pub(crate) fn buffer_device_ptr(&self) -> cudarc::driver::sys::CUdeviceptr {
+        self.buffer.as_raw_device_ptr()
     }
 }
 
@@ -294,7 +297,7 @@ pub fn pack_lstm_weights_for_cudnn(
     }
 
     // Allocate packed weight buffer (zero-initialized for safety)
-    let mut weight_buffer = ctx.alloc_zeros::<u8>(weight_space_size)?;
+    let weight_buffer = ctx.alloc_zeros::<u8>(weight_space_size)?;
 
     // Create temporary tensor descriptors for cudnnGetRNNWeightParams output
     let m_desc = TensorDescriptor::new()?;
@@ -313,7 +316,7 @@ pub fn pack_lstm_weights_for_cudnn(
             let mut m_addr: *mut c_void = ptr::null_mut();
             let mut b_addr: *mut c_void = ptr::null_mut();
 
-            let (wb_ptr, _wb_guard) = weight_buffer.device_ptr_mut(stream);
+            let wb_ptr = weight_buffer.as_raw_device_ptr();
             unsafe {
                 check_cudnn(sys::cudnnGetRNNWeightParams(
                     handle.raw(),
@@ -329,7 +332,6 @@ pub fn pack_lstm_weights_for_cudnn(
                 ))?;
             }
             // Drop the mutable guard before borrowing source tensors
-            drop(_wb_guard);
 
             // Copy input weight matrix for this gate
             // Source: W[dir, onnx_gate*hidden..(onnx_gate+1)*hidden, 0..input_size]
@@ -338,7 +340,7 @@ pub fn pack_lstm_weights_for_cudnn(
                 + onnx_gate * hidden_size * input_size;
             let w_size_bytes = hidden_size * input_size * std::mem::size_of::<f32>();
 
-            let (w_ptr, _w_guard) = w.data_f32()?.device_ptr(stream);
+            let w_ptr = w.data_f32()?.as_raw_device_ptr();
             let src_ptr = (w_ptr as usize + w_offset_floats * std::mem::size_of::<f32>())
                 as cudarc::driver::sys::CUdeviceptr;
 
@@ -365,7 +367,7 @@ pub fn pack_lstm_weights_for_cudnn(
             let mut m_addr: *mut c_void = ptr::null_mut();
             let mut b_addr: *mut c_void = ptr::null_mut();
 
-            let (wb_ptr, _wb_guard) = weight_buffer.device_ptr_mut(stream);
+            let wb_ptr = weight_buffer.as_raw_device_ptr();
             unsafe {
                 check_cudnn(sys::cudnnGetRNNWeightParams(
                     handle.raw(),
@@ -380,7 +382,6 @@ pub fn pack_lstm_weights_for_cudnn(
                     &mut b_addr,
                 ))?;
             }
-            drop(_wb_guard);
 
             // Copy recurrence weight matrix for this gate
             // Source: R[dir, onnx_gate*hidden..(onnx_gate+1)*hidden, 0..hidden_size]
@@ -388,7 +389,7 @@ pub fn pack_lstm_weights_for_cudnn(
                 + onnx_gate * hidden_size * hidden_size;
             let r_size_bytes = hidden_size * hidden_size * std::mem::size_of::<f32>();
 
-            let (r_ptr, _r_guard) = r.data_f32()?.device_ptr(stream);
+            let r_ptr = r.data_f32()?.as_raw_device_ptr();
             let src_ptr = (r_ptr as usize + r_offset_floats * std::mem::size_of::<f32>())
                 as cudarc::driver::sys::CUdeviceptr;
 
@@ -423,7 +424,7 @@ pub fn pack_lstm_weights_for_cudnn(
                     let mut m_addr: *mut c_void = ptr::null_mut();
                     let mut b_addr: *mut c_void = ptr::null_mut();
 
-                    let (wb_ptr, _wb_guard) = weight_buffer.device_ptr_mut(stream);
+                    let wb_ptr = weight_buffer.as_raw_device_ptr();
                     unsafe {
                         check_cudnn(sys::cudnnGetRNNWeightParams(
                             handle.raw(),
@@ -438,12 +439,11 @@ pub fn pack_lstm_weights_for_cudnn(
                             &mut b_addr,
                         ))?;
                     }
-                    drop(_wb_guard);
-
+        
                     // Wb[gate]: offset = dir * 8*hidden + onnx_gate * hidden
                     let wb_offset_floats = dir * 8 * hidden_size + onnx_gate * hidden_size;
 
-                    let (b_ptr, _b_guard) = b_tensor.data_f32()?.device_ptr(stream);
+                    let b_ptr = b_tensor.data_f32()?.as_raw_device_ptr();
                     let src_ptr = (b_ptr as usize
                         + wb_offset_floats * std::mem::size_of::<f32>())
                         as cudarc::driver::sys::CUdeviceptr;
@@ -471,7 +471,7 @@ pub fn pack_lstm_weights_for_cudnn(
                     let mut m_addr_r: *mut c_void = ptr::null_mut();
                     let mut b_addr_r: *mut c_void = ptr::null_mut();
 
-                    let (wb_ptr, _wb_guard) = weight_buffer.device_ptr_mut(stream);
+                    let wb_ptr = weight_buffer.as_raw_device_ptr();
                     unsafe {
                         check_cudnn(sys::cudnnGetRNNWeightParams(
                             handle.raw(),
@@ -486,13 +486,12 @@ pub fn pack_lstm_weights_for_cudnn(
                             &mut b_addr_r,
                         ))?;
                     }
-                    drop(_wb_guard);
-
+        
                     // Rb[gate]: offset = dir * 8*hidden + (4 + onnx_gate) * hidden
                     let rb_offset_floats =
                         dir * 8 * hidden_size + (4 + onnx_gate) * hidden_size;
 
-                    let (b_ptr, _b_guard) = b_tensor.data_f32()?.device_ptr(stream);
+                    let b_ptr = b_tensor.data_f32()?.as_raw_device_ptr();
                     let src_ptr_r = (b_ptr as usize
                         + rb_offset_floats * std::mem::size_of::<f32>())
                         as cudarc::driver::sys::CUdeviceptr;
@@ -606,34 +605,32 @@ pub fn cudnn_lstm_forward(
 
     // Create seq_lengths array on device (all same length)
     let seq_lengths_host: Vec<i32> = vec![seq_len as i32; batch_size];
-    let seq_lengths_dev: CudaSlice<i32> = ctx
+    let seq_lengths_dev: DeviceSlice<'static, i32> = ctx
         .htod_i32(&seq_lengths_host)
         .map_err(|e| CudaError::Transfer(format!("Failed to copy seq_lengths: {}", e)))?;
 
-    // Execute forward pass in a scoped block so device pointer guards are
-    // dropped before we reshape the output tensor.
+    // Execute forward pass. All device pointers below are plain
+    // `CUdeviceptr` values obtained from garboard slices; lifetime is
+    // bounded by this function's scope (the slices are stack-local or
+    // borrowed from longer-lived tensors).
     {
-        let stream = ctx.stream();
-
-        let (x_ptr, _x_guard) = x.data_f32()?.device_ptr(stream);
-        let (y_ptr, _y_guard) = y.data_f32_mut()?.device_ptr_mut(stream);
-        let (w_ptr, _w_guard) = packed_weights.buffer_device_ptr(stream);
-        let workspace_ptr = workspace.ptr(stream);
-        let (seq_dev_ptr, _seq_guard) = seq_lengths_dev.device_ptr(stream);
+        let x_ptr = x.data_f32()?.as_raw_device_ptr();
+        let y_ptr = y.data_f32_mut()?.as_raw_device_ptr();
+        let w_ptr = packed_weights.buffer_device_ptr();
+        let workspace_ptr = workspace.ptr();
+        let seq_dev_ptr = seq_lengths_dev.as_raw_device_ptr();
 
         // Get h_init and c_init raw pointers (null if not provided)
-        let (hx_ptr, _hx_guard) = if let Some(h) = h_init {
-            let (ptr, guard) = h.data_f32()?.device_ptr(stream);
-            (ptr as *const c_void, Some(guard))
+        let hx_ptr = if let Some(h) = h_init {
+            h.data_f32()?.as_raw_device_ptr() as *const c_void
         } else {
-            (ptr::null(), None)
+            ptr::null()
         };
 
-        let (cx_ptr, _cx_guard) = if let Some(c) = c_init {
-            let (ptr, guard) = c.data_f32()?.device_ptr(stream);
-            (ptr as *const c_void, Some(guard))
+        let cx_ptr = if let Some(c) = c_init {
+            c.data_f32()?.as_raw_device_ptr() as *const c_void
         } else {
-            (ptr::null(), None)
+            ptr::null()
         };
 
         unsafe {

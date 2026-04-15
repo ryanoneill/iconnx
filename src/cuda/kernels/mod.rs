@@ -1,3 +1,4 @@
+use crate::cuda::bridge::GbKernelArg;
 use super::context::{CudaError, IconnxCudaContext};
 use super::memory_pool::GpuMemoryPool;
 use super::tensor::GpuTensor;
@@ -355,9 +356,9 @@ pub fn gpu_add(
             unsafe {
                 ctx.stream()
                     .launch_builder(func)
-                    .arg(out.data_i64_mut()?)
-                    .arg(a.data_i64()?)
-                    .arg(b.data_i64()?)
+                    .arg(&GbKernelArg::new_mut(out.data_i64_mut()?))
+                    .arg(&GbKernelArg::new(a.data_i64()?))
+                    .arg(&GbKernelArg::new(b.data_i64()?))
                     .arg(&n)
                     .launch(elementwise_config(n))
                     .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -373,9 +374,9 @@ pub fn gpu_add(
             unsafe {
                 ctx.stream()
                     .launch_builder(func)
-                    .arg(out.data_f32_mut()?)
-                    .arg(a.data_f32()?)
-                    .arg(b.data_f32()?)
+                    .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+                    .arg(&GbKernelArg::new(a.data_f32()?))
+                    .arg(&GbKernelArg::new(b.data_f32()?))
                     .arg(&n)
                     .launch(elementwise_config(n))
                     .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -409,9 +410,9 @@ fn gpu_add_broadcast_scalar(
             unsafe {
                 ctx.stream()
                     .launch_builder(func)
-                    .arg(out.data_i64_mut()?)
-                    .arg(tensor.data_i64()?)
-                    .arg(scalar.data_i64()?) // Pass GPU pointer directly
+                    .arg(&GbKernelArg::new_mut(out.data_i64_mut()?))
+                    .arg(&GbKernelArg::new(tensor.data_i64()?))
+                    .arg(&GbKernelArg::new(scalar.data_i64()?)) // Pass GPU pointer directly
                     .arg(&n)
                     .launch(elementwise_config(n))
                     .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -430,9 +431,9 @@ fn gpu_add_broadcast_scalar(
             unsafe {
                 ctx.stream()
                     .launch_builder(func)
-                    .arg(out.data_f32_mut()?)
-                    .arg(tensor.data_f32()?)
-                    .arg(scalar.data_f32()?) // Pass GPU pointer directly
+                    .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+                    .arg(&GbKernelArg::new(tensor.data_f32()?))
+                    .arg(&GbKernelArg::new(scalar.data_f32()?)) // Pass GPU pointer directly
                     .arg(&n)
                     .launch(elementwise_config(n))
                     .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -464,9 +465,9 @@ pub fn gpu_sub(
             unsafe {
                 ctx.stream()
                     .launch_builder(func)
-                    .arg(out.data_i64_mut()?)
-                    .arg(a.data_i64()?)
-                    .arg(b.data_i64()?)
+                    .arg(&GbKernelArg::new_mut(out.data_i64_mut()?))
+                    .arg(&GbKernelArg::new(a.data_i64()?))
+                    .arg(&GbKernelArg::new(b.data_i64()?))
                     .arg(&n)
                     .launch(elementwise_config(n))
                     .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -482,9 +483,9 @@ pub fn gpu_sub(
             unsafe {
                 ctx.stream()
                     .launch_builder(func)
-                    .arg(out.data_f32_mut()?)
-                    .arg(a.data_f32()?)
-                    .arg(b.data_f32()?)
+                    .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+                    .arg(&GbKernelArg::new(a.data_f32()?))
+                    .arg(&GbKernelArg::new(b.data_f32()?))
                     .arg(&n)
                     .launch(elementwise_config(n))
                     .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -515,9 +516,9 @@ pub fn gpu_mul(
             unsafe {
                 ctx.stream()
                     .launch_builder(func)
-                    .arg(out.data_i64_mut()?)
-                    .arg(a.data_i64()?)
-                    .arg(b.data_i64()?)
+                    .arg(&GbKernelArg::new_mut(out.data_i64_mut()?))
+                    .arg(&GbKernelArg::new(a.data_i64()?))
+                    .arg(&GbKernelArg::new(b.data_i64()?))
                     .arg(&n)
                     .launch(elementwise_config(n))
                     .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -533,9 +534,9 @@ pub fn gpu_mul(
             unsafe {
                 ctx.stream()
                     .launch_builder(func)
-                    .arg(out.data_f32_mut()?)
-                    .arg(a.data_f32()?)
-                    .arg(b.data_f32()?)
+                    .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+                    .arg(&GbKernelArg::new(a.data_f32()?))
+                    .arg(&GbKernelArg::new(b.data_f32()?))
                     .arg(&n)
                     .launch(elementwise_config(n))
                     .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -564,9 +565,9 @@ pub fn gpu_div(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(a.data_f32()?)
-            .arg(b.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(a.data_f32()?))
+            .arg(&GbKernelArg::new(b.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -596,8 +597,8 @@ pub fn gpu_sigmoid(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -623,8 +624,8 @@ pub fn gpu_tanh(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -650,8 +651,8 @@ pub fn gpu_relu(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -678,8 +679,8 @@ pub fn gpu_leaky_relu(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&alpha)
             .arg(&n)
             .launch(elementwise_config(n))
@@ -710,8 +711,8 @@ pub fn gpu_exp(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -737,8 +738,8 @@ pub fn gpu_log(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -764,8 +765,8 @@ pub fn gpu_sqrt(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -793,9 +794,9 @@ pub fn gpu_pow(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(base.data_f32()?)
-            .arg(exp.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(base.data_f32()?))
+            .arg(&GbKernelArg::new(exp.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -821,8 +822,8 @@ pub fn gpu_sin(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -848,8 +849,8 @@ pub fn gpu_cos(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -875,8 +876,8 @@ pub fn gpu_abs(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -902,8 +903,8 @@ pub fn gpu_neg(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -935,8 +936,8 @@ pub fn gpu_clip(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&min_val)
             .arg(&max_val)
             .arg(&n)
@@ -964,8 +965,8 @@ pub fn gpu_floor(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -991,8 +992,8 @@ pub fn gpu_ceil(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -1018,8 +1019,8 @@ pub fn gpu_round(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(elementwise_config(n))
             .map_err(|e| CudaError::Kernel(e.to_string()))?;
@@ -1050,8 +1051,8 @@ pub fn gpu_add_scalar(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(a.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(a.data_f32()?))
             .arg(&scalar)
             .arg(&n)
             .launch(elementwise_config(n))
@@ -1079,8 +1080,8 @@ pub fn gpu_mul_scalar(
     unsafe {
         ctx.stream()
             .launch_builder(func)
-            .arg(out.data_f32_mut()?)
-            .arg(a.data_f32()?)
+            .arg(&GbKernelArg::new_mut(out.data_f32_mut()?))
+            .arg(&GbKernelArg::new(a.data_f32()?))
             .arg(&scalar)
             .arg(&n)
             .launch(elementwise_config(n))

@@ -1,5 +1,6 @@
 //! Type casting operations for GPU tensors
 
+use crate::cuda::bridge::GbKernelArg;
 use super::cache::OpsKernelCache;
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::tensor::{DType, GpuTensor};
@@ -37,8 +38,8 @@ pub fn gpu_cast(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_i64_mut()?)
-                    .arg(input.data_f32()?)
+                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
+                    .arg(&GbKernelArg::new(input.data_f32()?))
                     .arg(&n)
                     .launch(config)
                     .map_err(|e| {
@@ -58,8 +59,8 @@ pub fn gpu_cast(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_i32_mut()?)
-                    .arg(input.data_f32()?)
+                    .arg(&GbKernelArg::new_mut(output.data_i32_mut()?))
+                    .arg(&GbKernelArg::new(input.data_f32()?))
                     .arg(&n)
                     .launch(config)
                     .map_err(|e| {
@@ -79,8 +80,8 @@ pub fn gpu_cast(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_f32_mut()?)
-                    .arg(input.data_i64()?)
+                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+                    .arg(&GbKernelArg::new(input.data_i64()?))
                     .arg(&n)
                     .launch(config)
                     .map_err(|e| {
@@ -100,8 +101,8 @@ pub fn gpu_cast(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_i32_mut()?)
-                    .arg(input.data_i64()?)
+                    .arg(&GbKernelArg::new_mut(output.data_i32_mut()?))
+                    .arg(&GbKernelArg::new(input.data_i64()?))
                     .arg(&n)
                     .launch(config)
                     .map_err(|e| {
@@ -121,8 +122,8 @@ pub fn gpu_cast(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_f32_mut()?)
-                    .arg(input.data_i32()?)
+                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+                    .arg(&GbKernelArg::new(input.data_i32()?))
                     .arg(&n)
                     .launch(config)
                     .map_err(|e| {
@@ -142,8 +143,8 @@ pub fn gpu_cast(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_i64_mut()?)
-                    .arg(input.data_i32()?)
+                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
+                    .arg(&GbKernelArg::new(input.data_i32()?))
                     .arg(&n)
                     .launch(config)
                     .map_err(|e| {

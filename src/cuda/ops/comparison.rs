@@ -1,5 +1,6 @@
 //! Comparison and logical operations for GPU tensors
 
+use crate::cuda::bridge::GbKernelArg;
 use super::cache::OpsKernelCache;
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::tensor::GpuTensor;
@@ -103,8 +104,8 @@ pub fn gpu_not(
     unsafe {
         ctx.stream()
             .launch_builder(kernel)
-            .arg(output.data_f32_mut()?)
-            .arg(a.data_f32()?)
+            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+            .arg(&GbKernelArg::new(a.data_f32()?))
             .arg(&n)
             .launch(config)
             .map_err(|e| CudaError::Kernel(format!("not launch failed: {}", e)))?;
@@ -146,9 +147,9 @@ fn binary_comparison(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_f32_mut()?)
-                    .arg(a.data_f32()?)
-                    .arg(b.data_f32()?)
+                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+                    .arg(&GbKernelArg::new(a.data_f32()?))
+                    .arg(&GbKernelArg::new(b.data_f32()?))
                     .arg(&n)
                     .launch(config)
                     .map_err(|e| {
@@ -167,9 +168,9 @@ fn binary_comparison(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_f32_mut()?)
-                    .arg(a.data_i64()?)
-                    .arg(b.data_i64()?)
+                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+                    .arg(&GbKernelArg::new(a.data_i64()?))
+                    .arg(&GbKernelArg::new(b.data_i64()?))
                     .arg(&n)
                     .launch(config)
                     .map_err(|e| {
@@ -188,9 +189,9 @@ fn binary_comparison(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_f32_mut()?)
-                    .arg(a.data_i32()?)
-                    .arg(b.data_i32()?)
+                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+                    .arg(&GbKernelArg::new(a.data_i32()?))
+                    .arg(&GbKernelArg::new(b.data_i32()?))
                     .arg(&n)
                     .launch(config)
                     .map_err(|e| {

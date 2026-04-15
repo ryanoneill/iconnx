@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)] // LSTM operations require many parameters
 
+use crate::cuda::bridge::GbKernelArg;
 use super::context::{CudaError, IconnxCudaContext};
 use super::matmul::gpu_gemm;
 use super::memory_pool::GpuMemoryPool;
@@ -311,6 +312,7 @@ pub fn gpu_lstm(
             dir_outputs.push((
                 t,
                 h_new
+                    .clone()
                     .reshape(vec![batch_size, hidden_size])
                     .ok_or_else(|| CudaError::Kernel("Failed to reshape h".into()))?,
             ));
@@ -345,7 +347,8 @@ pub fn gpu_lstm(
         let reshaped: Vec<GpuTensor> = dir_outputs
             .iter()
             .map(|t| {
-                t.reshape(vec![1, batch_size, hidden_size])
+                (*t).clone()
+                    .reshape(vec![1, batch_size, hidden_size])
                     .ok_or_else(|| CudaError::Kernel("Failed to reshape output".into()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -405,12 +408,12 @@ fn lstm_step(
     unsafe {
         ctx.stream()
             .launch_builder(fused_kernel)
-            .arg(h_new.data_f32_mut()?)
-            .arg(c_new.data_f32_mut()?)
-            .arg(gates_xw.data_f32()?)
-            .arg(gates_hr.data_f32()?)
-            .arg(b.data_f32()?)
-            .arg(c.data_f32()?)
+            .arg(&GbKernelArg::new_mut(h_new.data_f32_mut()?))
+            .arg(&GbKernelArg::new_mut(c_new.data_f32_mut()?))
+            .arg(&GbKernelArg::new(gates_xw.data_f32()?))
+            .arg(&GbKernelArg::new(gates_hr.data_f32()?))
+            .arg(&GbKernelArg::new(b.data_f32()?))
+            .arg(&GbKernelArg::new(c.data_f32()?))
             .arg(&batch_size)
             .arg(&hidden_size)
             .launch(config)

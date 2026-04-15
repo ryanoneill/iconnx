@@ -1,5 +1,6 @@
 //! Forward convolution operations (im2col + GEMM)
 
+use crate::cuda::bridge::GbKernelArg;
 use super::cache::ConvKernelCache;
 use super::params::{Conv1dParams, Conv2dParams};
 use crate::cuda::context::{CudaError, IconnxCudaContext};
@@ -45,8 +46,8 @@ pub fn gpu_im2col(
     unsafe {
         ctx.stream()
             .launch_builder(kernel)
-            .arg(output.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&batch_size)
             .arg(&channels)
             .arg(&height)
@@ -101,8 +102,8 @@ pub fn gpu_im2col_1d(
     unsafe {
         ctx.stream()
             .launch_builder(kernel)
-            .arg(output.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&batch_size)
             .arg(&channels)
             .arg(&length)
@@ -170,6 +171,7 @@ pub fn gpu_conv2d(
     let kernel_rows = out_channels;
     let kernel_cols = in_channels * params.kernel_h * params.kernel_w;
     let kernel_2d = kernel
+        .clone()
         .reshape(vec![kernel_rows, kernel_cols])
         .ok_or_else(|| CudaError::Kernel("Failed to reshape kernel".to_string()))?;
 
@@ -249,6 +251,7 @@ pub fn gpu_conv1d(
     let kernel_rows = out_channels;
     let kernel_cols = in_channels * params.kernel_size;
     let kernel_2d = kernel
+        .clone()
         .reshape(vec![kernel_rows, kernel_cols])
         .ok_or_else(|| CudaError::Kernel("Failed to reshape kernel".to_string()))?;
 
@@ -296,8 +299,8 @@ pub fn add_bias(
     unsafe {
         ctx.stream()
             .launch_builder(bias_kernel)
-            .arg(output.data_f32_mut()?)
-            .arg(bias.data_f32()?)
+            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+            .arg(&GbKernelArg::new(bias.data_f32()?))
             .arg(&batch_size)
             .arg(&out_channels)
             .arg(&spatial_size)

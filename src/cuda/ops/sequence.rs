@@ -1,5 +1,6 @@
 //! Sequence and math operations for GPU tensors
 
+use crate::cuda::bridge::GbKernelArg;
 use super::cache::OpsKernelCache;
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::tensor::GpuTensor;
@@ -24,8 +25,8 @@ pub fn gpu_atan(
     unsafe {
         ctx.stream()
             .launch_builder(kernel)
-            .arg(output.data_f32_mut()?)
-            .arg(input.data_f32()?)
+            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+            .arg(&GbKernelArg::new(input.data_f32()?))
             .arg(&n)
             .launch(config)
             .map_err(|e| CudaError::Kernel(format!("atan launch failed: {}", e)))?;
@@ -53,7 +54,7 @@ pub fn gpu_range(
     unsafe {
         ctx.stream()
             .launch_builder(kernel)
-            .arg(output.data_f32_mut()?)
+            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
             .arg(&start)
             .arg(&delta)
             .arg(&n)
@@ -83,7 +84,7 @@ pub fn gpu_range_i64(
     unsafe {
         ctx.stream()
             .launch_builder(kernel)
-            .arg(output.data_i64_mut()?)
+            .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
             .arg(&start)
             .arg(&delta)
             .arg(&n)
@@ -147,8 +148,8 @@ pub fn gpu_cumsum(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_f32_mut()?)
-                    .arg(input.data_f32()?)
+                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+                    .arg(&GbKernelArg::new(input.data_f32()?))
                     .arg(&num_lines)
                     .arg(&axis_len)
                     .arg(&inner_stride)
@@ -168,8 +169,8 @@ pub fn gpu_cumsum(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_i64_mut()?)
-                    .arg(input.data_i64()?)
+                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
+                    .arg(&GbKernelArg::new(input.data_i64()?))
                     .arg(&num_lines)
                     .arg(&axis_len)
                     .arg(&inner_stride)
@@ -189,8 +190,8 @@ pub fn gpu_cumsum(
             unsafe {
                 ctx.stream()
                     .launch_builder(kernel)
-                    .arg(output.data_i32_mut()?)
-                    .arg(input.data_i32()?)
+                    .arg(&GbKernelArg::new_mut(output.data_i32_mut()?))
+                    .arg(&GbKernelArg::new(input.data_i32()?))
                     .arg(&num_lines)
                     .arg(&axis_len)
                     .arg(&inner_stride)

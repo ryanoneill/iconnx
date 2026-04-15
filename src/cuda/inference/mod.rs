@@ -1336,7 +1336,7 @@ impl GpuGraphExecutor {
 
                         // Reshape A from [batch, M, K] to [batch*M, K]
                         let a_reshaped =
-                            inputs[0].reshape(vec![batch * m, k]).ok_or_else(|| {
+                            inputs[0].clone().reshape(vec![batch * m, k]).ok_or_else(|| {
                                 CudaError::Kernel("MatMul: failed to reshape A".into())
                             })?;
 
@@ -1366,20 +1366,20 @@ impl GpuGraphExecutor {
                         let n = b_shape[3];
 
                         // Reshape A from [batch, heads, M, K] to [batch*heads, M, K]
-                        let a_reshaped =
-                            inputs[0]
-                                .reshape(vec![batch * heads, m, k])
-                                .ok_or_else(|| {
-                                    CudaError::Kernel("MatMul 4D: failed to reshape A".into())
-                                })?;
+                        let a_reshaped = inputs[0]
+                            .clone()
+                            .reshape(vec![batch * heads, m, k])
+                            .ok_or_else(|| {
+                                CudaError::Kernel("MatMul 4D: failed to reshape A".into())
+                            })?;
 
                         // Reshape B from [batch, heads, K, N] to [batch*heads, K, N]
-                        let b_reshaped =
-                            inputs[1]
-                                .reshape(vec![batch * heads, k, n])
-                                .ok_or_else(|| {
-                                    CudaError::Kernel("MatMul 4D: failed to reshape B".into())
-                                })?;
+                        let b_reshaped = inputs[1]
+                            .clone()
+                            .reshape(vec![batch * heads, k, n])
+                            .ok_or_else(|| {
+                                CudaError::Kernel("MatMul 4D: failed to reshape B".into())
+                            })?;
 
                         // 3D batched matmul: [batch*heads, M, K] @ [batch*heads, K, N] = [batch*heads, M, N]
                         let result_3d = gpu_batched_matmul(&self.ctx, &mut pool, &a_reshaped, &b_reshaped)?;
@@ -2308,7 +2308,7 @@ impl GpuGraphExecutor {
                     }
                 }
 
-                inputs[0].reshape(new_shape.clone()).ok_or_else(|| {
+                inputs[0].clone().reshape(new_shape.clone()).ok_or_else(|| {
                     let new_len: usize = new_shape.iter().product();
                     CudaError::Kernel(format!(
                         "Reshape: element count mismatch. Input has {} elements (shape {:?}), target shape {:?} has {} elements. Raw shape_data: {:?}",
@@ -2362,6 +2362,7 @@ impl GpuGraphExecutor {
                     old_shape.iter().copied().filter(|&d| d != 1).collect()
                 };
                 inputs[0]
+                    .clone()
                     .reshape(new_shape)
                     .ok_or_else(|| CudaError::Kernel("Squeeze: element count mismatch".into()))
             }
@@ -2415,6 +2416,7 @@ impl GpuGraphExecutor {
                 }
 
                 inputs[0]
+                    .clone()
                     .reshape(new_shape)
                     .ok_or_else(|| CudaError::Kernel("Unsqueeze: element count mismatch".into()))
             }
@@ -2713,6 +2715,7 @@ impl GpuGraphExecutor {
                         )));
                     }
                     let signal_reshaped = inputs[0]
+                        .clone()
                         .reshape(vec![signal_shape[1]])
                         .ok_or_else(|| CudaError::Kernel("Failed to reshape signal".to_string()))?;
                     (signal_reshaped, 1)
@@ -2725,6 +2728,7 @@ impl GpuGraphExecutor {
                         )));
                     }
                     let signal_reshaped = inputs[0]
+                        .clone()
                         .reshape(vec![signal_shape[1]])
                         .ok_or_else(|| CudaError::Kernel("Failed to reshape signal".to_string()))?;
                     (signal_reshaped, 1)

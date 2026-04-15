@@ -2,6 +2,7 @@
 
 #![allow(clippy::too_many_arguments)] // CUDA kernels require many parameters
 
+use crate::cuda::bridge::GbKernelArg;
 use super::cache::ConvKernelCache;
 use super::forward::add_bias;
 use super::params::{Conv1dParams, Conv2dParams};
@@ -41,8 +42,8 @@ pub fn gpu_col2im(
     unsafe {
         ctx.stream()
             .launch_builder(kernel)
-            .arg(output.data_f32_mut()?)
-            .arg(col_matrix.data_f32()?)
+            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+            .arg(&GbKernelArg::new(col_matrix.data_f32()?))
             .arg(&batch_size)
             .arg(&channels)
             .arg(&height)
@@ -88,8 +89,8 @@ pub fn gpu_col2im_1d(
     unsafe {
         ctx.stream()
             .launch_builder(kernel)
-            .arg(output.data_f32_mut()?)
-            .arg(col_matrix.data_f32()?)
+            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
+            .arg(&GbKernelArg::new(col_matrix.data_f32()?))
             .arg(&batch_size)
             .arg(&channels)
             .arg(&length)
@@ -167,12 +168,14 @@ pub fn gpu_conv_transpose_2d(
     // Step 1: Reshape input to [in_channels, batch_size * height * width]
     let input_cols = batch_size * height * width;
     let input_2d = input
+        .clone()
         .reshape(vec![in_channels, input_cols])
         .ok_or_else(|| CudaError::Kernel("Failed to reshape input".to_string()))?;
 
     // Step 2: Reshape kernel to [in_channels, out_channels * kH * kW]
     let kernel_cols = out_channels * params.kernel_h * params.kernel_w;
     let kernel_2d = kernel
+        .clone()
         .reshape(vec![in_channels, kernel_cols])
         .ok_or_else(|| CudaError::Kernel("Failed to reshape kernel".to_string()))?;
 
@@ -268,12 +271,14 @@ pub fn gpu_conv_transpose_1d(
     // Step 1: Reshape input to [in_channels, batch_size * length]
     let input_cols = batch_size * length;
     let input_2d = input
+        .clone()
         .reshape(vec![in_channels, input_cols])
         .ok_or_else(|| CudaError::Kernel("Failed to reshape input".to_string()))?;
 
     // Step 2: Reshape kernel to [in_channels, out_channels * kernel_size]
     let kernel_cols = out_channels * params.kernel_size;
     let kernel_2d = kernel
+        .clone()
         .reshape(vec![in_channels, kernel_cols])
         .ok_or_else(|| CudaError::Kernel("Failed to reshape kernel".to_string()))?;
 
