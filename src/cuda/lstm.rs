@@ -1,61 +1,46 @@
 #![allow(clippy::too_many_arguments)] // LSTM operations require many parameters
 
-use crate::cuda::bridge::GbKernelArg;
 use super::context::{CudaError, IconnxCudaContext};
 use super::matmul::gpu_gemm;
 use super::memory_pool::GpuMemoryPool;
 use super::ops::{gpu_concat, gpu_slice_nd, OpsKernelCache};
 use super::tensor::GpuTensor;
-/// GPU LSTM (Long Short-Term Memory) using cuBLAS
+/// GPU LSTM (Long Short-Term Memory) using cuBLAS.
 ///
-/// Implements LSTM entirely on GPU by:
-/// 1. Using cuBLAS GEMM for matrix multiplications (W @ X and R @ H)
-/// 2. Using custom CUDA kernels for gate activations (sigmoid, tanh)
-/// 3. Using elementwise kernels for gate combinations
-///
-/// LSTM equations:
-/// i_t = sigmoid(X_t @ W_i^T + H_{t-1} @ R_i^T + b_i)    (input gate)
-/// f_t = sigmoid(X_t @ W_f^T + H_{t-1} @ R_f^T + b_f)    (forget gate)
-/// c_t = f_t * c_{t-1} + i_t * tanh(X_t @ W_c^T + H_{t-1} @ R_c^T + b_c)  (cell state)
-/// o_t = sigmoid(X_t @ W_o^T + H_{t-1} @ R_o^T + b_o)    (output gate)
-/// h_t = o_t * tanh(c_t)                                  (hidden state)
-use cudarc::driver::{CudaFunction, CudaModule, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::compile_ptx;
-use std::collections::HashMap;
-use std::sync::Arc;
+/// Implements LSTM entirely on GPU:
+/// 1. cuBLAS GEMM for matrix multiplications (W @ X and R @ H).
+/// 2. Custom CUDA kernels for gate activations (sigmoid, tanh).
+/// 3. Fused kernel for gate combinations (fused_lstm_step_kernel).
+use garboard::{DeviceSlice, LaunchConfig, Module, Program};
 
-/// Manages compiled LSTM kernels with caching
+/// Compiled LSTM kernels as a garboard `Module`.
 pub struct LstmKernelCache {
-    #[allow(dead_code)]
-    module: Arc<CudaModule>,
-    functions: HashMap<&'static str, CudaFunction>,
+    module: Module<'static>,
 }
 
 impl LstmKernelCache {
-    /// Compile all LSTM kernels and create the cache
+    /// Compile all LSTM kernels and create the cache.
     pub fn new(ctx: &IconnxCudaContext) -> Result<Self, CudaError> {
-        let ptx = compile_ptx(LSTM_KERNELS)
-            .map_err(|e| CudaError::Kernel(format!("NVRTC compilation failed: {:?}", e)))?;
+        let program = Program::compile_for_device(LSTM_KERNELS, ctx.garboard_device(), &[])
+            .map_err(|e| CudaError::Kernel(format!("NVRTC compilation failed: {}", e)))?;
 
         let module = ctx
-            .context()
-            .load_module(ptx)
+            .garboard_device()
+            .load_module(&program)
             .map_err(|e| CudaError::Kernel(format!("Module load failed: {}", e)))?;
 
-        let mut functions = HashMap::new();
-
         for name in KERNEL_NAMES {
-            let func = module.load_function(name).map_err(|e| {
+            module.function(name).map_err(|e| {
                 CudaError::Kernel(format!("Failed to load kernel '{}': {}", name, e))
             })?;
-            functions.insert(*name, func);
         }
 
-        Ok(Self { module, functions })
+        Ok(Self { module })
     }
 
-    pub fn get(&self, name: &'static str) -> Option<&CudaFunction> {
-        self.functions.get(name)
+    /// Access to the underlying module for launch sites.
+    pub(crate) fn module(&self) -> &Module<'static> {
+        &self.module
     }
 }
 
@@ -398,27 +383,44 @@ fn lstm_step(
     let mut h_new = pool.get_tensor_f32(ctx, vec![batch_size, hidden_size])?;
     let mut c_new = pool.get_tensor_f32(ctx, vec![batch_size, hidden_size])?;
 
-    let fused_kernel = cache
-        .get("fused_lstm_step_kernel")
-        .ok_or_else(|| CudaError::Kernel("fused_lstm_step_kernel not found".into()))?;
-
     let total_cells = batch_size * hidden_size;
-    let config = LaunchConfig::for_num_elems(total_cells as u32);
 
-    unsafe {
-        ctx.stream()
-            .launch_builder(fused_kernel)
-            .arg(&GbKernelArg::new_mut(h_new.data_f32_mut()?))
-            .arg(&GbKernelArg::new_mut(c_new.data_f32_mut()?))
-            .arg(&GbKernelArg::new(gates_xw.data_f32()?))
-            .arg(&GbKernelArg::new(gates_hr.data_f32()?))
-            .arg(&GbKernelArg::new(b.data_f32()?))
-            .arg(&GbKernelArg::new(c.data_f32()?))
-            .arg(&batch_size)
-            .arg(&hidden_size)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(format!("fused_lstm_step launch failed: {}", e)))?;
+    // SAFETY: fused_lstm_step_kernel signature is
+    // `(float* h_new, float* c_new, const float* gates_xw,
+    //   const float* gates_hr, const float* bias, const float* c_prev,
+    //   size_t batch_size, size_t hidden_size)`.
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut DeviceSlice<'_, f32>,
+            &mut DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            usize,
+            usize,
+        )>("fused_lstm_step_kernel")
     }
+    .map_err(|e| {
+        CudaError::Kernel(format!("fused_lstm_step_kernel lookup failed: {}", e))
+    })?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(total_cells as u32),
+            (
+                h_new.data_f32_mut()?,
+                c_new.data_f32_mut()?,
+                gates_xw.data_f32()?,
+                gates_hr.data_f32()?,
+                b.data_f32()?,
+                c.data_f32()?,
+                batch_size,
+                hidden_size,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("fused_lstm_step launch failed: {}", e)))?;
 
     Ok((h_new, c_new))
 }
@@ -566,8 +568,8 @@ mod tests {
     fn test_kernel_compilation() {
         let (ctx, lstm_cache, _ops_cache, _pool) = setup();
 
-        assert!(lstm_cache.get("lstm_gates_kernel").is_some());
-        assert!(lstm_cache.get("lstm_cell_update_kernel").is_some());
+        assert!(lstm_cache.module().function("lstm_gates_kernel").is_ok());
+        assert!(lstm_cache.module().function("lstm_cell_update_kernel").is_ok());
 
         println!("All LSTM kernels compiled successfully!");
         drop(ctx);
