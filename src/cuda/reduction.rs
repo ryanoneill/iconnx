@@ -50,10 +50,10 @@ const KERNEL_NAMES: &[&str] = &[
 ];
 
 /// Reduction CUDA kernel source code.
+///
+/// `CUDART_INF_F` comes from `math_constants.h`, auto-included by
+/// garboard's `compile_for_device`.
 const REDUCTION_KERNELS: &str = r#"
-// Define infinity constant for NVRTC (can't include math_constants.h)
-#define CUDART_INF_F __int_as_float(0x7f800000)
-
 // Block-level reduction using shared memory
 // Each block reduces its portion, then atomically adds to output
 

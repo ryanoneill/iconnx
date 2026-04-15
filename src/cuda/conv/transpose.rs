@@ -5,13 +5,11 @@
 use super::cache::ConvKernelCache;
 use super::forward::add_bias;
 use super::params::{Conv1dParams, Conv2dParams};
-use crate::cuda::bridge::GbKernelArg;
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::matmul::gpu_gemm;
 use crate::cuda::memory_pool::GpuMemoryPool;
 use crate::cuda::ops::{gpu_concat, gpu_slice_nd, OpsKernelCache};
 use crate::cuda::tensor::GpuTensor;
-use cudarc::driver::{LaunchConfig as CudarcLaunchConfig, PushKernelArg};
 use garboard::{DeviceSlice, LaunchConfig};
 
 /// GPU col2im transformation for 2D ConvTranspose
@@ -34,33 +32,43 @@ pub fn gpu_col2im(
     let total_output = batch_size * channels * height * width;
     let mut output = pool.get_tensor_f32(ctx, vec![batch_size, channels, height, width])?;
 
-    // 14 parameters — exceeds garboard's `KernelArgs` 12-tuple cap, so
-    // this launch uses cudarc via the GbKernelArg bridge. Will migrate
-    // to `module.typed_kernel` once garboard's tuple impls go up.
-    let func = cache
-        .cudarc_function("col2im_kernel")
-        .ok_or_else(|| CudaError::Kernel("col2im_kernel not found".to_string()))?;
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(func)
-            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-            .arg(&GbKernelArg::new(col_matrix.data_f32()?))
-            .arg(&batch_size)
-            .arg(&channels)
-            .arg(&height)
-            .arg(&width)
-            .arg(&params.kernel_h)
-            .arg(&params.kernel_w)
-            .arg(&params.stride_h)
-            .arg(&params.stride_w)
-            .arg(&params.pad_h)
-            .arg(&params.pad_w)
-            .arg(&out_h)
-            .arg(&out_w)
-            .launch(CudarcLaunchConfig::for_num_elems(total_output as u32))
-            .map_err(|e| CudaError::Kernel(format!("col2im launch failed: {}", e)))?;
+    // SAFETY: col2im_kernel signature is
+    // `(float* out, const float* col, size_t N, size_t C, size_t H, size_t W,
+    //   size_t kH, size_t kW, size_t sH, size_t sW, size_t pH, size_t pW,
+    //   size_t out_H, size_t out_W)`.
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            usize, usize, usize, usize,
+            usize, usize, usize, usize,
+            usize, usize, usize, usize,
+        )>("col2im_kernel")
     }
+    .map_err(|e| CudaError::Kernel(format!("col2im_kernel lookup failed: {}", e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(total_output as u32),
+            (
+                output.data_f32_mut()?,
+                col_matrix.data_f32()?,
+                batch_size,
+                channels,
+                height,
+                width,
+                params.kernel_h,
+                params.kernel_w,
+                params.stride_h,
+                params.stride_w,
+                params.pad_h,
+                params.pad_w,
+                out_h,
+                out_w,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("col2im launch failed: {}", e)))?;
 
     Ok(output)
 }

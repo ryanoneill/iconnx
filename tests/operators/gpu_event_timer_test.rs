@@ -29,7 +29,7 @@ fn timer_records_one_op_and_finalizes() {
     let (a, b) = make_add_inputs(&ctx);
 
     let mut timer =
-        GpuEventTimer::new(ctx.context().clone(), ctx.stream(), 8).expect("GpuEventTimer::new");
+        GpuEventTimer::new(ctx.garboard_device(), ctx.garboard_stream(), 8).expect("GpuEventTimer::new");
 
     let _ = gpu_add(&ctx, &elem_cache, &mut pool, &a, &b).expect("gpu_add");
     timer.record("Add".to_string()).expect("timer.record");
@@ -52,7 +52,7 @@ fn timer_aggregates_same_label_across_calls() {
     let (a, b) = make_add_inputs(&ctx);
 
     let mut timer =
-        GpuEventTimer::new(ctx.context().clone(), ctx.stream(), 8).expect("GpuEventTimer::new");
+        GpuEventTimer::new(ctx.garboard_device(), ctx.garboard_stream(), 8).expect("GpuEventTimer::new");
 
     // Three Add operations, all labeled the same -- finalize() should fold
     // them into one entry with count = 3.
@@ -87,7 +87,7 @@ fn timer_zero_elapsed_still_inserted() {
     let b = GpuTensor::from_host_f32(&ctx, &[2.0f32], vec![1]).expect("b upload");
 
     let mut timer =
-        GpuEventTimer::new(ctx.context().clone(), ctx.stream(), 4).expect("GpuEventTimer::new");
+        GpuEventTimer::new(ctx.garboard_device(), ctx.garboard_stream(), 4).expect("GpuEventTimer::new");
 
     let _ = gpu_add(&ctx, &elem_cache, &mut pool, &a, &b).expect("gpu_add");
     timer.record("TinyAdd".to_string()).expect("timer.record");
@@ -117,7 +117,7 @@ fn timer_multiple_distinct_labels() {
     let (a, b) = make_add_inputs(&ctx);
 
     let mut timer =
-        GpuEventTimer::new(ctx.context().clone(), ctx.stream(), 4).expect("GpuEventTimer::new");
+        GpuEventTimer::new(ctx.garboard_device(), ctx.garboard_stream(), 4).expect("GpuEventTimer::new");
 
     let _ = gpu_add(&ctx, &elem_cache, &mut pool, &a, &b).expect("gpu_add");
     timer.record("Add".to_string()).expect("timer.record Add");

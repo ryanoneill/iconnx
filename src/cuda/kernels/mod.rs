@@ -98,18 +98,10 @@ const KERNEL_NAMES: &[&str] = &[
 
 /// All elementwise CUDA kernel source code.
 ///
-/// Largely unchanged from the cudarc implementation. The one tweak:
-/// `-INFINITY` (from `math.h`) is replaced with the IEEE-754 bit
-/// pattern via `__int_as_float(0xff800000)` because NVRTC under garboard
-/// does not auto-include `math_constants.h` when a target architecture
-/// is specified. `reduction.rs` has always used this workaround; it's
-/// now applied consistently here too.
+/// `math_constants.h` is auto-included by garboard's `compile_for_device`,
+/// so `CUDART_INF_F` is available directly — no bit-pattern workaround
+/// needed.
 const ELEMENTWISE_KERNELS: &str = r#"
-// Negative infinity as a float — bit pattern 0xff800000.
-// NVRTC cannot include <math_constants.h> when a target architecture is
-// specified, so the raw bit cast is the portable workaround.
-#define ICONNX_NEG_INF_F __int_as_float(0xff800000)
-
 // Binary elementwise operations: out[i] = a[i] op b[i]
 
 extern "C" __global__ void add_kernel(float* out, const float* a, const float* b, size_t n) {
@@ -213,7 +205,7 @@ extern "C" __global__ void log_kernel(float* out, const float* x, size_t n) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         // Guard against log(0) and log(negative)
-        out[i] = x[i] > 0.0f ? logf(x[i]) : ICONNX_NEG_INF_F;
+        out[i] = x[i] > 0.0f ? logf(x[i]) : -CUDART_INF_F;
     }
 }
 
