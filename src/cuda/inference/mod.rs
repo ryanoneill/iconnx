@@ -4570,10 +4570,10 @@ impl GpuGraphExecutor {
 
         // Execute nodes with per-op-type timing
         let mut op_times: BTreeMap<String, (u64, usize)> = BTreeMap::new();
-        // GPU-side timing via CUDA events. Allocates events fresh per run.
+        // GPU-side timing via garboard events. Allocates events fresh per run.
         let mut gpu_timer = GpuEventTimer::new(
-            self.ctx.context().clone(),
-            self.ctx.stream(),
+            self.ctx.garboard_device(),
+            self.ctx.garboard_stream(),
             sorted_nodes.len(),
         )?;
         let exec_start = Instant::now();

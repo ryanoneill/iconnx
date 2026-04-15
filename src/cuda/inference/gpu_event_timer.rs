@@ -1,6 +1,6 @@
-//! GPU-side kernel timing via CUDA events.
+//! GPU-side kernel timing via garboard events.
 //!
-//! `GpuEventTimer` records a CUDA event before each op dispatch (via a
+//! `GpuEventTimer` records a GPU event before each op dispatch (via a
 //! "start sentinel" in `new()`) and after each op dispatch (via `record()`).
 //! After all ops have been dispatched, `finalize()` synchronizes the stream
 //! once, computes the elapsed time between consecutive event pairs, and
@@ -9,10 +9,9 @@
 //!
 //! # Invariants
 //!
-//! - All events are created with `CU_EVENT_DEFAULT` so that `elapsed_ms`
-//!   returns a valid measurement. cudarc's default flag is
-//!   `CU_EVENT_DISABLE_TIMING`; passing that default would cause
-//!   `elapsed_ms` to fail with an opaque CUDA driver error.
+//! - Garboard events always have timing enabled (no `DISABLE_TIMING`
+//!   flag to worry about; the knob doesn't exist in garboard's Event
+//!   API).
 //! - `events[0]` is the start sentinel recorded at construction.
 //!   `events[i+1]` is the event recorded by the `i`-th call to `record()`.
 //!   The label for the interval from `events[i]` to `events[i+1]` is
@@ -25,8 +24,8 @@
 //!
 //! ```text
 //! let mut timer = GpuEventTimer::new(
-//!     ctx.context().clone(),
-//!     ctx.stream(),
+//!     ctx.garboard_device(),
+//!     ctx.garboard_stream(),
 //!     sorted_nodes.len(),
 //! )?;
 //! for node in sorted_nodes {
@@ -37,43 +36,39 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use cudarc::driver::sys::CUevent_flags;
-use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
+use garboard::{Device, Event, Stream};
 
 use crate::cuda::context::CudaError;
 
-/// Per-op GPU timing via CUDA events. See module-level docs for invariants.
-pub struct GpuEventTimer {
-    ctx: Arc<CudaContext>,
-    stream: Arc<CudaStream>,
+/// Per-op GPU timing via garboard events. See module-level docs for invariants.
+pub struct GpuEventTimer<'s> {
+    device: &'static Device,
+    stream: &'s Stream<'static>,
     /// Events recorded on the stream. `events[0]` is the start sentinel;
     /// `events[i+1]` is the event recorded by the i-th `record()` call.
-    events: Vec<CudaEvent>,
+    events: Vec<Event<'static>>,
     /// Label for each recorded interval. `labels[i]` labels the interval
     /// from `events[i]` to `events[i+1]`.
     labels: Vec<String>,
 }
 
-impl GpuEventTimer {
+impl<'s> GpuEventTimer<'s> {
     /// Creates a new timer and records a start sentinel event on the stream.
     ///
     /// `estimated_ops` is a capacity hint for the internal `Vec`s — exceeding
     /// it is safe and only triggers normal `Vec` growth.
     pub fn new(
-        ctx: Arc<CudaContext>,
-        stream: &Arc<CudaStream>,
+        device: &'static Device,
+        stream: &'s Stream<'static>,
         estimated_ops: usize,
     ) -> Result<Self, CudaError> {
-        let sentinel = ctx
-            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(|e| {
-                CudaError::Kernel(format!(
-                    "GpuEventTimer: failed to create start sentinel event: {}",
-                    e
-                ))
-            })?;
+        let sentinel = device.create_event().map_err(|e| {
+            CudaError::Kernel(format!(
+                "GpuEventTimer: failed to create start sentinel event: {}",
+                e
+            ))
+        })?;
         sentinel.record(stream).map_err(|e| {
             CudaError::Kernel(format!(
                 "GpuEventTimer: failed to record start sentinel event: {}",
@@ -84,8 +79,8 @@ impl GpuEventTimer {
         let mut events = Vec::with_capacity(estimated_ops + 1);
         events.push(sentinel);
         Ok(Self {
-            ctx,
-            stream: stream.clone(),
+            device,
+            stream,
             events,
             labels: Vec::with_capacity(estimated_ops),
         })
@@ -98,16 +93,13 @@ impl GpuEventTimer {
     /// the GPU-measured interval because the recorded event captures the
     /// stream's queue position, not the CPU's wall-clock.
     pub fn record(&mut self, label: String) -> Result<(), CudaError> {
-        let event = self
-            .ctx
-            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(|e| {
-                CudaError::Kernel(format!(
-                    "GpuEventTimer: failed to create event for op '{}': {}",
-                    label, e
-                ))
-            })?;
-        event.record(&self.stream).map_err(|e| {
+        let event = self.device.create_event().map_err(|e| {
+            CudaError::Kernel(format!(
+                "GpuEventTimer: failed to create event for op '{}': {}",
+                label, e
+            ))
+        })?;
+        event.record(self.stream).map_err(|e| {
             CudaError::Kernel(format!(
                 "GpuEventTimer: failed to record event for op '{}': {}",
                 label, e
@@ -135,16 +127,15 @@ impl GpuEventTimer {
         for (i, label) in self.labels.into_iter().enumerate() {
             let start = &self.events[i];
             let end = &self.events[i + 1];
-            let elapsed_ms = start.elapsed_ms(end).map_err(|e| {
+            let elapsed_secs = start.elapsed_seconds(end).map_err(|e| {
                 CudaError::Kernel(format!(
-                    "GpuEventTimer: elapsed_ms failed at interval {} ('{}'): {}",
+                    "GpuEventTimer: elapsed_seconds failed at interval {} ('{}'): {}",
                     i, label, e
                 ))
             })?;
-            // elapsed_ms returns f32 milliseconds. Multiply by 1000 and
-            // truncate to u64 microseconds. Negative values are not
-            // physically possible; clamp to 0 out of paranoia.
-            let elapsed_us = (elapsed_ms.max(0.0) * 1000.0) as u64;
+            // Garboard clamps negative elapsed to zero internally, so we
+            // skip the defensive .max(0.0) the cudarc version needed.
+            let elapsed_us = (elapsed_secs * 1_000_000.0) as u64;
             let entry = map.entry(label).or_insert((0, 0));
             entry.0 += elapsed_us;
             entry.1 += 1;
