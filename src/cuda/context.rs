@@ -2,48 +2,50 @@
 //!
 //! Holds both cudarc and garboard handles during the Phase 1 migration:
 //!
-//! - **cudarc** (`CudaContext`, `CudaStream`, `CudaBlas`) — kernel launches,
-//!   cuBLAS, and cuDNN still go through cudarc. They will migrate to
-//!   garboard's `TypedKernel` / `BlasContext` / `DnnContext` in subsequent
-//!   PRs.
-//! - **garboard** (`Device`, `Stream`) — memory allocation, host/device
-//!   transfers, and device zero-fill have moved here. The garboard
-//!   `Device` is leaked to `'static` so `DeviceSlice<'static, T>` can
-//!   flow through `Arc`-backed `GpuTensor` fields and the memory pool
-//!   without self-borrow gymnastics.
+//! - **cudarc** (`CudaContext`, `CudaStream`) — a handful of remaining
+//!   launch sites (14+-arg layout kernels, cuDNN conv/RNN) still route
+//!   through cudarc via the `GbKernelArg` bridge or raw FFI. They migrate
+//!   in the final Phase 1 PR.
+//! - **garboard** (`Device`, `Stream`, `BlasContext`) — memory allocation,
+//!   host/device transfers, device zero-fill, and cuBLAS GEMMs all run
+//!   through garboard now. The garboard `Device` is leaked to `'static`
+//!   so `DeviceSlice<'static, T>` can flow through `Arc`-backed
+//!   `GpuTensor` fields and the memory pool without self-borrow issues.
 //!
 //! Cross-backend synchronization is handled by `sync()` which drains
-//! both streams. Kernel launches on the cudarc stream read/write
-//! garboard-owned memory via the [`crate::cuda::bridge::CudarcView`] RAII
-//! helper — see `bridge.rs` for the safety story.
+//! both streams.
 
 use std::sync::Arc;
 
-use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaContext, CudaStream};
-use garboard::{Device as GbDevice, DeviceSlice as GbDeviceSlice, Stream as GbStream};
+use garboard::{
+    BlasContext, Device as GbDevice, DeviceSlice as GbDeviceSlice, Stream as GbStream,
+};
 
 use super::bridge::CudarcView;
 
-/// Iconnx CUDA context — manages GPU device, stream, and cuBLAS.
+/// Iconnx CUDA context — manages GPU device, stream, BLAS, etc.
 pub struct IconnxCudaContext {
-    // ---- cudarc (kernel launches, cuBLAS, cuDNN) ----
+    // ---- cudarc (residual: layout bridge kernels, cuDNN) ----
     /// The cudarc CUDA context.
     context: Arc<CudaContext>,
-    /// Default stream for cudarc-driven operations.
+    /// Default stream for cudarc-driven operations (stream 0, CUDA's
+    /// legacy null stream — implicitly synchronizes with garboard's
+    /// user stream below).
     stream: Arc<CudaStream>,
-    /// cuBLAS handle for matrix operations (migration target: garboard's BlasContext).
-    cublas: CudaBlas,
 
-    // ---- garboard (memory allocation, transfers) ----
+    // ---- garboard (memory allocation, transfers, BLAS) ----
     /// Garboard device, leaked to `'static` so `DeviceSlice<'static, T>`
     /// can flow through long-lived structures without self-borrow issues.
     /// One Device is leaked per distinct ordinal per process; this is
     /// consistent with the singleton nature of a GPU context.
     garboard_device: &'static GbDevice,
-    /// Default stream on the garboard device, used for host-to-device and
-    /// device-to-host transfers done through garboard.
+    /// Default stream on the garboard device, used for host/device
+    /// transfers, all typed-kernel launches, and cuBLAS GEMMs.
     garboard_stream: GbStream<'static>,
+    /// cuBLAS handle (via garboard), bound to `garboard_stream` on each
+    /// BLAS call.
+    blas: BlasContext<'static>,
 }
 
 impl IconnxCudaContext {
@@ -59,12 +61,10 @@ impl IconnxCudaContext {
     /// bounded by the number of distinct ordinals seen during the
     /// process's lifetime.
     pub fn new_for_device(device_ordinal: usize) -> Result<Self, CudaError> {
-        // cudarc side.
+        // cudarc side (residual: for kernels still on the bridge and cuDNN).
         let context =
             CudaContext::new(device_ordinal).map_err(|e| CudaError::DeviceInit(e.to_string()))?;
         let stream = context.default_stream();
-        let cublas =
-            CudaBlas::new(stream.clone()).map_err(|e| CudaError::Cublas(e.to_string()))?;
 
         // garboard side.
         let ordinal_i32: i32 = device_ordinal.try_into().map_err(|_| {
@@ -80,13 +80,16 @@ impl IconnxCudaContext {
         let garboard_stream = garboard_device
             .create_stream()
             .map_err(|e| CudaError::StreamCreate(e.to_string()))?;
+        let blas = garboard_device
+            .create_blas_context()
+            .map_err(|e| CudaError::Cublas(e.to_string()))?;
 
         Ok(Self {
             context,
             stream,
-            cublas,
             garboard_device,
             garboard_stream,
+            blas,
         })
     }
 
@@ -102,9 +105,11 @@ impl IconnxCudaContext {
         &self.stream
     }
 
-    /// Get the cuBLAS handle for matrix operations.
-    pub fn cublas(&self) -> &CudaBlas {
-        &self.cublas
+    /// Get the garboard cuBLAS context for matrix operations.
+    /// Each BLAS call takes `&Stream` at its call site; this accessor
+    /// returns the handle to pair with `garboard_stream()`.
+    pub fn blas(&self) -> &BlasContext<'static> {
+        &self.blas
     }
 
     /// Get the garboard device (leaked to `'static`). Use this for
