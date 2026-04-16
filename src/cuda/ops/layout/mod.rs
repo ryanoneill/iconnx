@@ -1,11 +1,9 @@
 //! Layout and memory operations for GPU tensors
 
-use crate::cuda::bridge::GbKernelArg;
 use super::cache::OpsKernelCache;
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::memory_pool::GpuMemoryPool;
 use crate::cuda::tensor::GpuTensor;
-use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 /// GPU Shape operator: Returns tensor dimensions as Int64 tensor
 ///
@@ -58,22 +56,26 @@ pub fn gpu_constant_of_shape_direct(
     // Allocate output tensor (uninitialized would be ideal, but zeros is safe)
     let mut output = pool.get_tensor_f32(ctx, target_shape)?;
 
-    // Use fill kernel to set all values
-    let kernel = cache
-        .cudarc_function("fill_kernel")
-        .ok_or_else(|| CudaError::Kernel("fill_kernel not found".into()))?;
-
-    let config = LaunchConfig::for_num_elems(total_elements as u32);
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(kernel)
-            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-            .arg(&value)
-            .arg(&total_elements)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(format!("fill_kernel launch failed: {}", e)))?;
+    // Use fill kernel to set all values.
+    // SAFETY: fill_kernel takes (float* out, float value, size_t total_elements).
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, f32>,
+            f32,
+            usize,
+        )>("fill_kernel")
     }
+    .map_err(|e| CudaError::Kernel(format!("fill_kernel lookup: {}", e)))?;
+
+    let config = garboard::LaunchConfig::for_num_elems(total_elements as u32);
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (output.data_f32_mut()?, value, total_elements),
+        )
+        .map_err(|e| CudaError::Kernel(format!("fill_kernel launch failed: {}", e)))?;
 
     Ok(output)
 }
@@ -94,22 +96,27 @@ pub fn gpu_transpose_2d(
 
     let mut output = pool.get_tensor_f32(ctx, vec![cols, rows])?;
 
-    let kernel = cache
-        .cudarc_function("transpose_2d_kernel")
-        .ok_or_else(|| CudaError::Kernel("transpose_2d_kernel not found".into()))?;
-
-    let config = LaunchConfig::for_num_elems(total as u32);
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(kernel)
-            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-            .arg(&GbKernelArg::new(input.data_f32()?))
-            .arg(&rows)
-            .arg(&cols)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(format!("transpose_2d launch failed: {}", e)))?;
+    // SAFETY: transpose_2d_kernel takes (float* out, const float* inp,
+    //   size_t rows, size_t cols).
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, f32>,
+            usize,
+            usize,
+        )>("transpose_2d_kernel")
     }
+    .map_err(|e| CudaError::Kernel(format!("transpose_2d_kernel lookup: {}", e)))?;
+
+    let config = garboard::LaunchConfig::for_num_elems(total as u32);
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (output.data_f32_mut()?, input.data_f32()?, rows, cols),
+        )
+        .map_err(|e| CudaError::Kernel(format!("transpose_2d launch failed: {}", e)))?;
 
     Ok(output)
 }
@@ -192,82 +199,127 @@ pub fn gpu_transpose_nd(
     let out_strides_gpu = ctx.htod_usize(&out_strides)?;
     let perm_gpu = ctx.htod_usize(&perm_usize)?;
 
-    let config = LaunchConfig::for_num_elems(total_elements as u32);
+    let config = garboard::LaunchConfig::for_num_elems(total_elements as u32);
 
     // Dispatch based on input dtype
     match input {
         GpuTensor::Float32 { .. } => {
             let mut output = pool.get_tensor_f32(ctx, out_shape)?;
-            let kernel = cache
-                .cudarc_function("transpose_general_kernel")
-                .ok_or_else(|| CudaError::Kernel("transpose_general_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    .arg(&GbKernelArg::new(&in_shape_gpu))
-                    .arg(&GbKernelArg::new(&in_strides_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&perm_gpu))
-                    .arg(&ndim)
-                    .arg(&total_elements)
-                    .launch(config)
-                    .map_err(|e| {
-                        CudaError::Kernel(format!("transpose_general launch failed: {}", e))
-                    })?;
+            // SAFETY: transpose_general_kernel takes (float* out, const float* inp,
+            //   const size_t* in_shape, const size_t* in_strides,
+            //   const size_t* out_strides, const size_t* perm,
+            //   size_t ndim, size_t total_elements).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("transpose_general_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("transpose_general_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &in_shape_gpu,
+                        &in_strides_gpu,
+                        &out_strides_gpu,
+                        &perm_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("transpose_general launch failed: {}", e))
+                })?;
             Ok(output)
         }
         GpuTensor::Int64 { .. } => {
             let mut output = pool.get_tensor_i64(ctx, out_shape)?;
-            let kernel = cache.cudarc_function("transpose_general_i64_kernel").ok_or_else(|| {
-                CudaError::Kernel("transpose_general_i64_kernel not found".into())
-            })?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
-                    .arg(&GbKernelArg::new(input.data_i64()?))
-                    .arg(&GbKernelArg::new(&in_shape_gpu))
-                    .arg(&GbKernelArg::new(&in_strides_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&perm_gpu))
-                    .arg(&ndim)
-                    .arg(&total_elements)
-                    .launch(config)
-                    .map_err(|e| {
-                        CudaError::Kernel(format!("transpose_general_i64 launch failed: {}", e))
-                    })?;
+            // SAFETY: transpose_general_i64_kernel signature mirrors transpose_general_kernel
+            // with `long long*` (i64) data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("transpose_general_i64_kernel")
             }
+            .map_err(|e| {
+                CudaError::Kernel(format!("transpose_general_i64_kernel lookup: {}", e))
+            })?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i64_mut()?,
+                        input.data_i64()?,
+                        &in_shape_gpu,
+                        &in_strides_gpu,
+                        &out_strides_gpu,
+                        &perm_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("transpose_general_i64 launch failed: {}", e))
+                })?;
             Ok(output)
         }
         GpuTensor::Int32 { .. } => {
-            // Int32 uses same size as Float32 (4 bytes), so we can reinterpret
-            // This is a bit hacky but works for transpose which just moves data
             let mut output = pool.get_tensor_i32(ctx, out_shape)?;
-            let kernel = cache
-                .cudarc_function("transpose_general_kernel")
-                .ok_or_else(|| CudaError::Kernel("transpose_general_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_i32()?))
-                    .arg(&GbKernelArg::new(&in_shape_gpu))
-                    .arg(&GbKernelArg::new(&in_strides_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&perm_gpu))
-                    .arg(&ndim)
-                    .arg(&total_elements)
-                    .launch(config)
-                    .map_err(|e| {
-                        CudaError::Kernel(format!("transpose_general_i32 launch failed: {}", e))
-                    })?;
+            // SAFETY: transpose_general_i32_kernel signature mirrors transpose_general_kernel
+            // with `int*` (i32) data pointers in place of `float*`. Pre-garboard the
+            // float kernel was reused via cudarc's type-erased pointer wrapper; garboard
+            // requires a properly typed kernel symbol.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i32>,
+                    &garboard::DeviceSlice<'_, i32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("transpose_general_i32_kernel")
             }
+            .map_err(|e| {
+                CudaError::Kernel(format!("transpose_general_i32_kernel lookup: {}", e))
+            })?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i32_mut()?,
+                        input.data_i32()?,
+                        &in_shape_gpu,
+                        &in_strides_gpu,
+                        &out_strides_gpu,
+                        &perm_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("transpose_general_i32 launch failed: {}", e))
+                })?;
             Ok(output)
         }
     }
@@ -298,65 +350,95 @@ pub fn gpu_where(
         )));
     }
 
-    let config = LaunchConfig::for_num_elems(n as u32);
+    let config = garboard::LaunchConfig::for_num_elems(n as u32);
 
     // Dispatch based on x/y dtype
     match dtype {
         crate::cuda::tensor::DType::Float32 => {
             let mut output = pool.get_tensor_f32(ctx, condition.shape().to_vec())?;
-            let kernel = cache
-                .cudarc_function("where_kernel")
-                .ok_or_else(|| CudaError::Kernel("where_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(condition.data_f32()?))
-                    .arg(&GbKernelArg::new(x.data_f32()?))
-                    .arg(&GbKernelArg::new(y.data_f32()?))
-                    .arg(&n)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("where launch failed: {}", e)))?;
+            // SAFETY: where_kernel takes (float* out, const float* condition,
+            //   const float* x, const float* y, size_t n).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    usize,
+                )>("where_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("where_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f32_mut()?,
+                        condition.data_f32()?,
+                        x.data_f32()?,
+                        y.data_f32()?,
+                        n,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("where launch failed: {}", e)))?;
             Ok(output)
         }
         crate::cuda::tensor::DType::Int64 => {
             let mut output = pool.get_tensor_i64(ctx, condition.shape().to_vec())?;
-            let kernel = cache
-                .cudarc_function("where_i64_kernel")
-                .ok_or_else(|| CudaError::Kernel("where_i64_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
-                    .arg(&GbKernelArg::new(condition.data_f32()?))
-                    .arg(&GbKernelArg::new(x.data_i64()?))
-                    .arg(&GbKernelArg::new(y.data_i64()?))
-                    .arg(&n)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("where_i64 launch failed: {}", e)))?;
+            // SAFETY: where_i64_kernel takes (long long* out, const float* condition,
+            //   const long long* x, const long long* y, size_t n).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                )>("where_i64_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("where_i64_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i64_mut()?,
+                        condition.data_f32()?,
+                        x.data_i64()?,
+                        y.data_i64()?,
+                        n,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("where_i64 launch failed: {}", e)))?;
             Ok(output)
         }
         crate::cuda::tensor::DType::Int32 => {
             let mut output = pool.get_tensor_i32(ctx, condition.shape().to_vec())?;
-            let kernel = cache
-                .cudarc_function("where_i32_kernel")
-                .ok_or_else(|| CudaError::Kernel("where_i32_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i32_mut()?))
-                    .arg(&GbKernelArg::new(condition.data_f32()?))
-                    .arg(&GbKernelArg::new(x.data_i32()?))
-                    .arg(&GbKernelArg::new(y.data_i32()?))
-                    .arg(&n)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("where_i32 launch failed: {}", e)))?;
+            // SAFETY: where_i32_kernel takes (int* out, const float* condition,
+            //   const int* x, const int* y, size_t n).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, i32>,
+                    &garboard::DeviceSlice<'_, i32>,
+                    usize,
+                )>("where_i32_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("where_i32_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i32_mut()?,
+                        condition.data_f32()?,
+                        x.data_i32()?,
+                        y.data_i32()?,
+                        n,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("where_i32 launch failed: {}", e)))?;
             Ok(output)
         }
     }
@@ -403,48 +485,72 @@ pub fn gpu_gather(
     }
 
     let total = num_indices * slice_size;
-    let config = LaunchConfig::for_num_elems(total as u32);
+    let config = garboard::LaunchConfig::for_num_elems(total as u32);
 
     // Dispatch based on input dtype
     match input {
         GpuTensor::Float32 { .. } => {
             let mut output = pool.get_tensor_f32(ctx, out_shape)?;
-            let kernel = cache
-                .cudarc_function("gather_kernel")
-                .ok_or_else(|| CudaError::Kernel("gather_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    .arg(&GbKernelArg::new(&indices_gpu))
-                    .arg(&num_indices)
-                    .arg(&slice_size)
-                    .arg(&dim0_size)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("gather launch failed: {}", e)))?;
+            // SAFETY: gather_kernel takes (float* out, const float* inp,
+            //   const long long* indices, size_t num_indices, size_t slice_size,
+            //   size_t dim0_size).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                )>("gather_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("gather_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &indices_gpu,
+                        num_indices,
+                        slice_size,
+                        dim0_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("gather launch failed: {}", e)))?;
             Ok(output)
         }
         GpuTensor::Int64 { .. } => {
             let mut output = pool.get_tensor_i64(ctx, out_shape)?;
-            let kernel = cache
-                .cudarc_function("gather_i64_kernel")
-                .ok_or_else(|| CudaError::Kernel("gather_i64_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
-                    .arg(&GbKernelArg::new(input.data_i64()?))
-                    .arg(&GbKernelArg::new(&indices_gpu))
-                    .arg(&num_indices)
-                    .arg(&slice_size)
-                    .arg(&dim0_size)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("gather_i64 launch failed: {}", e)))?;
+            // SAFETY: gather_i64_kernel takes (long long* out, const long long* inp,
+            //   const long long* indices, size_t num_indices, size_t slice_size,
+            //   size_t dim0_size).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                )>("gather_i64_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("gather_i64_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i64_mut()?,
+                        input.data_i64()?,
+                        &indices_gpu,
+                        num_indices,
+                        slice_size,
+                        dim0_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("gather_i64 launch failed: {}", e)))?;
             Ok(output)
         }
         _ => Err(CudaError::Kernel(format!(
@@ -480,48 +586,72 @@ pub fn gpu_gather_from_gpu(
     }
 
     let total = num_indices * slice_size;
-    let config = LaunchConfig::for_num_elems(total as u32);
+    let config = garboard::LaunchConfig::for_num_elems(total as u32);
 
     // Dispatch based on input dtype
     match input {
         GpuTensor::Float32 { .. } => {
             let mut output = pool.get_tensor_f32(ctx, out_shape)?;
-            let kernel = cache
-                .cudarc_function("gather_kernel")
-                .ok_or_else(|| CudaError::Kernel("gather_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    .arg(&GbKernelArg::new(indices_tensor.data_i64()?))
-                    .arg(&num_indices)
-                    .arg(&slice_size)
-                    .arg(&dim0_size)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("gather launch failed: {}", e)))?;
+            // SAFETY: gather_kernel takes (float* out, const float* inp,
+            //   const long long* indices, size_t num_indices, size_t slice_size,
+            //   size_t dim0_size).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                )>("gather_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("gather_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        indices_tensor.data_i64()?,
+                        num_indices,
+                        slice_size,
+                        dim0_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("gather launch failed: {}", e)))?;
             Ok(output)
         }
         GpuTensor::Int64 { .. } => {
             let mut output = pool.get_tensor_i64(ctx, out_shape)?;
-            let kernel = cache
-                .cudarc_function("gather_i64_kernel")
-                .ok_or_else(|| CudaError::Kernel("gather_i64_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
-                    .arg(&GbKernelArg::new(input.data_i64()?))
-                    .arg(&GbKernelArg::new(indices_tensor.data_i64()?))
-                    .arg(&num_indices)
-                    .arg(&slice_size)
-                    .arg(&dim0_size)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("gather_i64 launch failed: {}", e)))?;
+            // SAFETY: gather_i64_kernel takes (long long* out, const long long* inp,
+            //   const long long* indices, size_t num_indices, size_t slice_size,
+            //   size_t dim0_size).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                )>("gather_i64_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("gather_i64_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i64_mut()?,
+                        input.data_i64()?,
+                        indices_tensor.data_i64()?,
+                        num_indices,
+                        slice_size,
+                        dim0_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("gather_i64 launch failed: {}", e)))?;
             Ok(output)
         }
         _ => Err(CudaError::Kernel(format!(
@@ -545,22 +675,27 @@ pub fn gpu_slice_contiguous(
 
     let mut output = pool.get_tensor_f32(ctx, out_shape)?;
 
-    let kernel = cache
-        .cudarc_function("slice_kernel")
-        .ok_or_else(|| CudaError::Kernel("slice_kernel not found".into()))?;
-
-    let config = LaunchConfig::for_num_elems(length as u32);
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(kernel)
-            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-            .arg(&GbKernelArg::new(input.data_f32()?))
-            .arg(&start)
-            .arg(&length)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(format!("slice launch failed: {}", e)))?;
+    // SAFETY: slice_kernel takes (float* out, const float* inp,
+    //   size_t start_offset, size_t total_elements).
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, f32>,
+            usize,
+            usize,
+        )>("slice_kernel")
     }
+    .map_err(|e| CudaError::Kernel(format!("slice_kernel lookup: {}", e)))?;
+
+    let config = garboard::LaunchConfig::for_num_elems(length as u32);
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (output.data_f32_mut()?, input.data_f32()?, start, length),
+        )
+        .map_err(|e| CudaError::Kernel(format!("slice launch failed: {}", e)))?;
 
     Ok(output)
 }
@@ -576,21 +711,25 @@ pub fn gpu_copy(
 
     let mut output = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
 
-    let kernel = cache
-        .cudarc_function("copy_kernel")
-        .ok_or_else(|| CudaError::Kernel("copy_kernel not found".into()))?;
-
-    let config = LaunchConfig::for_num_elems(n as u32);
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(kernel)
-            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-            .arg(&GbKernelArg::new(input.data_f32()?))
-            .arg(&n)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(format!("copy launch failed: {}", e)))?;
+    // SAFETY: copy_kernel takes (float* out, const float* inp, size_t n).
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, f32>,
+            usize,
+        )>("copy_kernel")
     }
+    .map_err(|e| CudaError::Kernel(format!("copy_kernel lookup: {}", e)))?;
+
+    let config = garboard::LaunchConfig::for_num_elems(n as u32);
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (output.data_f32_mut()?, input.data_f32()?, n),
+        )
+        .map_err(|e| CudaError::Kernel(format!("copy launch failed: {}", e)))?;
 
     Ok(output)
 }
@@ -667,9 +806,23 @@ pub fn gpu_concat(
     match dtype {
         crate::cuda::tensor::DType::Float32 => {
             let mut output = pool.get_tensor_f32(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("concat_kernel")
-                .ok_or_else(|| CudaError::Kernel("concat_kernel not found".into()))?;
+            // SAFETY: concat_kernel takes (float* out, const float* inp,
+            //   size_t inp_offset, size_t inp_axis_size, size_t outer_size,
+            //   size_t inner_size, size_t out_axis_size,
+            //   size_t total_inp_elements).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                )>("concat_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("concat_kernel lookup: {}", e)))?;
 
             let mut inp_offset: usize = 0;
             for inp in inputs {
@@ -682,22 +835,24 @@ pub fn gpu_concat(
                     continue;
                 }
 
-                let config = LaunchConfig::for_num_elems(total_inp_elements as u32);
+                let config = garboard::LaunchConfig::for_num_elems(total_inp_elements as u32);
 
-                unsafe {
-                    ctx.stream()
-                        .launch_builder(kernel)
-                        .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                        .arg(&GbKernelArg::new(inp.data_f32()?))
-                        .arg(&inp_offset)
-                        .arg(&inp_axis_size)
-                        .arg(&outer_size)
-                        .arg(&inner_size)
-                        .arg(&out_axis_size)
-                        .arg(&total_inp_elements)
-                        .launch(config)
-                        .map_err(|e| CudaError::Kernel(format!("concat launch failed: {}", e)))?;
-                }
+                kernel
+                    .launch(
+                        ctx.garboard_stream(),
+                        &config,
+                        (
+                            output.data_f32_mut()?,
+                            inp.data_f32()?,
+                            inp_offset,
+                            inp_axis_size,
+                            outer_size,
+                            inner_size,
+                            out_axis_size,
+                            total_inp_elements,
+                        ),
+                    )
+                    .map_err(|e| CudaError::Kernel(format!("concat launch failed: {}", e)))?;
 
                 inp_offset += inp_axis_size;
             }
@@ -705,9 +860,21 @@ pub fn gpu_concat(
         }
         crate::cuda::tensor::DType::Int64 => {
             let mut output = pool.get_tensor_i64(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("concat_i64_kernel")
-                .ok_or_else(|| CudaError::Kernel("concat_i64_kernel not found".into()))?;
+            // SAFETY: concat_i64_kernel mirrors concat_kernel with `long long*`
+            // (i64) data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                )>("concat_i64_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("concat_i64_kernel lookup: {}", e)))?;
 
             let mut inp_offset: usize = 0;
             for inp in inputs {
@@ -720,24 +887,24 @@ pub fn gpu_concat(
                     continue;
                 }
 
-                let config = LaunchConfig::for_num_elems(total_inp_elements as u32);
+                let config = garboard::LaunchConfig::for_num_elems(total_inp_elements as u32);
 
-                unsafe {
-                    ctx.stream()
-                        .launch_builder(kernel)
-                        .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
-                        .arg(&GbKernelArg::new(inp.data_i64()?))
-                        .arg(&inp_offset)
-                        .arg(&inp_axis_size)
-                        .arg(&outer_size)
-                        .arg(&inner_size)
-                        .arg(&out_axis_size)
-                        .arg(&total_inp_elements)
-                        .launch(config)
-                        .map_err(|e| {
-                            CudaError::Kernel(format!("concat_i64 launch failed: {}", e))
-                        })?;
-                }
+                kernel
+                    .launch(
+                        ctx.garboard_stream(),
+                        &config,
+                        (
+                            output.data_i64_mut()?,
+                            inp.data_i64()?,
+                            inp_offset,
+                            inp_axis_size,
+                            outer_size,
+                            inner_size,
+                            out_axis_size,
+                            total_inp_elements,
+                        ),
+                    )
+                    .map_err(|e| CudaError::Kernel(format!("concat_i64 launch failed: {}", e)))?;
 
                 inp_offset += inp_axis_size;
             }
@@ -745,9 +912,21 @@ pub fn gpu_concat(
         }
         crate::cuda::tensor::DType::Int32 => {
             let mut output = pool.get_tensor_i32(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("concat_i32_kernel")
-                .ok_or_else(|| CudaError::Kernel("concat_i32_kernel not found".into()))?;
+            // SAFETY: concat_i32_kernel mirrors concat_kernel with `int*` (i32)
+            // data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i32>,
+                    &garboard::DeviceSlice<'_, i32>,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                )>("concat_i32_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("concat_i32_kernel lookup: {}", e)))?;
 
             let mut inp_offset: usize = 0;
             for inp in inputs {
@@ -760,24 +939,24 @@ pub fn gpu_concat(
                     continue;
                 }
 
-                let config = LaunchConfig::for_num_elems(total_inp_elements as u32);
+                let config = garboard::LaunchConfig::for_num_elems(total_inp_elements as u32);
 
-                unsafe {
-                    ctx.stream()
-                        .launch_builder(kernel)
-                        .arg(&GbKernelArg::new_mut(output.data_i32_mut()?))
-                        .arg(&GbKernelArg::new(inp.data_i32()?))
-                        .arg(&inp_offset)
-                        .arg(&inp_axis_size)
-                        .arg(&outer_size)
-                        .arg(&inner_size)
-                        .arg(&out_axis_size)
-                        .arg(&total_inp_elements)
-                        .launch(config)
-                        .map_err(|e| {
-                            CudaError::Kernel(format!("concat_i32 launch failed: {}", e))
-                        })?;
-                }
+                kernel
+                    .launch(
+                        ctx.garboard_stream(),
+                        &config,
+                        (
+                            output.data_i32_mut()?,
+                            inp.data_i32()?,
+                            inp_offset,
+                            inp_axis_size,
+                            outer_size,
+                            inner_size,
+                            out_axis_size,
+                            total_inp_elements,
+                        ),
+                    )
+                    .map_err(|e| CudaError::Kernel(format!("concat_i32 launch failed: {}", e)))?;
 
                 inp_offset += inp_axis_size;
             }
@@ -849,74 +1028,115 @@ pub fn gpu_expand(
     let inp_shape_gpu = ctx.htod_usize(&padded_inp_shape)?;
     let inp_strides_gpu = ctx.htod_usize(&inp_strides)?;
 
-    let config = LaunchConfig::for_num_elems(total_elements as u32);
+    let config = garboard::LaunchConfig::for_num_elems(total_elements as u32);
 
     // Dispatch based on dtype
     match dtype {
         crate::cuda::tensor::DType::Float32 => {
             let mut output = pool.get_tensor_f32(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("expand_kernel")
-                .ok_or_else(|| CudaError::Kernel("expand_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    .arg(&GbKernelArg::new(&out_shape_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&inp_shape_gpu))
-                    .arg(&GbKernelArg::new(&inp_strides_gpu))
-                    .arg(&ndim)
-                    .arg(&total_elements)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("expand launch failed: {}", e)))?;
+            // SAFETY: expand_kernel takes (float* out, const float* inp,
+            //   const size_t* out_shape, const size_t* out_strides,
+            //   const size_t* inp_shape, const size_t* inp_strides,
+            //   size_t ndim, size_t total_elements).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("expand_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("expand_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &out_shape_gpu,
+                        &out_strides_gpu,
+                        &inp_shape_gpu,
+                        &inp_strides_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("expand launch failed: {}", e)))?;
             Ok(output)
         }
         crate::cuda::tensor::DType::Int64 => {
             let mut output = pool.get_tensor_i64(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("expand_i64_kernel")
-                .ok_or_else(|| CudaError::Kernel("expand_i64_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
-                    .arg(&GbKernelArg::new(input.data_i64()?))
-                    .arg(&GbKernelArg::new(&out_shape_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&inp_shape_gpu))
-                    .arg(&GbKernelArg::new(&inp_strides_gpu))
-                    .arg(&ndim)
-                    .arg(&total_elements)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("expand_i64 launch failed: {}", e)))?;
+            // SAFETY: expand_i64_kernel mirrors expand_kernel with `long long*`
+            // (i64) data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("expand_i64_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("expand_i64_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i64_mut()?,
+                        input.data_i64()?,
+                        &out_shape_gpu,
+                        &out_strides_gpu,
+                        &inp_shape_gpu,
+                        &inp_strides_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("expand_i64 launch failed: {}", e)))?;
             Ok(output)
         }
         crate::cuda::tensor::DType::Int32 => {
             let mut output = pool.get_tensor_i32(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("expand_i32_kernel")
-                .ok_or_else(|| CudaError::Kernel("expand_i32_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_i32()?))
-                    .arg(&GbKernelArg::new(&out_shape_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&inp_shape_gpu))
-                    .arg(&GbKernelArg::new(&inp_strides_gpu))
-                    .arg(&ndim)
-                    .arg(&total_elements)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("expand_i32 launch failed: {}", e)))?;
+            // SAFETY: expand_i32_kernel mirrors expand_kernel with `int*`
+            // (i32) data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i32>,
+                    &garboard::DeviceSlice<'_, i32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("expand_i32_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("expand_i32_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i32_mut()?,
+                        input.data_i32()?,
+                        &out_shape_gpu,
+                        &out_strides_gpu,
+                        &inp_shape_gpu,
+                        &inp_strides_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("expand_i32 launch failed: {}", e)))?;
             Ok(output)
         }
     }
@@ -963,7 +1183,7 @@ pub fn gpu_pad(
     let out_strides = compute_strides(&out_shape);
     let inp_strides = compute_strides(inp_shape);
 
-    let config = LaunchConfig::for_num_elems(total_out_elements as u32);
+    let config = garboard::LaunchConfig::for_num_elems(total_out_elements as u32);
 
     // Select kernel based on mode
     match mode {
@@ -1039,7 +1259,7 @@ fn gpu_pad_constant(
     pads_begin: &[usize],
     value: f32,
     total_out_elements: usize,
-    config: LaunchConfig,
+    config: garboard::LaunchConfig,
 ) -> Result<(), CudaError> {
     let ndim = inp_shape.len();
 
@@ -1070,15 +1290,10 @@ fn gpu_pad_constant(
             }
             .map_err(|e| CudaError::Kernel(format!("pad_3d_scalar_kernel lookup: {}", e)))?;
 
-            let gb_config = garboard::LaunchConfig {
-                grid_dim: config.grid_dim,
-                block_dim: config.block_dim,
-                shared_mem_bytes: config.shared_mem_bytes,
-            };
             kernel
                 .launch(
                     ctx.garboard_stream(),
-                    &gb_config,
+                    &config,
                     (
                         output.data_f32_mut()?,
                         input.data_f32()?,
@@ -1115,15 +1330,10 @@ fn gpu_pad_constant(
             }
             .map_err(|e| CudaError::Kernel(format!("pad_4d_scalar_kernel lookup: {}", e)))?;
 
-            let gb_config = garboard::LaunchConfig {
-                grid_dim: config.grid_dim,
-                block_dim: config.block_dim,
-                shared_mem_bytes: config.shared_mem_bytes,
-            };
             kernel
                 .launch(
                     ctx.garboard_stream(),
-                    &gb_config,
+                    &config,
                     (
                         output.data_f32_mut()?,
                         input.data_f32()?,
@@ -1143,26 +1353,45 @@ fn gpu_pad_constant(
             let out_strides_gpu = ctx.htod_usize(out_strides)?;
             let pads_begin_gpu = ctx.htod_usize(pads_begin)?;
 
-            let kernel = cache
-                .cudarc_function("pad_kernel")
-                .ok_or_else(|| CudaError::Kernel("pad_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    .arg(&GbKernelArg::new(&inp_shape_gpu))
-                    .arg(&GbKernelArg::new(&out_shape_gpu))
-                    .arg(&GbKernelArg::new(&inp_strides_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&pads_begin_gpu))
-                    .arg(&ndim)
-                    .arg(&value)
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("pad launch failed: {}", e)))?;
+            // SAFETY: pad_kernel takes (float* out, const float* inp,
+            //   const size_t* inp_shape, const size_t* out_shape,
+            //   const size_t* inp_strides, const size_t* out_strides,
+            //   const size_t* pads_begin, size_t ndim,
+            //   float pad_value, size_t total_out_elements).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    f32,
+                    usize,
+                )>("pad_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("pad_kernel lookup: {}", e)))?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &inp_shape_gpu,
+                        &out_shape_gpu,
+                        &inp_strides_gpu,
+                        &out_strides_gpu,
+                        &pads_begin_gpu,
+                        ndim,
+                        value,
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("pad launch failed: {}", e)))?;
         }
     }
 
@@ -1183,7 +1412,7 @@ fn gpu_pad_reflect(
     out_strides: &[usize],
     pads_begin: &[usize],
     total_out_elements: usize,
-    config: LaunchConfig,
+    config: garboard::LaunchConfig,
 ) -> Result<(), CudaError> {
     let ndim = inp_shape.len();
 
@@ -1213,15 +1442,10 @@ fn gpu_pad_reflect(
             }
             .map_err(|e| CudaError::Kernel(format!("pad_reflect_3d_kernel lookup: {}", e)))?;
 
-            let gb_config = garboard::LaunchConfig {
-                grid_dim: config.grid_dim,
-                block_dim: config.block_dim,
-                shared_mem_bytes: config.shared_mem_bytes,
-            };
             kernel
                 .launch(
                     ctx.garboard_stream(),
-                    &gb_config,
+                    &config,
                     (
                         output.data_f32_mut()?,
                         input.data_f32()?,
@@ -1240,25 +1464,43 @@ fn gpu_pad_reflect(
             let out_strides_gpu = ctx.htod_usize(out_strides)?;
             let pads_begin_gpu = ctx.htod_usize(pads_begin)?;
 
-            let kernel = cache
-                .cudarc_function("pad_reflect_kernel")
-                .ok_or_else(|| CudaError::Kernel("pad_reflect_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    .arg(&GbKernelArg::new(&inp_shape_gpu))
-                    .arg(&GbKernelArg::new(&out_shape_gpu))
-                    .arg(&GbKernelArg::new(&inp_strides_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&pads_begin_gpu))
-                    .arg(&ndim)
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("pad_reflect launch failed: {}", e)))?;
+            // SAFETY: pad_reflect_kernel takes (float* out, const float* inp,
+            //   const size_t* inp_shape, const size_t* out_shape,
+            //   const size_t* inp_strides, const size_t* out_strides,
+            //   const size_t* pads_begin, size_t ndim,
+            //   size_t total_out_elements).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("pad_reflect_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("pad_reflect_kernel lookup: {}", e)))?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &inp_shape_gpu,
+                        &out_shape_gpu,
+                        &inp_strides_gpu,
+                        &out_strides_gpu,
+                        &pads_begin_gpu,
+                        ndim,
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("pad_reflect launch failed: {}", e)))?;
         }
     }
 
@@ -1279,7 +1521,7 @@ fn gpu_pad_edge(
     out_strides: &[usize],
     pads_begin: &[usize],
     total_out_elements: usize,
-    config: LaunchConfig,
+    config: garboard::LaunchConfig,
 ) -> Result<(), CudaError> {
     let ndim = inp_shape.len();
 
@@ -1291,25 +1533,43 @@ fn gpu_pad_edge(
     let out_strides_gpu = ctx.htod_usize(out_strides)?;
     let pads_begin_gpu = ctx.htod_usize(pads_begin)?;
 
-    let kernel = cache
-        .cudarc_function("pad_edge_kernel")
-        .ok_or_else(|| CudaError::Kernel("pad_edge_kernel not found".into()))?;
-
-    unsafe {
-        ctx.stream()
-            .launch_builder(kernel)
-            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-            .arg(&GbKernelArg::new(input.data_f32()?))
-            .arg(&GbKernelArg::new(&inp_shape_gpu))
-            .arg(&GbKernelArg::new(&out_shape_gpu))
-            .arg(&GbKernelArg::new(&inp_strides_gpu))
-            .arg(&GbKernelArg::new(&out_strides_gpu))
-            .arg(&GbKernelArg::new(&pads_begin_gpu))
-            .arg(&ndim)
-            .arg(&total_out_elements)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(format!("pad_edge launch failed: {}", e)))?;
+    // SAFETY: pad_edge_kernel takes (float* out, const float* inp,
+    //   const size_t* inp_shape, const size_t* out_shape,
+    //   const size_t* inp_strides, const size_t* out_strides,
+    //   const size_t* pads_begin, size_t ndim,
+    //   size_t total_out_elements).
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, u64>,
+            &garboard::DeviceSlice<'_, u64>,
+            &garboard::DeviceSlice<'_, u64>,
+            &garboard::DeviceSlice<'_, u64>,
+            &garboard::DeviceSlice<'_, u64>,
+            usize,
+            usize,
+        )>("pad_edge_kernel")
     }
+    .map_err(|e| CudaError::Kernel(format!("pad_edge_kernel lookup: {}", e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (
+                output.data_f32_mut()?,
+                input.data_f32()?,
+                &inp_shape_gpu,
+                &out_shape_gpu,
+                &inp_strides_gpu,
+                &out_strides_gpu,
+                &pads_begin_gpu,
+                ndim,
+                total_out_elements,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("pad_edge launch failed: {}", e)))?;
 
     Ok(())
 }
@@ -1341,27 +1601,42 @@ pub fn gpu_scatter_nd(
     let shape_vec: Vec<usize> = data_shape.to_vec();
     let shape_gpu = ctx.htod_usize(&shape_vec)?;
 
-    let kernel = cache
-        .cudarc_function("scatter_nd_kernel")
-        .ok_or_else(|| CudaError::Kernel("scatter_nd_kernel not found".into()))?;
+    // SAFETY: scatter_nd_kernel takes (float* out, const float* updates,
+    //   const long long* indices, const size_t* shape,
+    //   size_t num_updates, size_t slice_size, size_t index_depth, size_t ndim).
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, i64>,
+            &garboard::DeviceSlice<'_, u64>,
+            usize,
+            usize,
+            usize,
+            usize,
+        )>("scatter_nd_kernel")
+    }
+    .map_err(|e| CudaError::Kernel(format!("scatter_nd_kernel lookup: {}", e)))?;
 
     let total = num_updates * slice_size;
-    let config = LaunchConfig::for_num_elems(total as u32);
+    let config = garboard::LaunchConfig::for_num_elems(total as u32);
 
-    unsafe {
-        ctx.stream()
-            .launch_builder(kernel)
-            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-            .arg(&GbKernelArg::new(updates.data_f32()?))
-            .arg(&GbKernelArg::new(&indices_gpu))
-            .arg(&GbKernelArg::new(&shape_gpu))
-            .arg(&num_updates)
-            .arg(&slice_size)
-            .arg(&index_depth)
-            .arg(&ndim)
-            .launch(config)
-            .map_err(|e| CudaError::Kernel(format!("scatter_nd launch failed: {}", e)))?;
-    }
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (
+                output.data_f32_mut()?,
+                updates.data_f32()?,
+                &indices_gpu,
+                &shape_gpu,
+                num_updates,
+                slice_size,
+                index_depth,
+                ndim,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("scatter_nd launch failed: {}", e)))?;
 
     Ok(output)
 }
@@ -1443,7 +1718,7 @@ pub fn gpu_resize(
     let inp_shape_vec: Vec<usize> = inp_shape.to_vec();
     let inp_strides = compute_strides(&inp_shape_vec);
 
-    let config = LaunchConfig::for_num_elems(total_out_elements as u32);
+    let config = garboard::LaunchConfig::for_num_elems(total_out_elements as u32);
 
     // Mode flags for kernel
     let coord_mode_int: i32 = coord_mode as i32;
@@ -1454,42 +1729,45 @@ pub fn gpu_resize(
             // Linear interpolation
             match ndim {
                 3 => {
-                    let kernel = cache
-                        .cudarc_function("resize_linear_3d_kernel")
-                        .ok_or_else(|| {
-                            CudaError::Kernel("resize_linear_3d_kernel not found".into())
-                        })?;
-
-                    unsafe {
-                        ctx.stream()
-                            .launch_builder(kernel)
-                            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                            .arg(&GbKernelArg::new(input.data_f32()?))
-                            // Input shape
-                            .arg(&inp_shape[0])
-                            .arg(&inp_shape[1])
-                            .arg(&inp_shape[2])
-                            // Output shape
-                            .arg(&out_shape[0])
-                            .arg(&out_shape[1])
-                            .arg(&out_shape[2])
-                            // Input strides
-                            .arg(&inp_strides[0])
-                            .arg(&inp_strides[1])
-                            .arg(&inp_strides[2])
-                            // Scales
-                            .arg(&scales[0])
-                            .arg(&scales[1])
-                            .arg(&scales[2])
-                            // Total
-                            .arg(&total_out_elements)
-                            // Coord mode
-                            .arg(&coord_mode_int)
-                            .launch(config)
-                            .map_err(|e| {
-                                CudaError::Kernel(format!("resize_linear_3d launch failed: {}", e))
-                            })?;
+                    // SAFETY: resize_linear_3d_kernel takes (float* out, const float* inp,
+                    //   size_t inp_d0, size_t inp_d1, size_t inp_d2,
+                    //   size_t out_d0, size_t out_d1, size_t out_d2,
+                    //   size_t inp_s0, size_t inp_s1, size_t inp_s2,
+                    //   float scale0, float scale1, float scale2,
+                    //   size_t total_out_elements, int coord_mode).
+                    let kernel = unsafe {
+                        cache.module().typed_kernel::<(
+                            &mut garboard::DeviceSlice<'_, f32>,
+                            &garboard::DeviceSlice<'_, f32>,
+                            usize, usize, usize,
+                            usize, usize, usize,
+                            usize, usize, usize,
+                            f32, f32, f32,
+                            usize, i32,
+                        )>("resize_linear_3d_kernel")
                     }
+                    .map_err(|e| {
+                        CudaError::Kernel(format!("resize_linear_3d_kernel lookup: {}", e))
+                    })?;
+
+                    kernel
+                        .launch(
+                            ctx.garboard_stream(),
+                            &config,
+                            (
+                                output.data_f32_mut()?,
+                                input.data_f32()?,
+                                inp_shape[0], inp_shape[1], inp_shape[2],
+                                out_shape[0], out_shape[1], out_shape[2],
+                                inp_strides[0], inp_strides[1], inp_strides[2],
+                                scales[0], scales[1], scales[2],
+                                total_out_elements,
+                                coord_mode_int,
+                            ),
+                        )
+                        .map_err(|e| {
+                            CudaError::Kernel(format!("resize_linear_3d launch failed: {}", e))
+                        })?;
                 }
                 4 => {
                     // Pack [inp_d0..3, out_d0..3, inp_s0..3] = 12 params.
@@ -1512,15 +1790,10 @@ pub fn gpu_resize(
                     }
                     .map_err(|e| CudaError::Kernel(format!("resize_linear_4d lookup: {}", e)))?;
 
-                    let gb_config = garboard::LaunchConfig {
-                        grid_dim: config.grid_dim,
-                        block_dim: config.block_dim,
-                        shared_mem_bytes: config.shared_mem_bytes,
-                    };
                     kernel
                         .launch(
                             ctx.garboard_stream(),
-                            &gb_config,
+                            &config,
                             (
                                 output.data_f32_mut()?,
                                 input.data_f32()?,
@@ -1567,15 +1840,10 @@ pub fn gpu_resize(
                     }
                     .map_err(|e| CudaError::Kernel(format!("resize_3d_scalar lookup: {}", e)))?;
 
-                    let gb_config = garboard::LaunchConfig {
-                        grid_dim: config.grid_dim,
-                        block_dim: config.block_dim,
-                        shared_mem_bytes: config.shared_mem_bytes,
-                    };
                     kernel
                         .launch(
                             ctx.garboard_stream(),
-                            &gb_config,
+                            &config,
                             (
                                 output.data_f32_mut()?,
                                 input.data_f32()?,
@@ -1612,15 +1880,10 @@ pub fn gpu_resize(
                     }
                     .map_err(|e| CudaError::Kernel(format!("resize_4d_scalar lookup: {}", e)))?;
 
-                    let gb_config = garboard::LaunchConfig {
-                        grid_dim: config.grid_dim,
-                        block_dim: config.block_dim,
-                        shared_mem_bytes: config.shared_mem_bytes,
-                    };
                     kernel
                         .launch(
                             ctx.garboard_stream(),
-                            &gb_config,
+                            &config,
                             (
                                 output.data_f32_mut()?,
                                 input.data_f32()?,
@@ -1643,31 +1906,46 @@ pub fn gpu_resize(
                     let out_strides_gpu = ctx.htod_usize(&out_strides)?;
                     let scales_gpu = ctx.htod(scales)?;
 
-                    let kernel = cache
-                        .cudarc_function("resize_nearest_kernel")
-                        .ok_or_else(|| {
-                            CudaError::Kernel("resize_nearest_kernel not found".into())
-                        })?;
-
-                    unsafe {
-                        ctx.stream()
-                            .launch_builder(kernel)
-                            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                            .arg(&GbKernelArg::new(input.data_f32()?))
-                            .arg(&GbKernelArg::new(&inp_shape_gpu))
-                            .arg(&GbKernelArg::new(&out_shape_gpu))
-                            .arg(&GbKernelArg::new(&inp_strides_gpu))
-                            .arg(&GbKernelArg::new(&out_strides_gpu))
-                            .arg(&GbKernelArg::new(&scales_gpu))
-                            .arg(&ndim)
-                            .arg(&total_out_elements)
-                            .arg(&coord_mode_int)
-                            .arg(&nearest_mode_int)
-                            .launch(config)
-                            .map_err(|e| {
-                                CudaError::Kernel(format!("resize launch failed: {}", e))
-                            })?;
+                    // SAFETY: resize_nearest_kernel takes (float* out, const float* inp,
+                    //   const size_t* inp_shape, const size_t* out_shape,
+                    //   const size_t* inp_strides, const size_t* out_strides,
+                    //   const float* scales, size_t ndim, size_t total_out_elements,
+                    //   int coord_mode, int nearest_mode).
+                    let kernel = unsafe {
+                        cache.module().typed_kernel::<(
+                            &mut garboard::DeviceSlice<'_, f32>,
+                            &garboard::DeviceSlice<'_, f32>,
+                            &garboard::DeviceSlice<'_, u64>,
+                            &garboard::DeviceSlice<'_, u64>,
+                            &garboard::DeviceSlice<'_, u64>,
+                            &garboard::DeviceSlice<'_, u64>,
+                            &garboard::DeviceSlice<'_, f32>,
+                            usize, usize, i32, i32,
+                        )>("resize_nearest_kernel")
                     }
+                    .map_err(|e| CudaError::Kernel(format!("resize_nearest_kernel lookup: {}", e)))?;
+
+                    kernel
+                        .launch(
+                            ctx.garboard_stream(),
+                            &config,
+                            (
+                                output.data_f32_mut()?,
+                                input.data_f32()?,
+                                &inp_shape_gpu,
+                                &out_shape_gpu,
+                                &inp_strides_gpu,
+                                &out_strides_gpu,
+                                &scales_gpu,
+                                ndim,
+                                total_out_elements,
+                                coord_mode_int,
+                                nearest_mode_int,
+                            ),
+                        )
+                        .map_err(|e| {
+                            CudaError::Kernel(format!("resize launch failed: {}", e))
+                        })?;
                 }
             }
         }
@@ -1866,76 +2144,106 @@ pub fn gpu_slice_nd(
     let inp_strides = compute_strides(input_shape);
     let out_strides = compute_strides(&out_shape);
 
-    let config = LaunchConfig::for_num_elems(total_out_elements as u32);
+    let config = garboard::LaunchConfig::for_num_elems(total_out_elements as u32);
 
     // Use optimized scalar-argument kernels for 3D and 4D tensors (avoids H2D transfers)
     match (ndim, dtype) {
         // 3D Float32 - optimized path
         (3, crate::cuda::tensor::DType::Float32) => {
             let mut output = pool.get_tensor_f32(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("slice_3d_scalar_kernel")
-                .ok_or_else(|| CudaError::Kernel("slice_3d_scalar_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    // Input strides as scalars
-                    .arg(&(inp_strides[0] as u64))
-                    .arg(&(inp_strides[1] as u64))
-                    .arg(&(inp_strides[2] as u64))
-                    // Output strides as scalars
-                    .arg(&(out_strides[0] as u64))
-                    .arg(&(out_strides[1] as u64))
-                    .arg(&(out_strides[2] as u64))
-                    // Starts as scalars
-                    .arg(&effective_starts[0])
-                    .arg(&effective_starts[1])
-                    .arg(&effective_starts[2])
-                    // Steps as scalars
-                    .arg(&effective_steps[0])
-                    .arg(&effective_steps[1])
-                    .arg(&effective_steps[2])
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| {
-                        CudaError::Kernel(format!("slice_3d_scalar launch failed: {}", e))
-                    })?;
+            // SAFETY: slice_3d_scalar_kernel takes (float* out, const float* inp,
+            //   size_t inp_stride0, size_t inp_stride1, size_t inp_stride2,
+            //   size_t out_stride0, size_t out_stride1, size_t out_stride2,
+            //   long long start0, long long start1, long long start2,
+            //   long long step0, long long step1, long long step2,
+            //   size_t total_out_elements).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    u64, u64, u64,
+                    u64, u64, u64,
+                    i64, i64, i64,
+                    i64, i64, i64,
+                    usize,
+                )>("slice_3d_scalar_kernel")
             }
+            .map_err(|e| {
+                CudaError::Kernel(format!("slice_3d_scalar_kernel lookup: {}", e))
+            })?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        inp_strides[0] as u64,
+                        inp_strides[1] as u64,
+                        inp_strides[2] as u64,
+                        out_strides[0] as u64,
+                        out_strides[1] as u64,
+                        out_strides[2] as u64,
+                        effective_starts[0],
+                        effective_starts[1],
+                        effective_starts[2],
+                        effective_steps[0],
+                        effective_steps[1],
+                        effective_steps[2],
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("slice_3d_scalar launch failed: {}", e))
+                })?;
             Ok(output)
         }
         // 3D Int64 - optimized path
         (3, crate::cuda::tensor::DType::Int64) => {
             let mut output = pool.get_tensor_i64(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("slice_3d_i64_scalar_kernel")
-                .ok_or_else(|| CudaError::Kernel("slice_3d_i64_scalar_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
-                    .arg(&GbKernelArg::new(input.data_i64()?))
-                    .arg(&(inp_strides[0] as u64))
-                    .arg(&(inp_strides[1] as u64))
-                    .arg(&(inp_strides[2] as u64))
-                    .arg(&(out_strides[0] as u64))
-                    .arg(&(out_strides[1] as u64))
-                    .arg(&(out_strides[2] as u64))
-                    .arg(&effective_starts[0])
-                    .arg(&effective_starts[1])
-                    .arg(&effective_starts[2])
-                    .arg(&effective_steps[0])
-                    .arg(&effective_steps[1])
-                    .arg(&effective_steps[2])
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| {
-                        CudaError::Kernel(format!("slice_3d_i64_scalar launch failed: {}", e))
-                    })?;
+            // SAFETY: slice_3d_i64_scalar_kernel mirrors slice_3d_scalar_kernel
+            // with `long long*` (i64) data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    u64, u64, u64,
+                    u64, u64, u64,
+                    i64, i64, i64,
+                    i64, i64, i64,
+                    usize,
+                )>("slice_3d_i64_scalar_kernel")
             }
+            .map_err(|e| {
+                CudaError::Kernel(format!("slice_3d_i64_scalar_kernel lookup: {}", e))
+            })?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i64_mut()?,
+                        input.data_i64()?,
+                        inp_strides[0] as u64,
+                        inp_strides[1] as u64,
+                        inp_strides[2] as u64,
+                        out_strides[0] as u64,
+                        out_strides[1] as u64,
+                        out_strides[2] as u64,
+                        effective_starts[0],
+                        effective_starts[1],
+                        effective_starts[2],
+                        effective_steps[0],
+                        effective_steps[1],
+                        effective_steps[2],
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("slice_3d_i64_scalar launch failed: {}", e))
+                })?;
             Ok(output)
         }
         // 4D Float32 - optimized path (packed params).
@@ -1960,15 +2268,10 @@ pub fn gpu_slice_nd(
             }
             .map_err(|e| CudaError::Kernel(format!("slice_4d_scalar lookup: {}", e)))?;
 
-            let gb_config = garboard::LaunchConfig {
-                grid_dim: config.grid_dim,
-                block_dim: config.block_dim,
-                shared_mem_bytes: config.shared_mem_bytes,
-            };
             kernel
                 .launch(
                     ctx.garboard_stream(),
-                    &gb_config,
+                    &config,
                     (
                         output.data_f32_mut()?,
                         input.data_f32()?,
@@ -2002,15 +2305,10 @@ pub fn gpu_slice_nd(
             }
             .map_err(|e| CudaError::Kernel(format!("slice_4d_i64_scalar lookup: {}", e)))?;
 
-            let gb_config = garboard::LaunchConfig {
-                grid_dim: config.grid_dim,
-                block_dim: config.block_dim,
-                shared_mem_bytes: config.shared_mem_bytes,
-            };
             kernel
                 .launch(
                     ctx.garboard_stream(),
-                    &gb_config,
+                    &config,
                     (
                         output.data_i64_mut()?,
                         input.data_i64()?,
@@ -2033,24 +2331,40 @@ pub fn gpu_slice_nd(
             let steps_gpu = ctx.htod_i64(&effective_steps)?;
 
             let mut output = pool.get_tensor_f32(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("slice_nd_kernel")
-                .ok_or_else(|| CudaError::Kernel("slice_nd_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    .arg(&GbKernelArg::new(&inp_strides_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&starts_gpu))
-                    .arg(&GbKernelArg::new(&steps_gpu))
-                    .arg(&ndim)
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("slice_nd launch failed: {}", e)))?;
+            // SAFETY: slice_nd_kernel takes (float* out, const float* inp,
+            //   const size_t* inp_strides, const size_t* out_strides,
+            //   const long long* starts, const long long* steps,
+            //   size_t ndim, size_t total_out_elements).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                )>("slice_nd_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("slice_nd_kernel lookup: {}", e)))?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &inp_strides_gpu,
+                        &out_strides_gpu,
+                        &starts_gpu,
+                        &steps_gpu,
+                        ndim,
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("slice_nd launch failed: {}", e)))?;
             Ok(output)
         }
         (_, crate::cuda::tensor::DType::Int64) => {
@@ -2061,24 +2375,38 @@ pub fn gpu_slice_nd(
             let steps_gpu = ctx.htod_i64(&effective_steps)?;
 
             let mut output = pool.get_tensor_i64(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("slice_nd_i64_kernel")
-                .ok_or_else(|| CudaError::Kernel("slice_nd_i64_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
-                    .arg(&GbKernelArg::new(input.data_i64()?))
-                    .arg(&GbKernelArg::new(&inp_strides_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&starts_gpu))
-                    .arg(&GbKernelArg::new(&steps_gpu))
-                    .arg(&ndim)
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("slice_nd_i64 launch failed: {}", e)))?;
+            // SAFETY: slice_nd_i64_kernel mirrors slice_nd_kernel with `long long*`
+            // (i64) data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                )>("slice_nd_i64_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("slice_nd_i64_kernel lookup: {}", e)))?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i64_mut()?,
+                        input.data_i64()?,
+                        &inp_strides_gpu,
+                        &out_strides_gpu,
+                        &starts_gpu,
+                        &steps_gpu,
+                        ndim,
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("slice_nd_i64 launch failed: {}", e)))?;
             Ok(output)
         }
         (_, crate::cuda::tensor::DType::Int32) => {
@@ -2089,24 +2417,38 @@ pub fn gpu_slice_nd(
             let steps_gpu = ctx.htod_i64(&effective_steps)?;
 
             let mut output = pool.get_tensor_i32(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("slice_nd_i32_kernel")
-                .ok_or_else(|| CudaError::Kernel("slice_nd_i32_kernel not found".into()))?;
-
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_i32()?))
-                    .arg(&GbKernelArg::new(&inp_strides_gpu))
-                    .arg(&GbKernelArg::new(&out_strides_gpu))
-                    .arg(&GbKernelArg::new(&starts_gpu))
-                    .arg(&GbKernelArg::new(&steps_gpu))
-                    .arg(&ndim)
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("slice_nd_i32 launch failed: {}", e)))?;
+            // SAFETY: slice_nd_i32_kernel mirrors slice_nd_kernel with `int*`
+            // (i32) data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i32>,
+                    &garboard::DeviceSlice<'_, i32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                )>("slice_nd_i32_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("slice_nd_i32_kernel lookup: {}", e)))?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i32_mut()?,
+                        input.data_i32()?,
+                        &inp_strides_gpu,
+                        &out_strides_gpu,
+                        &starts_gpu,
+                        &steps_gpu,
+                        ndim,
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("slice_nd_i32 launch failed: {}", e)))?;
             Ok(output)
         }
     }

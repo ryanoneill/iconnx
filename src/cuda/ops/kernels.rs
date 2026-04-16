@@ -5,6 +5,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "transpose_2d_kernel",
     "transpose_general_kernel",
     "transpose_general_i64_kernel",
+    "transpose_general_i32_kernel",
     "concat_kernel",
     "concat_i64_kernel",
     "concat_i32_kernel",
@@ -113,6 +114,34 @@ extern "C" __global__ void transpose_general_kernel(
 // N-dimensional transpose kernel (Int64)
 extern "C" __global__ void transpose_general_i64_kernel(
     long long* out, const long long* inp,
+    const size_t* in_shape, const size_t* in_strides,
+    const size_t* out_strides, const size_t* perm,
+    size_t ndim, size_t total_elements
+) {
+    size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out_idx >= total_elements) return;
+    size_t out_coords[6];
+    size_t remaining = out_idx;
+    for (size_t d = 0; d < ndim; d++) {
+        out_coords[d] = remaining / out_strides[d];
+        remaining = remaining % out_strides[d];
+    }
+    size_t in_idx = 0;
+    for (size_t d = 0; d < ndim; d++) {
+        in_idx += out_coords[d] * in_strides[perm[d]];
+    }
+    out[out_idx] = inp[in_idx];
+}
+
+// N-dimensional transpose kernel (Int32)
+//
+// Functionally identical to transpose_general_kernel — both move 4-byte
+// scalars by index — but exists as its own symbol so the Rust type system
+// (garboard's TypedKernel) can enforce that an i32 slice is paired with
+// an i32-typed kernel. Pre-migration cudarc could erase the pointer type
+// and reuse the float kernel; garboard cannot.
+extern "C" __global__ void transpose_general_i32_kernel(
+    int* out, const int* inp,
     const size_t* in_shape, const size_t* in_strides,
     const size_t* out_strides, const size_t* perm,
     size_t ndim, size_t total_elements
