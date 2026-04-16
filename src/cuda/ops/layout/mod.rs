@@ -1045,83 +1045,94 @@ fn gpu_pad_constant(
 
     match ndim {
         3 => {
-            let kernel = cache
-                .cudarc_function("pad_3d_scalar_kernel")
-                .ok_or_else(|| CudaError::Kernel("pad_3d_scalar_kernel not found".into()))?;
+            // Pack 15 size_t params: inp_d[3], out_d[3], inp_s[3], out_s[3], pad_b[3].
+            let params: Vec<usize> = [
+                &inp_shape[..3],
+                &out_shape[..3],
+                &inp_strides[..3],
+                &out_strides[..3],
+                &pads_begin[..3],
+            ]
+            .concat();
+            let params_gpu = ctx.htod_usize(&params)?;
 
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    // Input shape
-                    .arg(&inp_shape[0])
-                    .arg(&inp_shape[1])
-                    .arg(&inp_shape[2])
-                    // Output shape
-                    .arg(&out_shape[0])
-                    .arg(&out_shape[1])
-                    .arg(&out_shape[2])
-                    // Input strides
-                    .arg(&inp_strides[0])
-                    .arg(&inp_strides[1])
-                    .arg(&inp_strides[2])
-                    // Output strides
-                    .arg(&out_strides[0])
-                    .arg(&out_strides[1])
-                    .arg(&out_strides[2])
-                    // Pad begin
-                    .arg(&pads_begin[0])
-                    .arg(&pads_begin[1])
-                    .arg(&pads_begin[2])
-                    // Value and total
-                    .arg(&value)
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("pad_3d launch failed: {}", e)))?;
+            // SAFETY: pad_3d_scalar_kernel takes
+            // (float* out, const float* inp, const size_t* params,
+            //  float pad_value, size_t total_out_elements).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    f32,
+                    usize,
+                )>("pad_3d_scalar_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("pad_3d_scalar_kernel lookup: {}", e)))?;
+
+            let gb_config = garboard::LaunchConfig {
+                grid_dim: config.grid_dim,
+                block_dim: config.block_dim,
+                shared_mem_bytes: config.shared_mem_bytes,
+            };
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &gb_config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &params_gpu,
+                        value,
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("pad_3d launch failed: {}", e)))?;
         }
         4 => {
-            let kernel = cache
-                .cudarc_function("pad_4d_scalar_kernel")
-                .ok_or_else(|| CudaError::Kernel("pad_4d_scalar_kernel not found".into()))?;
+            // Pack 20 size_t params: inp_d[4], out_d[4], inp_s[4], out_s[4], pad_b[4].
+            let params: Vec<usize> = [
+                &inp_shape[..4],
+                &out_shape[..4],
+                &inp_strides[..4],
+                &out_strides[..4],
+                &pads_begin[..4],
+            ]
+            .concat();
+            let params_gpu = ctx.htod_usize(&params)?;
 
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    // Input shape
-                    .arg(&inp_shape[0])
-                    .arg(&inp_shape[1])
-                    .arg(&inp_shape[2])
-                    .arg(&inp_shape[3])
-                    // Output shape
-                    .arg(&out_shape[0])
-                    .arg(&out_shape[1])
-                    .arg(&out_shape[2])
-                    .arg(&out_shape[3])
-                    // Input strides
-                    .arg(&inp_strides[0])
-                    .arg(&inp_strides[1])
-                    .arg(&inp_strides[2])
-                    .arg(&inp_strides[3])
-                    // Output strides
-                    .arg(&out_strides[0])
-                    .arg(&out_strides[1])
-                    .arg(&out_strides[2])
-                    .arg(&out_strides[3])
-                    // Pad begin
-                    .arg(&pads_begin[0])
-                    .arg(&pads_begin[1])
-                    .arg(&pads_begin[2])
-                    .arg(&pads_begin[3])
-                    // Value and total
-                    .arg(&value)
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| CudaError::Kernel(format!("pad_4d launch failed: {}", e)))?;
+            // SAFETY: pad_4d_scalar_kernel takes
+            // (float* out, const float* inp, const size_t* params,
+            //  float pad_value, size_t total_out_elements).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    f32,
+                    usize,
+                )>("pad_4d_scalar_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("pad_4d_scalar_kernel lookup: {}", e)))?;
+
+            let gb_config = garboard::LaunchConfig {
+                grid_dim: config.grid_dim,
+                block_dim: config.block_dim,
+                shared_mem_bytes: config.shared_mem_bytes,
+            };
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &gb_config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &params_gpu,
+                        value,
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("pad_4d launch failed: {}", e)))?;
         }
         _ => {
             // Fall back to generic kernel with H2D transfers for other dimensions

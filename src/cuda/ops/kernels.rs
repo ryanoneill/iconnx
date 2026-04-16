@@ -570,18 +570,22 @@ extern "C" __global__ void pad_kernel(
     out[out_idx] = in_bounds ? inp[inp_idx] : pad_value;
 }
 
-// Optimized 3D Pad with scalar parameters (no H2D transfers for shapes/strides)
+// Optimized 3D Pad with packed parameters (avoids 19-arg tuple limit).
+// params layout: [inp_d0..2, out_d0..2, inp_s0..2, out_s0..2, pad_b0..2] = 15 values.
 extern "C" __global__ void pad_3d_scalar_kernel(
     float* out, const float* inp,
-    size_t inp_d0, size_t inp_d1, size_t inp_d2,
-    size_t out_d0, size_t out_d1, size_t out_d2,
-    size_t inp_s0, size_t inp_s1, size_t inp_s2,
-    size_t out_s0, size_t out_s1, size_t out_s2,
-    size_t pad_b0, size_t pad_b1, size_t pad_b2,
+    const size_t* params,
     float pad_value, size_t total_out_elements
 ) {
     size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (out_idx >= total_out_elements) return;
+
+    // Unpack params
+    size_t inp_d0 = params[0], inp_d1 = params[1], inp_d2 = params[2];
+    // out_d0..2 at params[3..6] — unused directly but define output layout.
+    size_t inp_s0 = params[6], inp_s1 = params[7], inp_s2 = params[8];
+    size_t out_s0 = params[9], out_s1 = params[10], out_s2 = params[11];
+    size_t pad_b0 = params[12], pad_b1 = params[13], pad_b2 = params[14];
 
     // Decompose output index into coordinates
     size_t c0 = out_idx / out_s0;
@@ -618,18 +622,22 @@ extern "C" __global__ void pad_3d_scalar_kernel(
     out[out_idx] = in_bounds ? inp[inp_idx] : pad_value;
 }
 
-// Optimized 4D Pad with scalar parameters (no H2D transfers for shapes/strides)
+// Optimized 4D Pad with packed parameters (avoids 24-arg tuple limit).
+// params layout: [inp_d0..3, out_d0..3, inp_s0..3, out_s0..3, pad_b0..3] = 20 values.
 extern "C" __global__ void pad_4d_scalar_kernel(
     float* out, const float* inp,
-    size_t inp_d0, size_t inp_d1, size_t inp_d2, size_t inp_d3,
-    size_t out_d0, size_t out_d1, size_t out_d2, size_t out_d3,
-    size_t inp_s0, size_t inp_s1, size_t inp_s2, size_t inp_s3,
-    size_t out_s0, size_t out_s1, size_t out_s2, size_t out_s3,
-    size_t pad_b0, size_t pad_b1, size_t pad_b2, size_t pad_b3,
+    const size_t* params,
     float pad_value, size_t total_out_elements
 ) {
     size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (out_idx >= total_out_elements) return;
+
+    // Unpack params
+    size_t inp_d0 = params[0], inp_d1 = params[1], inp_d2 = params[2], inp_d3 = params[3];
+    // out_d0..3 at params[4..8] — unused directly.
+    size_t inp_s0 = params[8], inp_s1 = params[9], inp_s2 = params[10], inp_s3 = params[11];
+    size_t out_s0 = params[12], out_s1 = params[13], out_s2 = params[14], out_s3 = params[15];
+    size_t pad_b0 = params[16], pad_b1 = params[17], pad_b2 = params[18], pad_b3 = params[19];
 
     // Decompose output index into coordinates
     size_t c0 = out_idx / out_s0;
