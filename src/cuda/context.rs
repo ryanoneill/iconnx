@@ -173,7 +173,14 @@ impl IconnxCudaContext {
             .garboard_device
             .alloc_uninit::<T>(data.len())
             .map_err(|e| CudaError::Alloc(e.to_string()))?;
-        self.garboard_device
+        // Use the stream-aware copy (`cuMemcpyHtoDAsync`) rather than
+        // `Device::copy_host_to_device` (`cuMemcpyHtoD_v2`). The sync
+        // `_v2` form not only blocks the host but also induces an
+        // implicit cross-stream synchronization with every other
+        // in-flight stream — at ~25 us per call that overhead
+        // compounded across every layout op's shape/stride upload into
+        // a measurable per-inference regression.
+        self.garboard_stream
             .copy_host_to_device(data, &mut slice)
             .map_err(|e| CudaError::Transfer(e.to_string()))?;
         Ok(slice)
