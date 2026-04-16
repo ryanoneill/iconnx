@@ -8,7 +8,8 @@
 use super::context::{CudaError, IconnxCudaContext};
 use super::conv::{add_bias, gpu_conv2d, gpu_conv_transpose_2d, Conv2dParams, ConvKernelCache};
 use super::cudnn::{
-    cudnn_conv_1d, cudnn_conv_transpose_1d, cudnn_lstm_forward, pack_lstm_weights_for_cudnn,
+    garboard_conv_1d, garboard_conv_transpose_1d, cudnn_lstm_forward,
+    pack_lstm_weights_for_cudnn,
     ConvAlgoCache, CudnnHandle, PackedLstmWeights, Workspace as CudnnWorkspace,
 };
 use super::cufft::StftKernelCache;
@@ -1503,14 +1504,9 @@ impl GpuGraphExecutor {
                         let padding = pads.first().copied().unwrap_or(0) as usize;
                         let dilation = dilations.first().copied().unwrap_or(1) as usize;
 
-                        // Use cuDNN for convolution
-                        let mut workspace = self.cudnn_workspace.borrow_mut();
-                        let mut cache = self.conv_algo_cache.borrow_mut();
-                        let mut output = cudnn_conv_1d(
-                            &self.cudnn_handle,
+                        // Use cuDNN (via garboard DnnContext) for convolution.
+                        let mut output = garboard_conv_1d(
                             &self.ctx,
-                            &mut workspace,
-                            &mut cache,
                             inputs[0],
                             inputs[1],
                             stride,
@@ -1590,10 +1586,7 @@ impl GpuGraphExecutor {
                     let output_pad = output_padding.first().copied().unwrap_or(0) as usize;
                     let dilation = dilations.first().copied().unwrap_or(1) as usize;
 
-                    // Use cuDNN for transposed convolution
-                    let mut workspace = self.cudnn_workspace.borrow_mut();
-                    let mut cache = self.conv_algo_cache.borrow_mut();
-
+                    // Use cuDNN (via garboard DnnContext) for transposed convolution.
                     // Debug: Print input stats for ConvTranspose
                     if std::env::var("DEBUG_CONV_TRANSPOSE").is_ok() {
                         let inp = inputs[0];
@@ -1616,11 +1609,8 @@ impl GpuGraphExecutor {
                         }
                     }
 
-                    let mut output = cudnn_conv_transpose_1d(
-                        &self.cudnn_handle,
+                    let mut output = garboard_conv_transpose_1d(
                         &self.ctx,
-                        &mut workspace,
-                        &mut cache,
                         inputs[0],
                         inputs[1],
                         stride,

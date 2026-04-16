@@ -15,11 +15,12 @@
 //! Cross-backend synchronization is handled by `sync()` which drains
 //! both streams.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream};
 use garboard::{
-    BlasContext, Device as GbDevice, DeviceSlice as GbDeviceSlice, Stream as GbStream,
+    BlasContext, Device as GbDevice, DeviceSlice as GbDeviceSlice, DnnContext, Stream as GbStream,
 };
 
 use super::bridge::CudarcView;
@@ -46,6 +47,10 @@ pub struct IconnxCudaContext {
     /// cuBLAS handle (via garboard), bound to `garboard_stream` on each
     /// BLAS call.
     blas: BlasContext<'static>,
+    /// cuDNN handle (via garboard). `RefCell` because `DnnContext`
+    /// operations take `&mut self` (workspace auto-grows), but
+    /// `IconnxCudaContext` is passed as `&ctx` at inference sites.
+    dnn: RefCell<DnnContext<'static>>,
 }
 
 impl IconnxCudaContext {
@@ -83,6 +88,9 @@ impl IconnxCudaContext {
         let blas = garboard_device
             .create_blas_context()
             .map_err(|e| CudaError::Cublas(e.to_string()))?;
+        let dnn = garboard_device
+            .create_dnn_context()
+            .map_err(|e| CudaError::Cudnn(e.to_string()))?;
 
         Ok(Self {
             context,
@@ -90,6 +98,7 @@ impl IconnxCudaContext {
             garboard_device,
             garboard_stream,
             blas,
+            dnn: RefCell::new(dnn),
         })
     }
 
@@ -110,6 +119,13 @@ impl IconnxCudaContext {
     /// returns the handle to pair with `garboard_stream()`.
     pub fn blas(&self) -> &BlasContext<'static> {
         &self.blas
+    }
+
+    /// Mutable handle on the garboard cuDNN context. The workspace may
+    /// auto-grow during `conv_*` / `rnn_*` calls, hence `&mut self` on
+    /// `DnnContext` methods. We hand out a `RefMut` via `RefCell`.
+    pub fn dnn(&self) -> std::cell::RefMut<'_, DnnContext<'static>> {
+        self.dnn.borrow_mut()
     }
 
     /// Get the garboard device (leaked to `'static`). Use this for

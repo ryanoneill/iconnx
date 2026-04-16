@@ -875,6 +875,151 @@ pub fn cudnn_conv_1d(
 }
 
 // =============================================================================
+// Garboard-based conv (replaces cudnn_conv_1d / cudnn_conv_transpose_1d)
+// =============================================================================
+
+/// 1D Convolution via garboard's DnnContext.
+///
+/// Replaces `cudnn_conv_1d` (the function above) — same operation, but
+/// all descriptor management, workspace sizing, and algorithm selection
+/// happen inside garboard. Call sites that used `cudnn_conv_1d` now call
+/// `garboard_conv_1d` and drop the `handle`, `workspace`, `cache` args.
+pub fn garboard_conv_1d(
+    ctx: &IconnxCudaContext,
+    input: &GpuTensor,
+    kernel: &GpuTensor,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    groups: usize,
+) -> Result<GpuTensor, CudaError> {
+    let input_shape = input.shape();
+    let kernel_shape = kernel.shape();
+
+    if input_shape.len() != 3 {
+        return Err(CudaError::Cudnn(format!(
+            "Expected 3D input [N,C,L], got {:?}",
+            input_shape
+        )));
+    }
+    if kernel_shape.len() != 3 {
+        return Err(CudaError::Cudnn(format!(
+            "Expected 3D kernel [C_out,C_in/g,K], got {:?}",
+            kernel_shape
+        )));
+    }
+
+    let batch = input_shape[0];
+    let in_channels = input_shape[1];
+    let in_length = input_shape[2];
+    let out_channels = kernel_shape[0];
+    let in_channels_per_group = kernel_shape[1];
+    let kernel_size = kernel_shape[2];
+
+    let out_length = (in_length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+
+    let config = garboard::ConvForwardConfig {
+        input_dims: [batch as i32, in_channels as i32, 1, in_length as i32],
+        filter_dims: [
+            out_channels as i32,
+            in_channels_per_group as i32,
+            1,
+            kernel_size as i32,
+        ],
+        padding: [0, padding as i32],
+        stride: [1, stride as i32],
+        dilation: [1, dilation as i32],
+        groups: groups as i32,
+        algorithm: None, // cuDNN heuristic picks per-call.
+    };
+
+    let mut output = GpuTensor::zeros_f32(ctx, vec![batch, out_channels, out_length])?;
+
+    ctx.dnn()
+        .conv_forward(
+            ctx.garboard_stream(),
+            &config,
+            input.data_f32()?,
+            kernel.data_f32()?,
+            output.data_f32_mut()?,
+        )
+        .map_err(|e| CudaError::Cudnn(e.to_string()))?;
+
+    Ok(output)
+}
+
+/// 1D ConvTranspose via garboard's DnnContext.
+///
+/// Replaces `cudnn_conv_transpose_1d` — same semantics, garboard manages
+/// descriptors and workspace internally.
+pub fn garboard_conv_transpose_1d(
+    ctx: &IconnxCudaContext,
+    input: &GpuTensor,
+    kernel: &GpuTensor,
+    stride: usize,
+    padding: usize,
+    output_padding: usize,
+    dilation: usize,
+    groups: usize,
+) -> Result<GpuTensor, CudaError> {
+    let input_shape = input.shape();
+    let kernel_shape = kernel.shape();
+
+    if input_shape.len() != 3 {
+        return Err(CudaError::Cudnn(format!(
+            "Expected 3D input [N,C,L], got {:?}",
+            input_shape
+        )));
+    }
+    if kernel_shape.len() != 3 {
+        return Err(CudaError::Cudnn(format!(
+            "Expected 3D kernel [C_in,C_out/g,K], got {:?}",
+            kernel_shape
+        )));
+    }
+
+    let batch = input_shape[0];
+    let in_channels = input_shape[1];
+    let in_length = input_shape[2];
+    let kernel_size = kernel_shape[2];
+    let out_channels_per_group = kernel_shape[1];
+    let out_channels = out_channels_per_group * groups;
+
+    let out_length =
+        (in_length - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + output_padding + 1;
+
+    let config = garboard::ConvBwdDataConfig {
+        input_dims: [batch as i32, in_channels as i32, 1, in_length as i32],
+        filter_dims: [
+            in_channels as i32,
+            out_channels_per_group as i32,
+            1,
+            kernel_size as i32,
+        ],
+        output_dims: [batch as i32, out_channels as i32, 1, out_length as i32],
+        padding: [0, padding as i32],
+        stride: [1, stride as i32],
+        dilation: [1, dilation as i32],
+        groups: groups as i32,
+        algorithm: None,
+    };
+
+    let mut output = GpuTensor::zeros_f32(ctx, vec![batch, out_channels, out_length])?;
+
+    ctx.dnn()
+        .conv_backward_data(
+            ctx.garboard_stream(),
+            &config,
+            kernel.data_f32()?,
+            input.data_f32()?,
+            output.data_f32_mut()?,
+        )
+        .map_err(|e| CudaError::Cudnn(e.to_string()))?;
+
+    Ok(output)
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
