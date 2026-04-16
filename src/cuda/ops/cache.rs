@@ -38,10 +38,10 @@ const CUDARC_BRIDGE_KERNELS: &[&str] = &[
     // pad_4d_scalar_kernel — migrated to garboard (packed params).
     // pad_reflect_3d_kernel — migrated to garboard (packed params).
     "resize_nearest_kernel",
-    "resize_3d_scalar_kernel",
-    "resize_4d_scalar_kernel",
+    // resize_3d_scalar_kernel — migrated to garboard (packed params).
+    // resize_4d_scalar_kernel — migrated to garboard (packed params).
     "resize_linear_3d_kernel",
-    "resize_linear_4d_kernel",
+    // resize_linear_4d_kernel — migrated to garboard (packed params).
     "scatter_nd_kernel",
     "slice_kernel",
     "slice_nd_kernel",

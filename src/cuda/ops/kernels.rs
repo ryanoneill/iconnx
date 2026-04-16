@@ -1075,18 +1075,21 @@ __device__ size_t resize_apply_nearest(float coord, size_t max_idx, int nearest_
 // Optimized 3D Resize with scalar parameters (no H2D transfers)
 // coord_mode: 0 = asymmetric, 1 = half_pixel
 // nearest_mode: 0 = floor, 1 = round_prefer_floor
+// Optimized 3D Resize nearest with packed params (avoids 20-arg limit).
+// params layout: [inp_d0..2, out_d0..2, inp_s0..2, out_s0..2] = 12 values.
 extern "C" __global__ void resize_3d_scalar_kernel(
     float* out, const float* inp,
-    size_t inp_d0, size_t inp_d1, size_t inp_d2,
-    size_t out_d0, size_t out_d1, size_t out_d2,
-    size_t inp_s0, size_t inp_s1, size_t inp_s2,
-    size_t out_s0, size_t out_s1, size_t out_s2,
+    const size_t* params,
     float scale0, float scale1, float scale2,
     size_t total_out_elements,
     int coord_mode, int nearest_mode
 ) {
     size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (out_idx >= total_out_elements) return;
+
+    size_t inp_d0 = params[0], inp_d1 = params[1], inp_d2 = params[2];
+    size_t inp_s0 = params[6], inp_s1 = params[7], inp_s2 = params[8];
+    size_t out_s0 = params[9], out_s1 = params[10], out_s2 = params[11];
 
     // Decompose output index into coordinates
     size_t c0 = out_idx / out_s0;
@@ -1107,21 +1110,21 @@ extern "C" __global__ void resize_3d_scalar_kernel(
     out[out_idx] = inp[inp_idx];
 }
 
-// Optimized 4D Resize with scalar parameters (no H2D transfers)
-// coord_mode: 0 = asymmetric, 1 = half_pixel
-// nearest_mode: 0 = floor, 1 = round_prefer_floor
+// Optimized 4D Resize nearest with packed params (avoids 25-arg limit).
+// params layout: [inp_d0..3, out_d0..3, inp_s0..3, out_s0..3] = 16 values.
 extern "C" __global__ void resize_4d_scalar_kernel(
     float* out, const float* inp,
-    size_t inp_d0, size_t inp_d1, size_t inp_d2, size_t inp_d3,
-    size_t out_d0, size_t out_d1, size_t out_d2, size_t out_d3,
-    size_t inp_s0, size_t inp_s1, size_t inp_s2, size_t inp_s3,
-    size_t out_s0, size_t out_s1, size_t out_s2, size_t out_s3,
+    const size_t* params,
     float scale0, float scale1, float scale2, float scale3,
     size_t total_out_elements,
     int coord_mode, int nearest_mode
 ) {
     size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (out_idx >= total_out_elements) return;
+
+    size_t inp_d0 = params[0], inp_d1 = params[1], inp_d2 = params[2], inp_d3 = params[3];
+    size_t inp_s0 = params[8], inp_s1 = params[9], inp_s2 = params[10], inp_s3 = params[11];
+    size_t out_s0 = params[12], out_s1 = params[13], out_s2 = params[14], out_s3 = params[15];
 
     // Decompose output index into coordinates
     size_t c0 = out_idx / out_s0;
@@ -1217,17 +1220,21 @@ extern "C" __global__ void resize_linear_3d_kernel(
 
 // 4D Linear interpolation for Resize
 // coord_mode: 0 = asymmetric, 1 = half_pixel
+// 4D Linear interpolation with packed params (avoids 20-arg limit).
+// params layout: [inp_d0..3, out_d0..3, inp_s0..3] = 12 values.
 extern "C" __global__ void resize_linear_4d_kernel(
     float* out, const float* inp,
-    size_t inp_d0, size_t inp_d1, size_t inp_d2, size_t inp_d3,
-    size_t out_d0, size_t out_d1, size_t out_d2, size_t out_d3,
-    size_t inp_s0, size_t inp_s1, size_t inp_s2, size_t inp_s3,
+    const size_t* params,
     float scale0, float scale1, float scale2, float scale3,
     size_t total_out_elements,
     int coord_mode
 ) {
     size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (out_idx >= total_out_elements) return;
+
+    size_t inp_d0 = params[0], inp_d1 = params[1], inp_d2 = params[2], inp_d3 = params[3];
+    size_t out_d0 = params[4], out_d1 = params[5], out_d2 = params[6], out_d3 = params[7];
+    size_t inp_s0 = params[8], inp_s1 = params[9], inp_s2 = params[10], inp_s3 = params[11];
 
     // Decompose output index into coordinates
     size_t out_s0 = out_d1 * out_d2 * out_d3;

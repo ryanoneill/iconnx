@@ -1492,46 +1492,47 @@ pub fn gpu_resize(
                     }
                 }
                 4 => {
-                    let kernel = cache
-                        .cudarc_function("resize_linear_4d_kernel")
-                        .ok_or_else(|| {
-                            CudaError::Kernel("resize_linear_4d_kernel not found".into())
-                        })?;
+                    // Pack [inp_d0..3, out_d0..3, inp_s0..3] = 12 params.
+                    let params: Vec<usize> = [
+                        &inp_shape[..4],
+                        &out_shape[..4],
+                        &inp_strides[..4],
+                    ]
+                    .concat();
+                    let params_gpu = ctx.htod_usize(&params)?;
 
-                    unsafe {
-                        ctx.stream()
-                            .launch_builder(kernel)
-                            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                            .arg(&GbKernelArg::new(input.data_f32()?))
-                            // Input shape
-                            .arg(&inp_shape[0])
-                            .arg(&inp_shape[1])
-                            .arg(&inp_shape[2])
-                            .arg(&inp_shape[3])
-                            // Output shape
-                            .arg(&out_shape[0])
-                            .arg(&out_shape[1])
-                            .arg(&out_shape[2])
-                            .arg(&out_shape[3])
-                            // Input strides
-                            .arg(&inp_strides[0])
-                            .arg(&inp_strides[1])
-                            .arg(&inp_strides[2])
-                            .arg(&inp_strides[3])
-                            // Scales
-                            .arg(&scales[0])
-                            .arg(&scales[1])
-                            .arg(&scales[2])
-                            .arg(&scales[3])
-                            // Total
-                            .arg(&total_out_elements)
-                            // Coord mode
-                            .arg(&coord_mode_int)
-                            .launch(config)
-                            .map_err(|e| {
-                                CudaError::Kernel(format!("resize_linear_4d launch failed: {}", e))
-                            })?;
+                    let kernel = unsafe {
+                        cache.module().typed_kernel::<(
+                            &mut garboard::DeviceSlice<'_, f32>,
+                            &garboard::DeviceSlice<'_, f32>,
+                            &garboard::DeviceSlice<'_, u64>,
+                            f32, f32, f32, f32,
+                            usize, i32,
+                        )>("resize_linear_4d_kernel")
                     }
+                    .map_err(|e| CudaError::Kernel(format!("resize_linear_4d lookup: {}", e)))?;
+
+                    let gb_config = garboard::LaunchConfig {
+                        grid_dim: config.grid_dim,
+                        block_dim: config.block_dim,
+                        shared_mem_bytes: config.shared_mem_bytes,
+                    };
+                    kernel
+                        .launch(
+                            ctx.garboard_stream(),
+                            &gb_config,
+                            (
+                                output.data_f32_mut()?,
+                                input.data_f32()?,
+                                &params_gpu,
+                                scales[0], scales[1], scales[2], scales[3],
+                                total_out_elements,
+                                coord_mode_int,
+                            ),
+                        )
+                        .map_err(|e| {
+                            CudaError::Kernel(format!("resize_linear_4d launch failed: {}", e))
+                        })?;
                 }
                 _ => {
                     return Err(CudaError::Kernel(format!(
@@ -1545,95 +1546,94 @@ pub fn gpu_resize(
             // Nearest-neighbor interpolation
             match ndim {
                 3 => {
-                    let kernel = cache
-                        .cudarc_function("resize_3d_scalar_kernel")
-                        .ok_or_else(|| {
-                            CudaError::Kernel("resize_3d_scalar_kernel not found".into())
-                        })?;
+                    // Pack [inp_d0..2, out_d0..2, inp_s0..2, out_s0..2] = 12 params.
+                    let params: Vec<usize> = [
+                        &inp_shape[..3],
+                        &out_shape[..3],
+                        &inp_strides[..3],
+                        &out_strides[..3],
+                    ]
+                    .concat();
+                    let params_gpu = ctx.htod_usize(&params)?;
 
-                    unsafe {
-                        ctx.stream()
-                            .launch_builder(kernel)
-                            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                            .arg(&GbKernelArg::new(input.data_f32()?))
-                            // Input shape
-                            .arg(&inp_shape[0])
-                            .arg(&inp_shape[1])
-                            .arg(&inp_shape[2])
-                            // Output shape
-                            .arg(&out_shape[0])
-                            .arg(&out_shape[1])
-                            .arg(&out_shape[2])
-                            // Input strides
-                            .arg(&inp_strides[0])
-                            .arg(&inp_strides[1])
-                            .arg(&inp_strides[2])
-                            // Output strides
-                            .arg(&out_strides[0])
-                            .arg(&out_strides[1])
-                            .arg(&out_strides[2])
-                            // Scales
-                            .arg(&scales[0])
-                            .arg(&scales[1])
-                            .arg(&scales[2])
-                            // Total
-                            .arg(&total_out_elements)
-                            // Modes
-                            .arg(&coord_mode_int)
-                            .arg(&nearest_mode_int)
-                            .launch(config)
-                            .map_err(|e| {
-                                CudaError::Kernel(format!("resize_3d launch failed: {}", e))
-                            })?;
+                    let kernel = unsafe {
+                        cache.module().typed_kernel::<(
+                            &mut garboard::DeviceSlice<'_, f32>,
+                            &garboard::DeviceSlice<'_, f32>,
+                            &garboard::DeviceSlice<'_, u64>,
+                            f32, f32, f32,
+                            usize, i32, i32,
+                        )>("resize_3d_scalar_kernel")
                     }
+                    .map_err(|e| CudaError::Kernel(format!("resize_3d_scalar lookup: {}", e)))?;
+
+                    let gb_config = garboard::LaunchConfig {
+                        grid_dim: config.grid_dim,
+                        block_dim: config.block_dim,
+                        shared_mem_bytes: config.shared_mem_bytes,
+                    };
+                    kernel
+                        .launch(
+                            ctx.garboard_stream(),
+                            &gb_config,
+                            (
+                                output.data_f32_mut()?,
+                                input.data_f32()?,
+                                &params_gpu,
+                                scales[0], scales[1], scales[2],
+                                total_out_elements,
+                                coord_mode_int,
+                                nearest_mode_int,
+                            ),
+                        )
+                        .map_err(|e| {
+                            CudaError::Kernel(format!("resize_3d launch failed: {}", e))
+                        })?;
                 }
                 4 => {
-                    let kernel = cache
-                        .cudarc_function("resize_4d_scalar_kernel")
-                        .ok_or_else(|| {
-                            CudaError::Kernel("resize_4d_scalar_kernel not found".into())
-                        })?;
+                    // Pack [inp_d0..3, out_d0..3, inp_s0..3, out_s0..3] = 16 params.
+                    let params: Vec<usize> = [
+                        &inp_shape[..4],
+                        &out_shape[..4],
+                        &inp_strides[..4],
+                        &out_strides[..4],
+                    ]
+                    .concat();
+                    let params_gpu = ctx.htod_usize(&params)?;
 
-                    unsafe {
-                        ctx.stream()
-                            .launch_builder(kernel)
-                            .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                            .arg(&GbKernelArg::new(input.data_f32()?))
-                            // Input shape
-                            .arg(&inp_shape[0])
-                            .arg(&inp_shape[1])
-                            .arg(&inp_shape[2])
-                            .arg(&inp_shape[3])
-                            // Output shape
-                            .arg(&out_shape[0])
-                            .arg(&out_shape[1])
-                            .arg(&out_shape[2])
-                            .arg(&out_shape[3])
-                            // Input strides
-                            .arg(&inp_strides[0])
-                            .arg(&inp_strides[1])
-                            .arg(&inp_strides[2])
-                            .arg(&inp_strides[3])
-                            // Output strides
-                            .arg(&out_strides[0])
-                            .arg(&out_strides[1])
-                            .arg(&out_strides[2])
-                            .arg(&out_strides[3])
-                            // Scales
-                            .arg(&scales[0])
-                            .arg(&scales[1])
-                            .arg(&scales[2])
-                            .arg(&scales[3])
-                            // Total
-                            .arg(&total_out_elements)
-                            // Modes
-                            .arg(&coord_mode_int)
-                            .arg(&nearest_mode_int)
-                            .launch(config)
-                            .map_err(|e| {
-                                CudaError::Kernel(format!("resize_4d launch failed: {}", e))
-                            })?;
+                    let kernel = unsafe {
+                        cache.module().typed_kernel::<(
+                            &mut garboard::DeviceSlice<'_, f32>,
+                            &garboard::DeviceSlice<'_, f32>,
+                            &garboard::DeviceSlice<'_, u64>,
+                            f32, f32, f32, f32,
+                            usize, i32, i32,
+                        )>("resize_4d_scalar_kernel")
                     }
+                    .map_err(|e| CudaError::Kernel(format!("resize_4d_scalar lookup: {}", e)))?;
+
+                    let gb_config = garboard::LaunchConfig {
+                        grid_dim: config.grid_dim,
+                        block_dim: config.block_dim,
+                        shared_mem_bytes: config.shared_mem_bytes,
+                    };
+                    kernel
+                        .launch(
+                            ctx.garboard_stream(),
+                            &gb_config,
+                            (
+                                output.data_f32_mut()?,
+                                input.data_f32()?,
+                                &params_gpu,
+                                scales[0], scales[1], scales[2], scales[3],
+                                total_out_elements,
+                                coord_mode_int,
+                                nearest_mode_int,
+                            ),
+                        )
+                        .map_err(|e| {
+                            CudaError::Kernel(format!("resize_4d launch failed: {}", e))
+                        })?;
                 }
                 _ => {
                     // Fall back to generic kernel with H2D transfers for other dimensions
