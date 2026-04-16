@@ -23,8 +23,6 @@ use garboard::{
     BlasContext, Device as GbDevice, DeviceSlice as GbDeviceSlice, DnnContext, Stream as GbStream,
 };
 
-use super::bridge::CudarcView;
-
 /// Iconnx CUDA context — manages GPU device, stream, BLAS, etc.
 pub struct IconnxCudaContext {
     // ---- cudarc (residual: layout bridge kernels, cuDNN) ----
@@ -241,22 +239,21 @@ impl IconnxCudaContext {
         self.zero_slice(slice)
     }
 
-    /// Internal helper: zero a garboard slice via cudarc's `memset_zeros`.
-    /// Garboard has no in-place memset for existing slices, so during the
-    /// migration we bridge to cudarc. Future PRs will replace this with a
-    /// garboard-native API (or add one).
-    fn zero_slice<T>(&self, slice: &mut GbDeviceSlice<'static, T>) -> Result<(), CudaError>
-    where
-        T: bytemuck::Pod + cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
-    {
-        // SAFETY: the slice is currently owned exclusively by us (&mut),
-        // the cudarc stream is associated with the same CUDA context as
-        // the garboard device (same ordinal), and `memset_zeros` only
-        // writes bytes — the target type does not need to be valid for T
-        // after the operation.
-        let mut view = unsafe { CudarcView::borrow_mut(&self.stream, slice) };
-        self.stream
-            .memset_zeros(view.as_mut_slice())
+    /// Internal helper: zero a garboard slice on the garboard user stream.
+    ///
+    /// Uses garboard's `Stream::memset_zero`, which enqueues
+    /// `cuMemsetD8Async` on the garboard user stream — no null-stream
+    /// involvement, so no implicit cross-stream synchronization with
+    /// subsequent kernel launches. This is the fix for the ~76% inference
+    /// regression observed when zeroing was routed through cudarc's null
+    /// stream: each transition forced an implicit sync (~30–80μs), and
+    /// with ~2400 ops per inference the overhead compounded.
+    fn zero_slice<T: bytemuck::Pod>(
+        &self,
+        slice: &mut GbDeviceSlice<'static, T>,
+    ) -> Result<(), CudaError> {
+        self.garboard_stream
+            .memset_zero(slice)
             .map_err(|e| CudaError::Memory(e.to_string()))
     }
 }
