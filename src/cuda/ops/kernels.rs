@@ -1462,18 +1462,26 @@ extern "C" __global__ void slice_3d_i64_scalar_kernel(
 }
 
 // Optimized 4D Slice with scalar parameters (no H2D transfers)
+// Optimized 4D Slice with packed params (avoids 19-arg limit).
+// strides layout: [inp_s0..3, out_s0..3] = 8 size_t values.
+// slice_params layout: [start0..3, step0..3] = 8 long long values.
 extern "C" __global__ void slice_4d_scalar_kernel(
     float* out, const float* inp,
-    size_t inp_stride0, size_t inp_stride1, size_t inp_stride2, size_t inp_stride3,
-    size_t out_stride0, size_t out_stride1, size_t out_stride2, size_t out_stride3,
-    long long start0, long long start1, long long start2, long long start3,
-    long long step0, long long step1, long long step2, long long step3,
+    const size_t* strides, const long long* slice_params,
     size_t total_out_elements
 ) {
     size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (out_idx >= total_out_elements) return;
 
-    // Decompose flat index to 4D coordinates
+    size_t inp_stride0 = strides[0], inp_stride1 = strides[1];
+    size_t inp_stride2 = strides[2], inp_stride3 = strides[3];
+    size_t out_stride0 = strides[4], out_stride1 = strides[5];
+    size_t out_stride2 = strides[6];
+    long long start0 = slice_params[0], start1 = slice_params[1];
+    long long start2 = slice_params[2], start3 = slice_params[3];
+    long long step0 = slice_params[4], step1 = slice_params[5];
+    long long step2 = slice_params[6], step3 = slice_params[7];
+
     size_t c0 = out_idx / out_stride0;
     size_t rem = out_idx % out_stride0;
     size_t c1 = rem / out_stride1;
@@ -1481,7 +1489,6 @@ extern "C" __global__ void slice_4d_scalar_kernel(
     size_t c2 = rem / out_stride2;
     size_t c3 = rem % out_stride2;
 
-    // Map to input coordinates
     size_t inp_idx = (size_t)(start0 + (long long)c0 * step0) * inp_stride0
                    + (size_t)(start1 + (long long)c1 * step1) * inp_stride1
                    + (size_t)(start2 + (long long)c2 * step2) * inp_stride2
@@ -1490,17 +1497,23 @@ extern "C" __global__ void slice_4d_scalar_kernel(
     out[out_idx] = inp[inp_idx];
 }
 
-// Optimized 4D Slice for Int64 with scalar parameters
+// Optimized 4D Slice for Int64 with packed params (same layout as f32 variant).
 extern "C" __global__ void slice_4d_i64_scalar_kernel(
     long long* out, const long long* inp,
-    size_t inp_stride0, size_t inp_stride1, size_t inp_stride2, size_t inp_stride3,
-    size_t out_stride0, size_t out_stride1, size_t out_stride2, size_t out_stride3,
-    long long start0, long long start1, long long start2, long long start3,
-    long long step0, long long step1, long long step2, long long step3,
+    const size_t* strides, const long long* slice_params,
     size_t total_out_elements
 ) {
     size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (out_idx >= total_out_elements) return;
+
+    size_t inp_stride0 = strides[0], inp_stride1 = strides[1];
+    size_t inp_stride2 = strides[2], inp_stride3 = strides[3];
+    size_t out_stride0 = strides[4], out_stride1 = strides[5];
+    size_t out_stride2 = strides[6];
+    long long start0 = slice_params[0], start1 = slice_params[1];
+    long long start2 = slice_params[2], start3 = slice_params[3];
+    long long step0 = slice_params[4], step1 = slice_params[5];
+    long long step2 = slice_params[6], step3 = slice_params[7];
 
     size_t c0 = out_idx / out_stride0;
     size_t rem = out_idx % out_stride0;

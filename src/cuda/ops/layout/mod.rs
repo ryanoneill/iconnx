@@ -1938,80 +1938,90 @@ pub fn gpu_slice_nd(
             }
             Ok(output)
         }
-        // 4D Float32 - optimized path
+        // 4D Float32 - optimized path (packed params).
         (4, crate::cuda::tensor::DType::Float32) => {
             let mut output = pool.get_tensor_f32(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("slice_4d_scalar_kernel")
-                .ok_or_else(|| CudaError::Kernel("slice_4d_scalar_kernel not found".into()))?;
 
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_f32_mut()?))
-                    .arg(&GbKernelArg::new(input.data_f32()?))
-                    // Input strides as scalars
-                    .arg(&(inp_strides[0] as u64))
-                    .arg(&(inp_strides[1] as u64))
-                    .arg(&(inp_strides[2] as u64))
-                    .arg(&(inp_strides[3] as u64))
-                    // Output strides as scalars
-                    .arg(&(out_strides[0] as u64))
-                    .arg(&(out_strides[1] as u64))
-                    .arg(&(out_strides[2] as u64))
-                    .arg(&(out_strides[3] as u64))
-                    // Starts as scalars
-                    .arg(&effective_starts[0])
-                    .arg(&effective_starts[1])
-                    .arg(&effective_starts[2])
-                    .arg(&effective_starts[3])
-                    // Steps as scalars
-                    .arg(&effective_steps[0])
-                    .arg(&effective_steps[1])
-                    .arg(&effective_steps[2])
-                    .arg(&effective_steps[3])
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| {
-                        CudaError::Kernel(format!("slice_4d_scalar launch failed: {}", e))
-                    })?;
+            // strides: [inp_s0..3, out_s0..3] = 8 values.
+            let strides_packed: Vec<usize> = [&inp_strides[..4], &out_strides[..4]].concat();
+            let strides_gpu = ctx.htod_usize(&strides_packed)?;
+            // slice_params: [start0..3, step0..3] = 8 values.
+            let slice_packed: Vec<i64> = [&effective_starts[..4], &effective_steps[..4]].concat();
+            let slice_gpu = ctx.htod_i64(&slice_packed)?;
+
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                )>("slice_4d_scalar_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("slice_4d_scalar lookup: {}", e)))?;
+
+            let gb_config = garboard::LaunchConfig {
+                grid_dim: config.grid_dim,
+                block_dim: config.block_dim,
+                shared_mem_bytes: config.shared_mem_bytes,
+            };
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &gb_config,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &strides_gpu,
+                        &slice_gpu,
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("slice_4d_scalar launch failed: {}", e))
+                })?;
             Ok(output)
         }
-        // 4D Int64 - optimized path
+        // 4D Int64 - optimized path (packed params).
         (4, crate::cuda::tensor::DType::Int64) => {
             let mut output = pool.get_tensor_i64(ctx, out_shape.clone())?;
-            let kernel = cache
-                .cudarc_function("slice_4d_i64_scalar_kernel")
-                .ok_or_else(|| CudaError::Kernel("slice_4d_i64_scalar_kernel not found".into()))?;
 
-            unsafe {
-                ctx.stream()
-                    .launch_builder(kernel)
-                    .arg(&GbKernelArg::new_mut(output.data_i64_mut()?))
-                    .arg(&GbKernelArg::new(input.data_i64()?))
-                    .arg(&(inp_strides[0] as u64))
-                    .arg(&(inp_strides[1] as u64))
-                    .arg(&(inp_strides[2] as u64))
-                    .arg(&(inp_strides[3] as u64))
-                    .arg(&(out_strides[0] as u64))
-                    .arg(&(out_strides[1] as u64))
-                    .arg(&(out_strides[2] as u64))
-                    .arg(&(out_strides[3] as u64))
-                    .arg(&effective_starts[0])
-                    .arg(&effective_starts[1])
-                    .arg(&effective_starts[2])
-                    .arg(&effective_starts[3])
-                    .arg(&effective_steps[0])
-                    .arg(&effective_steps[1])
-                    .arg(&effective_steps[2])
-                    .arg(&effective_steps[3])
-                    .arg(&total_out_elements)
-                    .launch(config)
-                    .map_err(|e| {
-                        CudaError::Kernel(format!("slice_4d_i64_scalar launch failed: {}", e))
-                    })?;
+            let strides_packed: Vec<usize> = [&inp_strides[..4], &out_strides[..4]].concat();
+            let strides_gpu = ctx.htod_usize(&strides_packed)?;
+            let slice_packed: Vec<i64> = [&effective_starts[..4], &effective_steps[..4]].concat();
+            let slice_gpu = ctx.htod_i64(&slice_packed)?;
+
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                )>("slice_4d_i64_scalar_kernel")
             }
+            .map_err(|e| CudaError::Kernel(format!("slice_4d_i64_scalar lookup: {}", e)))?;
+
+            let gb_config = garboard::LaunchConfig {
+                grid_dim: config.grid_dim,
+                block_dim: config.block_dim,
+                shared_mem_bytes: config.shared_mem_bytes,
+            };
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &gb_config,
+                    (
+                        output.data_i64_mut()?,
+                        input.data_i64()?,
+                        &strides_gpu,
+                        &slice_gpu,
+                        total_out_elements,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("slice_4d_i64_scalar launch failed: {}", e))
+                })?;
             Ok(output)
         }
         // Fallback: use general N-D kernel with GPU arrays (for 1D, 2D, 5D+)

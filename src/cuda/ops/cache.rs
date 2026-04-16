@@ -49,8 +49,8 @@ const CUDARC_BRIDGE_KERNELS: &[&str] = &[
     "slice_nd_i64_kernel",
     "slice_3d_scalar_kernel",
     "slice_3d_i64_scalar_kernel",
-    "slice_4d_scalar_kernel",
-    "slice_4d_i64_scalar_kernel",
+    // slice_4d_scalar_kernel — migrated to garboard (packed params).
+    // slice_4d_i64_scalar_kernel — migrated to garboard (packed params).
     "transpose_2d_kernel",
     "transpose_general_kernel",
     "transpose_general_i64_kernel",
