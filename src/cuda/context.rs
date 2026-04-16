@@ -141,13 +141,27 @@ impl IconnxCudaContext {
     // ==================== Memory API (garboard) ====================
 
     /// Allocate a zero-initialized GPU buffer.
+    ///
+    /// Uses `alloc_uninit` + `Stream::memset_zero` rather than garboard's
+    /// `Device::alloc_zeros`. The latter performs a synchronous
+    /// `cuMemsetD8_v2`, which blocks the host AND induces an implicit
+    /// synchronization with any active CUDA stream — at ~25 us per call,
+    /// that overhead compounded across the memory-pool's miss path and
+    /// other allocation sites was a major contributor to the post-garboard
+    /// regression. Routing the zero-fill through garboard's user stream
+    /// keeps it on the async path and avoids the cross-stream sync.
     pub fn alloc_zeros<T: bytemuck::Pod>(
         &self,
         len: usize,
     ) -> Result<GbDeviceSlice<'static, T>, CudaError> {
-        self.garboard_device
-            .alloc_zeros::<T>(len)
-            .map_err(|e| CudaError::Alloc(e.to_string()))
+        let mut slice = self
+            .garboard_device
+            .alloc_uninit::<T>(len)
+            .map_err(|e| CudaError::Alloc(e.to_string()))?;
+        self.garboard_stream
+            .memset_zero(&mut slice)
+            .map_err(|e| CudaError::Memory(e.to_string()))?;
+        Ok(slice)
     }
 
     /// Copy data from host to device.
