@@ -42,6 +42,137 @@ impl OpsKernelCache {
 mod tests {
     use super::*;
 
+    /// Microbenchmark: per-call cost of small host-to-device uploads via
+    /// `IconnxCudaContext::htod_usize` (which goes through garboard's
+    /// `Device::copy_host_to_device`, the synchronous `cuMemcpyHtoD_v2`).
+    /// Diagnostic for the post-PR-5b regression — every shape/stride
+    /// upload in layout ops blocks the CPU on completion. With many
+    /// such uploads per inference, this could account for the gap to
+    /// the cudarc baseline.
+    #[test]
+    #[ignore = "microbenchmark — requires CUDA GPU"]
+    fn bench_htod_usize_cost() {
+        use std::time::Instant;
+        let ctx = IconnxCudaContext::new().expect("ctx");
+
+        const ITERATIONS: u32 = 1_000;
+        let small = vec![1usize, 2, 3, 4, 5, 6, 7, 8];
+
+        // Warm.
+        let _ = ctx.htod_usize(&small).unwrap();
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = ctx.htod_usize(&small).unwrap();
+        }
+        let elapsed = start.elapsed();
+        let per_call_ns = elapsed.as_nanos() as f64 / ITERATIONS as f64;
+        println!(
+            "htod_usize(8) x {} = {:?} (avg {:.0} ns/call = {:.2} us/call)",
+            ITERATIONS,
+            elapsed,
+            per_call_ns,
+            per_call_ns / 1000.0,
+        );
+
+        // Also a slightly larger one to see size dependence.
+        let medium: Vec<usize> = (0..32).collect();
+        let _ = ctx.htod_usize(&medium).unwrap();
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = ctx.htod_usize(&medium).unwrap();
+        }
+        let elapsed = start.elapsed();
+        let per_call_ns = elapsed.as_nanos() as f64 / ITERATIONS as f64;
+        println!(
+            "htod_usize(32) x {} = {:?} (avg {:.0} ns/call = {:.2} us/call)",
+            ITERATIONS,
+            elapsed,
+            per_call_ns,
+            per_call_ns / 1000.0,
+        );
+
+        // alloc_zeros + drop, since pool misses go through this path.
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = ctx.alloc_zeros::<f32>(1024).unwrap();
+        }
+        let elapsed = start.elapsed();
+        let per_call_ns = elapsed.as_nanos() as f64 / ITERATIONS as f64;
+        println!(
+            "alloc_zeros(1024 f32)+drop x {} = {:?} (avg {:.0} ns/call = {:.2} us/call)",
+            ITERATIONS,
+            elapsed,
+            per_call_ns,
+            per_call_ns / 1000.0,
+        );
+    }
+
+    /// Microbenchmark: per-call cost of `Module::typed_kernel<...>("name")`.
+    ///
+    /// Diagnostic for the post-PR-5b benchmark plateau (~200ms vs. 109ms
+    /// baseline). The per-launch typed_kernel lookup is currently the
+    /// suspected source of regression — every iconnx kernel call goes
+    /// through `cuModuleGetFunction` on the driver, with no caching in
+    /// garboard's `Module`. Run via:
+    ///   cargo test --release --features cuda -- --include-ignored \
+    ///     bench_typed_kernel_lookup_cost --nocapture
+    #[test]
+    #[ignore = "microbenchmark — requires CUDA GPU"]
+    fn bench_typed_kernel_lookup_cost() {
+        use std::time::Instant;
+        let ctx = IconnxCudaContext::new().expect("ctx");
+        let cache = OpsKernelCache::new(&ctx).expect("cache");
+
+        type TransposeArgs<'a> = (
+            &'a mut garboard::DeviceSlice<'a, f32>,
+            &'a garboard::DeviceSlice<'a, f32>,
+            usize,
+            usize,
+        );
+
+        const ITERATIONS: u32 = 10_000;
+
+        // Warm: do one call so any first-time-load cost is not in the loop.
+        let _ = unsafe {
+            cache
+                .module()
+                .typed_kernel::<TransposeArgs<'_>>("transpose_2d_kernel")
+        };
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = unsafe {
+                cache
+                    .module()
+                    .typed_kernel::<TransposeArgs<'_>>("transpose_2d_kernel")
+            };
+        }
+        let elapsed = start.elapsed();
+        let per_call_ns = elapsed.as_nanos() as f64 / ITERATIONS as f64;
+        println!(
+            "typed_kernel x {} = {:?} (avg {:.0} ns/call = {:.2} us/call)",
+            ITERATIONS,
+            elapsed,
+            per_call_ns,
+            per_call_ns / 1000.0,
+        );
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = cache.module().function("transpose_2d_kernel");
+        }
+        let elapsed = start.elapsed();
+        let per_call_ns = elapsed.as_nanos() as f64 / ITERATIONS as f64;
+        println!(
+            "module.function x {} = {:?} (avg {:.0} ns/call = {:.2} us/call)",
+            ITERATIONS,
+            elapsed,
+            per_call_ns,
+            per_call_ns / 1000.0,
+        );
+    }
+
     #[test]
     #[ignore = "requires CUDA GPU"]
     fn test_kernel_compilation() {
