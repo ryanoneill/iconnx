@@ -8,9 +8,8 @@
 use super::context::{CudaError, IconnxCudaContext};
 use super::conv::{add_bias, gpu_conv2d, gpu_conv_transpose_2d, Conv2dParams, ConvKernelCache};
 use super::cudnn::{
-    garboard_conv_1d, garboard_conv_transpose_1d, cudnn_lstm_forward,
-    pack_lstm_weights_for_cudnn,
-    ConvAlgoCache, CudnnHandle, PackedLstmWeights, Workspace as CudnnWorkspace,
+    garboard_conv_1d, garboard_conv_transpose_1d, lstm_forward, pack_lstm_weights_for_cudnn,
+    prepare_lstm_plan, ConvAlgoCache, PackedLstmWeights,
 };
 use super::cufft::StftKernelCache;
 use super::kernels::fused::{
@@ -60,6 +59,29 @@ struct LstmWeightCache {
 }
 
 impl LstmWeightCache {
+    fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+}
+
+/// Cache for garboard `RnnPlan`s, keyed by `(W_ptr, R_ptr, seq_length)`.
+///
+/// An `RnnPlan` owns all cuDNN descriptors created during `rnn_prepare`,
+/// including the `cudnnRNNDataDescriptor_t`s that bake seq_length and
+/// batch_size into their dimensions. Weights and batch_size are stable
+/// across a Kokoro inference, but seq_length varies per input — so plans
+/// need to be keyed on seq_length as well as the weight pair.
+///
+/// Batch size is not part of the key because every LSTM in Kokoro runs
+/// with batch_size=1. If that invariant ever changes, the key must be
+/// extended to include batch_size.
+struct LstmPlanCache {
+    cache: HashMap<(usize, usize, usize), garboard::RnnPlan<'static>>,
+}
+
+impl LstmPlanCache {
     fn new() -> Self {
         Self {
             cache: HashMap::new(),
@@ -250,14 +272,15 @@ pub struct GpuGraphExecutor {
     stft_kernels: StftKernelCache,
     fused_kernels: FusedKernelCache,
 
-    /// cuDNN handle for optimized convolutions
-    cudnn_handle: CudnnHandle,
-    /// cuDNN workspace for scratch memory (RefCell for interior mutability)
-    cudnn_workspace: RefCell<CudnnWorkspace>,
     /// cuDNN algorithm selection cache (RefCell for interior mutability)
     conv_algo_cache: RefCell<ConvAlgoCache>,
     /// cuDNN packed LSTM weight cache (RefCell for interior mutability)
     lstm_weight_cache: RefCell<LstmWeightCache>,
+    /// garboard `RnnPlan` cache, keyed by (W_ptr, R_ptr, seq_length).
+    /// Created lazily on first LSTM call per unique key; each plan owns
+    /// cached cuDNN descriptors so subsequent forward calls skip
+    /// descriptor creation.
+    lstm_plan_cache: RefCell<LstmPlanCache>,
 
     /// Dynamic cache for Int64 values (cleared each run due to memory pool pointer reuse)
     /// Keyed by GPU device pointer, stores computed Int64 values during a single run
@@ -423,14 +446,6 @@ impl GpuGraphExecutor {
             eprintln!("  Fused kernels (NVRTC): {:?}", start.elapsed());
         }
 
-        let start = Instant::now();
-        let cudnn_handle = CudnnHandle::new()?;
-        cudnn_handle.set_stream(ctx.stream())?;
-        let cudnn_workspace = RefCell::new(CudnnWorkspace::new());
-        if profile {
-            eprintln!("  cuDNN initialization: {:?}", start.elapsed());
-        }
-
         if profile {
             eprintln!("  TOTAL initialization: {:?}", total_start.elapsed());
         }
@@ -444,10 +459,9 @@ impl GpuGraphExecutor {
             ops_kernels,
             stft_kernels,
             fused_kernels,
-            cudnn_handle,
-            cudnn_workspace,
             conv_algo_cache: RefCell::new(ConvAlgoCache::new()),
             lstm_weight_cache: RefCell::new(LstmWeightCache::new()),
+            lstm_plan_cache: RefCell::new(LstmPlanCache::new()),
             i64_cache: RefCell::new(HashMap::new()),
             static_i64_cache: RefCell::new(HashMap::new()),
             weights: HashMap::new(),
@@ -1711,17 +1725,24 @@ impl GpuGraphExecutor {
                 let hidden_size = w_shape[1] / 4;
                 let input_size = w_shape[2];
 
-                // Get or create packed weights (cached by W/R device pointer pair)
+                // Derive seq_length from the input tensor: X is either 3D
+                // [seq_len, batch, input_size] or 2D [seq_len, input_size].
+                // All LSTMs in Kokoro use batch_size=1; plans are keyed on
+                // (w_ptr, r_ptr, seq_length).
+                let x_shape = inputs[0].shape();
+                let seq_length = x_shape[0];
+
                 let w_ptr = w.device_ptr(&self.ctx) as usize;
                 let r_ptr = r.device_ptr(&self.ctx) as usize;
-                let cache_key = (w_ptr, r_ptr);
+                let weight_key = (w_ptr, r_ptr);
+                let plan_key = (w_ptr, r_ptr, seq_length);
 
+                // Pack weights once per (W, R) pair.
                 let mut weight_cache = self.lstm_weight_cache.borrow_mut();
                 if let std::collections::hash_map::Entry::Vacant(e) =
-                    weight_cache.cache.entry(cache_key)
+                    weight_cache.cache.entry(weight_key)
                 {
                     let packed = pack_lstm_weights_for_cudnn(
-                        &self.cudnn_handle,
                         &self.ctx,
                         w,
                         r,
@@ -1732,14 +1753,24 @@ impl GpuGraphExecutor {
                     )?;
                     e.insert(packed);
                 }
-                let packed = weight_cache.cache.get(&cache_key).unwrap();
+                let packed = weight_cache.cache.get(&weight_key).unwrap();
 
-                let mut workspace = self.cudnn_workspace.borrow_mut();
-                cudnn_lstm_forward(
-                    &self.cudnn_handle,
+                // Build (or reuse) an RnnPlan for this seq_length.
+                let mut plan_cache = self.lstm_plan_cache.borrow_mut();
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    plan_cache.cache.entry(plan_key)
+                {
+                    // batch_size is always 1 for Kokoro's LSTMs; see the
+                    // LstmPlanCache docstring for the invariant.
+                    let plan = prepare_lstm_plan(&self.ctx, packed, 1, seq_length)?;
+                    e.insert(plan);
+                }
+                let plan = plan_cache.cache.get(&plan_key).unwrap();
+
+                lstm_forward(
                     &self.ctx,
-                    &mut workspace,
                     packed,
+                    plan,
                     inputs[0],
                     h_init,
                     c_init,

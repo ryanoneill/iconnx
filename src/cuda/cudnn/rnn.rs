@@ -1,204 +1,39 @@
-//! cuDNN RNN (LSTM) wrappers for fused sequence-level forward pass
+//! cuDNN RNN (LSTM) wrappers backed by garboard's `DnnContext`.
 //!
-//! Provides safe Rust wrappers around cuDNN's legacy RNN API (v8 descriptor)
-//! for LSTM inference. Instead of per-timestep cuBLAS GEMMs + custom CUDA
-//! kernels, this module uses a single cudnnRNNForward call per LSTM node.
+//! This module uses garboard's cached-descriptor RNN API
+//! (`DnnContext::rnn_prepare` + `rnn_forward_with_plan`). cuDNN descriptors
+//! are created once per (weights, batch_size, seq_length) configuration and
+//! reused across forward calls — crucial because the descriptor creation
+//! cost dominates short-sequence LSTM latency.
+//!
+//! Responsibilities live in two places:
+//!
+//! - This module owns ONNX-to-cuDNN weight packing
+//!   ([`pack_lstm_weights_for_cudnn`]) and the thin forward call
+//!   ([`lstm_forward`]) that dispatches to garboard.
+//! - The executor in `cuda::inference` owns the caches: one for packed
+//!   weights keyed by `(w_ptr, r_ptr)`, and one for plans keyed by
+//!   `(w_ptr, r_ptr, seq_length)` (since plans bake seq_length into the
+//!   RNN data descriptors).
+//!
+//! The weight packing D2D copies still use `cudarc::driver::sys::
+//! cuMemcpyDtoDAsync_v2` — garboard does not yet expose sub-slicing of
+//! `DeviceSlice<u8>`. Packing happens at most once per unique weight pair
+//! per process lifetime, so this is not a hot path and will be cleaned up
+//! in PR 5d together with the rest of the cudarc dependency removal.
+//!
+//! Ordering guarantee: the cudarc stream (used for weight-pack D2Ds) and
+//! the garboard stream (used for `rnn_forward_with_plan`) are both
+//! blocking streams (flags=0), so they implicitly serialize through the
+//! legacy null stream — packing always completes before the first forward
+//! call observes the packed buffer.
 
 #![allow(clippy::too_many_arguments)]
 
-use std::ffi::c_void;
-use std::ptr;
+use garboard::{DeviceSlice, RnnForwardConfig, RnnPlan};
 
-use garboard::DeviceSlice;
-
-use super::sys;
-use super::{check_cudnn, CudnnHandle, TensorDescriptor, Workspace};
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::tensor::GpuTensor;
-
-// =============================================================================
-// DropoutDescriptor
-// =============================================================================
-
-/// RAII wrapper around cudnnDropoutDescriptor_t.
-/// Always configured with dropout rate 0.0 for inference.
-pub struct DropoutDescriptor {
-    desc: sys::cudnnDropoutDescriptor_t,
-    _states: DeviceSlice<'static, u8>,
-}
-
-impl DropoutDescriptor {
-    pub fn new(handle: &CudnnHandle, ctx: &IconnxCudaContext) -> Result<Self, CudaError> {
-        let mut desc: sys::cudnnDropoutDescriptor_t = ptr::null_mut();
-        unsafe {
-            check_cudnn(sys::cudnnCreateDropoutDescriptor(&mut desc))?;
-        }
-
-        let mut state_size: usize = 0;
-        unsafe {
-            check_cudnn(sys::cudnnDropoutGetStatesSize(
-                handle.raw(),
-                &mut state_size,
-            ))?;
-        }
-
-        let states = ctx.alloc_zeros::<u8>(state_size.max(1))?;
-
-        {
-            let states_ptr = states.as_raw_device_ptr();
-            unsafe {
-                check_cudnn(sys::cudnnSetDropoutDescriptor(
-                    desc,
-                    handle.raw(),
-                    0.0,
-                    states_ptr as *mut c_void,
-                    state_size,
-                    0,
-                ))?;
-            }
-        }
-
-        Ok(Self { desc, _states: states })
-    }
-
-    pub(crate) fn raw(&self) -> sys::cudnnDropoutDescriptor_t {
-        self.desc
-    }
-}
-
-impl Drop for DropoutDescriptor {
-    fn drop(&mut self) {
-        unsafe {
-            sys::cudnnDestroyDropoutDescriptor(self.desc);
-        }
-    }
-}
-
-// cuDNN descriptors contain raw pointers that are not auto-Send/Sync.
-// cuDNN handles are thread-safe when used with proper stream synchronization,
-// which IconnxCudaContext enforces. Same reasoning as CudnnHandle's impls in mod.rs.
-unsafe impl Send for DropoutDescriptor {}
-unsafe impl Sync for DropoutDescriptor {}
-
-// =============================================================================
-// RnnDescriptor
-// =============================================================================
-
-/// RAII wrapper around cudnnRNNDescriptor_t, configured for LSTM inference.
-pub struct RnnDescriptor {
-    desc: sys::cudnnRNNDescriptor_t,
-    _dropout: DropoutDescriptor,
-}
-
-impl RnnDescriptor {
-    pub fn new_lstm(
-        handle: &CudnnHandle,
-        ctx: &IconnxCudaContext,
-        hidden_size: usize,
-        input_size: usize,
-        num_directions: usize,
-    ) -> Result<Self, CudaError> {
-        let mut desc: sys::cudnnRNNDescriptor_t = ptr::null_mut();
-        unsafe {
-            check_cudnn(sys::cudnnCreateRNNDescriptor(&mut desc))?;
-        }
-
-        let dropout = DropoutDescriptor::new(handle, ctx)?;
-
-        let dir_mode = if num_directions == 2 {
-            sys::cudnnDirectionMode_t::CUDNN_BIDIRECTIONAL
-        } else {
-            sys::cudnnDirectionMode_t::CUDNN_UNIDIRECTIONAL
-        };
-
-        unsafe {
-            check_cudnn(sys::cudnnSetRNNDescriptor_v8(
-                desc,
-                sys::cudnnRNNAlgo_t::CUDNN_RNN_ALGO_STANDARD,
-                sys::cudnnRNNMode_t::CUDNN_LSTM,
-                sys::cudnnRNNBiasMode_t::CUDNN_RNN_DOUBLE_BIAS,
-                dir_mode,
-                sys::cudnnRNNInputMode_t::CUDNN_LINEAR_INPUT,
-                sys::cudnnDataType_t::CUDNN_DATA_FLOAT,
-                sys::cudnnDataType_t::CUDNN_DATA_FLOAT,
-                sys::cudnnMathType_t::CUDNN_DEFAULT_MATH,
-                input_size as i32,
-                hidden_size as i32,
-                hidden_size as i32, // projSize: cuDNN 9 requires hiddenSize when no projection
-                1,                  // numLayers
-                dropout.raw(),
-                1,  // auxFlags: CUDNN_RNN_PADDED_IO_ENABLED
-            ))?;
-        }
-
-        Ok(Self { desc, _dropout: dropout })
-    }
-
-    pub(crate) fn raw(&self) -> sys::cudnnRNNDescriptor_t {
-        self.desc
-    }
-}
-
-impl Drop for RnnDescriptor {
-    fn drop(&mut self) {
-        unsafe {
-            sys::cudnnDestroyRNNDescriptor(self.desc);
-        }
-    }
-}
-
-unsafe impl Send for RnnDescriptor {}
-unsafe impl Sync for RnnDescriptor {}
-
-// =============================================================================
-// RnnDataDescriptor
-// =============================================================================
-
-/// RAII wrapper around cudnnRNNDataDescriptor_t.
-pub struct RnnDataDescriptor {
-    desc: sys::cudnnRNNDataDescriptor_t,
-}
-
-impl RnnDataDescriptor {
-    pub fn new(seq_len: usize, batch_size: usize, vector_size: usize) -> Result<Self, CudaError> {
-        let mut desc: sys::cudnnRNNDataDescriptor_t = ptr::null_mut();
-        unsafe {
-            check_cudnn(sys::cudnnCreateRNNDataDescriptor(&mut desc))?;
-        }
-
-        let seq_lengths: Vec<i32> = vec![seq_len as i32; batch_size];
-
-        unsafe {
-            check_cudnn(sys::cudnnSetRNNDataDescriptor(
-                desc,
-                sys::cudnnDataType_t::CUDNN_DATA_FLOAT,
-                sys::cudnnRNNDataLayout_t::CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED,
-                seq_len as i32,
-                batch_size as i32,
-                vector_size as i32,
-                seq_lengths.as_ptr(),
-                ptr::null_mut(),
-            ))?;
-        }
-
-        Ok(Self { desc })
-    }
-
-    pub(crate) fn raw(&self) -> sys::cudnnRNNDataDescriptor_t {
-        self.desc
-    }
-}
-
-impl Drop for RnnDataDescriptor {
-    fn drop(&mut self) {
-        unsafe {
-            sys::cudnnDestroyRNNDataDescriptor(self.desc);
-        }
-    }
-}
-
-unsafe impl Send for RnnDataDescriptor {}
-unsafe impl Sync for RnnDataDescriptor {}
 
 // =============================================================================
 // Packed LSTM Weights
@@ -207,45 +42,52 @@ unsafe impl Sync for RnnDataDescriptor {}
 /// GPU buffer containing LSTM weights repacked from ONNX gate order (IOFC) to
 /// cuDNN gate order (IFCO).
 ///
-/// Created by `pack_lstm_weights_for_cudnn` and consumed by `cudnn_lstm_forward`.
-/// The buffer layout is opaque -- only cuDNN knows the internal offsets. We
-/// query offsets via `cudnnGetRNNWeightParams` during packing.
+/// Created by [`pack_lstm_weights_for_cudnn`] once per unique `(W, R)` pair
+/// and cached by the executor. Consumed by [`lstm_forward`] alongside a
+/// per-`(weights, seq_length)` [`RnnPlan`] owned by the executor's plan
+/// cache.
 ///
-/// **Cache pointer invariant:** This struct is valid only while the original
-/// ONNX W/R tensors (whose data was copied into this buffer) remain alive.
-/// In practice the executor owns both the weight tensors and the cache, so
-/// this invariant is trivially satisfied.
+/// **Cache pointer invariant:** This struct is valid only while the
+/// original ONNX `W`/`R` tensors (whose data was copied into this buffer)
+/// remain alive. In practice the executor owns both the weight tensors
+/// and the cache, so this invariant is trivially satisfied.
 pub struct PackedLstmWeights {
-    /// Packed weight buffer on GPU
+    /// Packed weight buffer on GPU (cuDNN's opaque internal layout).
     buffer: DeviceSlice<'static, u8>,
-    /// Size in bytes
-    size: usize,
-    /// RNN descriptor that was used to create this packing
-    /// (must outlive any cudnnRNNForward call using this buffer)
-    rnn_desc: RnnDescriptor,
+    /// Input feature size. Retained so the plan cache can rebuild an
+    /// `RnnForwardConfig` for a given seq_length without the caller
+    /// re-deriving it.
+    input_size: usize,
+    /// Hidden state size.
+    hidden_size: usize,
+    /// 1 for unidirectional, 2 for bidirectional.
+    num_directions: usize,
 }
 
 impl PackedLstmWeights {
-    /// Size of the packed weight buffer in bytes
+    /// Size of the packed weight buffer in bytes.
     pub fn size(&self) -> usize {
-        self.size
+        self.buffer.size_bytes()
     }
 
-    /// Get the RNN descriptor
-    pub(crate) fn rnn_desc(&self) -> &RnnDescriptor {
-        &self.rnn_desc
+    /// Input feature size.
+    pub fn input_size(&self) -> usize {
+        self.input_size
     }
 
-    /// Get the device pointer for the packed weight buffer.
-    ///
-    /// Post-garboard migration this is a plain `CUdeviceptr` — the
-    /// previous `(ptr, SyncOnDrop)` tuple from cudarc is no longer
-    /// needed since garboard does not do per-slice stream-event
-    /// tracking. The caller must not free or reuse the buffer while a
-    /// cuDNN call is in flight against it; ordering is provided by the
-    /// single-stream execution model.
-    pub(crate) fn buffer_device_ptr(&self) -> cudarc::driver::sys::CUdeviceptr {
-        self.buffer.as_raw_device_ptr()
+    /// Hidden state size.
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// Number of directions (1 or 2).
+    pub fn num_directions(&self) -> usize {
+        self.num_directions
+    }
+
+    /// Borrow the packed weight buffer as a garboard `DeviceSlice<u8>`.
+    pub fn buffer(&self) -> &DeviceSlice<'static, u8> {
+        &self.buffer
     }
 }
 
@@ -262,19 +104,41 @@ const ONNX_TO_CUDNN_GATE: [i32; 4] = [
     2, // ONNX C -> cuDNN 2 (W_g)
 ];
 
+/// Build an `RnnForwardConfig` for an LSTM.
+///
+/// `batch_size` and `seq_length` are used by the plan-build path only —
+/// for the packing path, the weight space is batch/seq-invariant, so the
+/// caller passes 1 for both.
+fn make_rnn_config(
+    input_size: i32,
+    hidden_size: i32,
+    num_directions: i32,
+    batch_size: i32,
+    seq_length: i32,
+) -> RnnForwardConfig {
+    RnnForwardConfig {
+        input_size,
+        hidden_size,
+        num_layers: 1,
+        bidirectional: num_directions == 2,
+        batch_size,
+        seq_length,
+        dropout: 0.0,
+    }
+}
+
 /// Repack ONNX LSTM weights into cuDNN's packed weight buffer format.
 ///
 /// ONNX stores weights in IOFC gate order; cuDNN expects IFCO. This function:
-/// 1. Creates an RNN descriptor for the given LSTM configuration
-/// 2. Queries cuDNN for the packed weight buffer size
-/// 3. Allocates the buffer on GPU
-/// 4. For each direction and each gate, queries cuDNN for the offset within
-///    the buffer and copies the corresponding ONNX weight slice there
+/// 1. Queries garboard for the packed weight buffer size.
+/// 2. Allocates the buffer on GPU.
+/// 3. For each direction and each gate, queries garboard for the
+///    offset within the buffer and copies the corresponding ONNX weight
+///    slice there via `cuMemcpyDtoDAsync_v2`.
 ///
-/// The returned `PackedLstmWeights` owns both the GPU buffer and the RNN
-/// descriptor. Both must outlive any `cudnn_lstm_forward` call.
+/// Packing happens at most once per `(W, R)` pair per executor lifetime;
+/// the executor caches [`PackedLstmWeights`] by device-pointer pair.
 pub fn pack_lstm_weights_for_cudnn(
-    handle: &CudnnHandle,
     ctx: &IconnxCudaContext,
     w: &GpuTensor,         // [num_directions, 4*hidden, input_size]
     r: &GpuTensor,         // [num_directions, 4*hidden, hidden_size]
@@ -283,73 +147,57 @@ pub fn pack_lstm_weights_for_cudnn(
     input_size: usize,
     num_directions: usize,
 ) -> Result<PackedLstmWeights, CudaError> {
-    // Create RNN descriptor
-    let rnn_desc = RnnDescriptor::new_lstm(handle, ctx, hidden_size, input_size, num_directions)?;
+    // Weight space size is batch/seq-invariant — safe to use placeholders.
+    let config = make_rnn_config(
+        input_size as i32,
+        hidden_size as i32,
+        num_directions as i32,
+        1,
+        1,
+    );
 
-    // Query packed weight buffer size
-    let mut weight_space_size: usize = 0;
-    unsafe {
-        check_cudnn(sys::cudnnGetRNNWeightSpaceSize(
-            handle.raw(),
-            rnn_desc.raw(),
-            &mut weight_space_size,
-        ))?;
-    }
+    let weight_space_size = ctx
+        .dnn()
+        .rnn_weight_space_size(&config)
+        .map_err(|e| CudaError::Cudnn(format!("rnn_weight_space_size failed: {}", e)))?;
 
-    // Allocate packed weight buffer (zero-initialized for safety)
+    // Allocate packed weight buffer (zero-initialized for safety).
     let weight_buffer = ctx.alloc_zeros::<u8>(weight_space_size)?;
 
-    // Create temporary tensor descriptors for cudnnGetRNNWeightParams output
-    let m_desc = TensorDescriptor::new()?;
-    let b_desc = TensorDescriptor::new()?;
-
-    let stream = ctx.stream();
+    // Use the cudarc stream for the init-time D2D copies. Both streams
+    // are blocking (flags=0), so subsequent `rnn_forward_with_plan` on
+    // the garboard stream observes the packed buffer.
+    let cudarc_stream = ctx.stream().cu_stream();
 
     for dir in 0..num_directions {
-        // pseudoLayer: 0 for forward direction, 1 for backward direction
         let pseudo_layer = dir as i32;
 
-        // Process input weights (W): linLayerID 0-3
+        // Input weights (W): cuDNN linLayerID 0..3.
         for (onnx_gate, &cudnn_lin_id) in ONNX_TO_CUDNN_GATE.iter().enumerate() {
+            let loc = ctx
+                .dnn()
+                .rnn_weight_params(&config, &weight_buffer, pseudo_layer, cudnn_lin_id)
+                .map_err(|e| {
+                    CudaError::Cudnn(format!("rnn_weight_params(W, dir={}, gate={}) failed: {}", dir, onnx_gate, e))
+                })?;
 
-            // Query cuDNN for the destination offset within packed buffer
-            let mut m_addr: *mut c_void = ptr::null_mut();
-            let mut b_addr: *mut c_void = ptr::null_mut();
+            let wb_base_ptr = weight_buffer.as_raw_device_ptr();
+            let dst_ptr = wb_base_ptr + loc.matrix_offset as u64;
 
-            let wb_ptr = weight_buffer.as_raw_device_ptr();
-            unsafe {
-                check_cudnn(sys::cudnnGetRNNWeightParams(
-                    handle.raw(),
-                    rnn_desc.raw(),
-                    pseudo_layer,
-                    weight_space_size,
-                    wb_ptr as *const c_void,
-                    cudnn_lin_id,
-                    m_desc.raw(),
-                    &mut m_addr,
-                    b_desc.raw(),
-                    &mut b_addr,
-                ))?;
-            }
-            // Drop the mutable guard before borrowing source tensors
-
-            // Copy input weight matrix for this gate
-            // Source: W[dir, onnx_gate*hidden..(onnx_gate+1)*hidden, 0..input_size]
-            // This is a contiguous block of hidden_size * input_size floats
-            let w_offset_floats = dir * 4 * hidden_size * input_size
-                + onnx_gate * hidden_size * input_size;
+            let w_offset_floats =
+                dir * 4 * hidden_size * input_size + onnx_gate * hidden_size * input_size;
             let w_size_bytes = hidden_size * input_size * std::mem::size_of::<f32>();
 
-            let w_ptr = w.data_f32()?.as_raw_device_ptr();
-            let src_ptr = (w_ptr as usize + w_offset_floats * std::mem::size_of::<f32>())
-                as cudarc::driver::sys::CUdeviceptr;
+            let w_base_ptr = w.data_f32()?.as_raw_device_ptr();
+            let src_ptr =
+                (w_base_ptr as usize + w_offset_floats * std::mem::size_of::<f32>()) as u64;
 
             unsafe {
                 let status = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                    m_addr as cudarc::driver::sys::CUdeviceptr,
+                    dst_ptr,
                     src_ptr,
                     w_size_bytes,
-                    stream.cu_stream(),
+                    cudarc_stream,
                 );
                 if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                     return Err(CudaError::Transfer(format!(
@@ -360,45 +208,34 @@ pub fn pack_lstm_weights_for_cudnn(
             }
         }
 
-        // Process recurrence weights (R): linLayerID 4-7
+        // Recurrence weights (R): cuDNN linLayerID 4..7.
         for (onnx_gate, &cudnn_base) in ONNX_TO_CUDNN_GATE.iter().enumerate() {
             let cudnn_lin_id = cudnn_base + 4;
 
-            let mut m_addr: *mut c_void = ptr::null_mut();
-            let mut b_addr: *mut c_void = ptr::null_mut();
+            let loc = ctx
+                .dnn()
+                .rnn_weight_params(&config, &weight_buffer, pseudo_layer, cudnn_lin_id)
+                .map_err(|e| {
+                    CudaError::Cudnn(format!("rnn_weight_params(R, dir={}, gate={}) failed: {}", dir, onnx_gate, e))
+                })?;
 
-            let wb_ptr = weight_buffer.as_raw_device_ptr();
-            unsafe {
-                check_cudnn(sys::cudnnGetRNNWeightParams(
-                    handle.raw(),
-                    rnn_desc.raw(),
-                    pseudo_layer,
-                    weight_space_size,
-                    wb_ptr as *const c_void,
-                    cudnn_lin_id,
-                    m_desc.raw(),
-                    &mut m_addr,
-                    b_desc.raw(),
-                    &mut b_addr,
-                ))?;
-            }
+            let wb_base_ptr = weight_buffer.as_raw_device_ptr();
+            let dst_ptr = wb_base_ptr + loc.matrix_offset as u64;
 
-            // Copy recurrence weight matrix for this gate
-            // Source: R[dir, onnx_gate*hidden..(onnx_gate+1)*hidden, 0..hidden_size]
-            let r_offset_floats = dir * 4 * hidden_size * hidden_size
-                + onnx_gate * hidden_size * hidden_size;
+            let r_offset_floats =
+                dir * 4 * hidden_size * hidden_size + onnx_gate * hidden_size * hidden_size;
             let r_size_bytes = hidden_size * hidden_size * std::mem::size_of::<f32>();
 
-            let r_ptr = r.data_f32()?.as_raw_device_ptr();
-            let src_ptr = (r_ptr as usize + r_offset_floats * std::mem::size_of::<f32>())
-                as cudarc::driver::sys::CUdeviceptr;
+            let r_base_ptr = r.data_f32()?.as_raw_device_ptr();
+            let src_ptr =
+                (r_base_ptr as usize + r_offset_floats * std::mem::size_of::<f32>()) as u64;
 
             unsafe {
                 let status = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                    m_addr as cudarc::driver::sys::CUdeviceptr,
+                    dst_ptr,
                     src_ptr,
                     r_size_bytes,
-                    stream.cu_stream(),
+                    cudarc_stream,
                 );
                 if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                     return Err(CudaError::Transfer(format!(
@@ -409,51 +246,48 @@ pub fn pack_lstm_weights_for_cudnn(
             }
         }
 
-        // Process biases if provided
-        // ONNX B layout: [Wb_i, Wb_o, Wb_f, Wb_c, Rb_i, Rb_o, Rb_f, Rb_c]
-        // = 8*hidden values per direction
-        // cuDNN: each linLayerID 0-7 has its own bias vector of size hidden
+        // Biases (optional). ONNX B layout: [Wb_i, Wb_o, Wb_f, Wb_c,
+        // Rb_i, Rb_o, Rb_f, Rb_c] = 8*hidden values per direction.
+        // cuDNN keeps a separate bias vector per linLayerID 0..7.
         if let Some(b_tensor) = b {
             for (onnx_gate, &cudnn_base) in ONNX_TO_CUDNN_GATE.iter().enumerate() {
                 let bias_size_bytes = hidden_size * std::mem::size_of::<f32>();
 
-                // Input bias (Wb): linLayerID 0-3
+                // Input bias Wb: cuDNN linLayerID 0..3.
                 {
                     let cudnn_lin_id = cudnn_base;
+                    let loc = ctx
+                        .dnn()
+                        .rnn_weight_params(&config, &weight_buffer, pseudo_layer, cudnn_lin_id)
+                        .map_err(|e| {
+                            CudaError::Cudnn(format!(
+                                "rnn_weight_params(Wb, dir={}, gate={}) failed: {}",
+                                dir, onnx_gate, e
+                            ))
+                        })?;
 
-                    let mut m_addr: *mut c_void = ptr::null_mut();
-                    let mut b_addr: *mut c_void = ptr::null_mut();
-
-                    let wb_ptr = weight_buffer.as_raw_device_ptr();
-                    unsafe {
-                        check_cudnn(sys::cudnnGetRNNWeightParams(
-                            handle.raw(),
-                            rnn_desc.raw(),
-                            pseudo_layer,
-                            weight_space_size,
-                            wb_ptr as *const c_void,
-                            cudnn_lin_id,
-                            m_desc.raw(),
-                            &mut m_addr,
-                            b_desc.raw(),
-                            &mut b_addr,
-                        ))?;
+                    if loc.bias_size == 0 {
+                        return Err(CudaError::Cudnn(format!(
+                            "cuDNN reports no bias slot at (pseudo_layer={}, lin_layer_id={}) but ONNX provides biases",
+                            pseudo_layer, cudnn_lin_id
+                        )));
                     }
-        
-                    // Wb[gate]: offset = dir * 8*hidden + onnx_gate * hidden
-                    let wb_offset_floats = dir * 8 * hidden_size + onnx_gate * hidden_size;
 
-                    let b_ptr = b_tensor.data_f32()?.as_raw_device_ptr();
-                    let src_ptr = (b_ptr as usize
+                    let wb_base_ptr = weight_buffer.as_raw_device_ptr();
+                    let dst_ptr = wb_base_ptr + loc.bias_offset as u64;
+
+                    let wb_offset_floats = dir * 8 * hidden_size + onnx_gate * hidden_size;
+                    let b_base_ptr = b_tensor.data_f32()?.as_raw_device_ptr();
+                    let src_ptr = (b_base_ptr as usize
                         + wb_offset_floats * std::mem::size_of::<f32>())
-                        as cudarc::driver::sys::CUdeviceptr;
+                        as u64;
 
                     unsafe {
                         let status = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                            b_addr as cudarc::driver::sys::CUdeviceptr,
+                            dst_ptr,
                             src_ptr,
                             bias_size_bytes,
-                            stream.cu_stream(),
+                            cudarc_stream,
                         );
                         if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                             return Err(CudaError::Transfer(format!(
@@ -464,44 +298,42 @@ pub fn pack_lstm_weights_for_cudnn(
                     }
                 }
 
-                // Recurrence bias (Rb): linLayerID 4-7
+                // Recurrence bias Rb: cuDNN linLayerID 4..7.
                 {
                     let cudnn_lin_id_r = cudnn_base + 4;
+                    let loc = ctx
+                        .dnn()
+                        .rnn_weight_params(&config, &weight_buffer, pseudo_layer, cudnn_lin_id_r)
+                        .map_err(|e| {
+                            CudaError::Cudnn(format!(
+                                "rnn_weight_params(Rb, dir={}, gate={}) failed: {}",
+                                dir, onnx_gate, e
+                            ))
+                        })?;
 
-                    let mut m_addr_r: *mut c_void = ptr::null_mut();
-                    let mut b_addr_r: *mut c_void = ptr::null_mut();
-
-                    let wb_ptr = weight_buffer.as_raw_device_ptr();
-                    unsafe {
-                        check_cudnn(sys::cudnnGetRNNWeightParams(
-                            handle.raw(),
-                            rnn_desc.raw(),
-                            pseudo_layer,
-                            weight_space_size,
-                            wb_ptr as *const c_void,
-                            cudnn_lin_id_r,
-                            m_desc.raw(),
-                            &mut m_addr_r,
-                            b_desc.raw(),
-                            &mut b_addr_r,
-                        ))?;
+                    if loc.bias_size == 0 {
+                        return Err(CudaError::Cudnn(format!(
+                            "cuDNN reports no bias slot at (pseudo_layer={}, lin_layer_id={}) but ONNX provides biases",
+                            pseudo_layer, cudnn_lin_id_r
+                        )));
                     }
-        
-                    // Rb[gate]: offset = dir * 8*hidden + (4 + onnx_gate) * hidden
+
+                    let wb_base_ptr = weight_buffer.as_raw_device_ptr();
+                    let dst_ptr = wb_base_ptr + loc.bias_offset as u64;
+
                     let rb_offset_floats =
                         dir * 8 * hidden_size + (4 + onnx_gate) * hidden_size;
-
-                    let b_ptr = b_tensor.data_f32()?.as_raw_device_ptr();
-                    let src_ptr_r = (b_ptr as usize
+                    let b_base_ptr = b_tensor.data_f32()?.as_raw_device_ptr();
+                    let src_ptr = (b_base_ptr as usize
                         + rb_offset_floats * std::mem::size_of::<f32>())
-                        as cudarc::driver::sys::CUdeviceptr;
+                        as u64;
 
                     unsafe {
                         let status = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                            b_addr_r as cudarc::driver::sys::CUdeviceptr,
-                            src_ptr_r,
+                            dst_ptr,
+                            src_ptr,
                             bias_size_bytes,
-                            stream.cu_stream(),
+                            cudarc_stream,
                         );
                         if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                             return Err(CudaError::Transfer(format!(
@@ -517,38 +349,64 @@ pub fn pack_lstm_weights_for_cudnn(
 
     Ok(PackedLstmWeights {
         buffer: weight_buffer,
-        size: weight_space_size,
-        rnn_desc,
+        input_size,
+        hidden_size,
+        num_directions,
     })
+}
+
+/// Build an `RnnPlan` for the given packed weights + seq_length.
+///
+/// Plans bake the RNN data descriptors (which encode seq_length and
+/// batch_size) into cuDNN descriptors. Different seq_lengths need
+/// different plans. The executor caches plans keyed by
+/// `(w_ptr, r_ptr, seq_length)` alongside the weight cache.
+pub fn prepare_lstm_plan(
+    ctx: &IconnxCudaContext,
+    packed_weights: &PackedLstmWeights,
+    batch_size: usize,
+    seq_length: usize,
+) -> Result<RnnPlan<'static>, CudaError> {
+    let config = make_rnn_config(
+        packed_weights.input_size() as i32,
+        packed_weights.hidden_size() as i32,
+        packed_weights.num_directions() as i32,
+        batch_size as i32,
+        seq_length as i32,
+    );
+
+    ctx.dnn()
+        .rnn_prepare(ctx.garboard_stream(), &config)
+        .map_err(|e| CudaError::Cudnn(format!("rnn_prepare failed: {}", e)))
 }
 
 // =============================================================================
 // Forward Pass
 // =============================================================================
 
-/// Execute a fused LSTM forward pass using cuDNN.
+/// Execute a fused LSTM forward pass using garboard's `rnn_forward_with_plan`.
 ///
-/// Processes the entire sequence in a single cuDNN call, replacing per-timestep
-/// cuBLAS GEMMs + custom CUDA kernels. For Kokoro's bidirectional LSTM with
-/// seq_len=95, this reduces ~570 kernel launches to 1 call.
+/// Processes the entire sequence in a single cuDNN call. The plan caches
+/// all cuDNN descriptors — no per-call descriptor creation. For Kokoro's
+/// 6 LSTM calls per inference this lifts ~162 ms of descriptor-setup
+/// overhead off the critical path.
 ///
-/// Returns Y with shape [seq_len, num_directions, batch, hidden_size].
-/// The output layout matches ONNX LSTM's default seq_major format.
-pub fn cudnn_lstm_forward(
-    handle: &CudnnHandle,
+/// Returns `Y` with shape `[seq_len, num_directions, batch, hidden_size]`
+/// to match the output layout produced by [`crate::cuda::lstm::gpu_lstm`].
+pub fn lstm_forward(
     ctx: &IconnxCudaContext,
-    workspace: &mut Workspace,
     packed_weights: &PackedLstmWeights,
-    x: &GpuTensor,             // [seq_len, batch, input_size]
-    h_init: Option<&GpuTensor>, // [num_directions, batch, hidden_size]
-    c_init: Option<&GpuTensor>, // [num_directions, batch, hidden_size]
+    plan: &RnnPlan<'static>,
+    x: &GpuTensor,               // [seq_len, batch, input_size]
+    h_init: Option<&GpuTensor>,  // [num_directions, batch, hidden_size]
+    c_init: Option<&GpuTensor>,  // [num_directions, batch, hidden_size]
     hidden_size: usize,
     num_directions: usize,
 ) -> Result<GpuTensor, CudaError> {
     let x_shape = x.shape();
 
-    // Handle 2D input [seq_len, input_size] by treating as batch=1
-    let (seq_len, batch_size, input_size) = if x_shape.len() == 2 {
+    // Handle 2D input [seq_len, input_size] by treating as batch=1.
+    let (seq_len, batch_size, _input_size) = if x_shape.len() == 2 {
         (x_shape[0], 1, x_shape[1])
     } else if x_shape.len() == 3 {
         (x_shape[0], x_shape[1], x_shape[2])
@@ -561,117 +419,45 @@ pub fn cudnn_lstm_forward(
 
     let output_size = num_directions * hidden_size;
 
-    // Create data descriptors for input X and output Y
-    let x_desc = RnnDataDescriptor::new(seq_len, batch_size, input_size)?;
-    let y_desc = RnnDataDescriptor::new(seq_len, batch_size, output_size)?;
-
-    // Create tensor descriptors for hidden/cell state
-    // cuDNN expects h/c descriptors as 3D: [numLayers * numDirs, batch, hidden]
-    let mut h_desc = TensorDescriptor::new()?;
-    let h_dims = [num_directions, batch_size, hidden_size];
-    let h_strides = [batch_size * hidden_size, hidden_size, 1];
-    h_desc.set_nd(
-        &h_dims,
-        &h_strides,
-        sys::cudnnDataType_t::CUDNN_DATA_FLOAT,
-    )?;
-
-    let mut c_desc = TensorDescriptor::new()?;
-    c_desc.set_nd(
-        &h_dims,
-        &h_strides,
-        sys::cudnnDataType_t::CUDNN_DATA_FLOAT,
-    )?;
-
-    // Query workspace size
-    let mut work_space_size: usize = 0;
-    let mut _reserve_space_size: usize = 0;
-    unsafe {
-        check_cudnn(sys::cudnnGetRNNTempSpaceSizes(
-            handle.raw(),
-            packed_weights.rnn_desc().raw(),
-            sys::cudnnForwardMode_t::CUDNN_FWD_MODE_INFERENCE,
-            x_desc.raw(),
-            &mut work_space_size,
-            &mut _reserve_space_size,
-        ))?;
-    }
-
-    // Ensure workspace is large enough
-    workspace.ensure_size(ctx, work_space_size)?;
-
-    // Allocate output Y: [seq_len, batch, num_directions * hidden_size]
+    // Allocate output Y: [seq_len, batch, num_directions * hidden_size].
     let mut y = GpuTensor::zeros_f32(ctx, vec![seq_len, batch_size, output_size])?;
 
-    // Create seq_lengths array on device (all same length)
-    let seq_lengths_host: Vec<i32> = vec![seq_len as i32; batch_size];
-    let seq_lengths_dev: DeviceSlice<'static, i32> = ctx
-        .htod_i32(&seq_lengths_host)
-        .map_err(|e| CudaError::Transfer(format!("Failed to copy seq_lengths: {}", e)))?;
-
-    // Execute forward pass. All device pointers below are plain
-    // `CUdeviceptr` values obtained from garboard slices; lifetime is
-    // bounded by this function's scope (the slices are stack-local or
-    // borrowed from longer-lived tensors).
     {
-        let x_ptr = x.data_f32()?.as_raw_device_ptr();
-        let y_ptr = y.data_f32_mut()?.as_raw_device_ptr();
-        let w_ptr = packed_weights.buffer_device_ptr();
-        let workspace_ptr = workspace.ptr();
-        let seq_dev_ptr = seq_lengths_dev.as_raw_device_ptr();
-
-        // Get h_init and c_init raw pointers (null if not provided)
-        let hx_ptr = if let Some(h) = h_init {
-            h.data_f32()?.as_raw_device_ptr() as *const c_void
-        } else {
-            ptr::null()
+        let x_slice = x.data_f32()?;
+        let y_slice = y.data_f32_mut()?;
+        let hx_slice = match h_init {
+            Some(h) => Some(h.data_f32()?),
+            None => None,
+        };
+        let cx_slice = match c_init {
+            Some(c) => Some(c.data_f32()?),
+            None => None,
         };
 
-        let cx_ptr = if let Some(c) = c_init {
-            c.data_f32()?.as_raw_device_ptr() as *const c_void
-        } else {
-            ptr::null()
-        };
-
-        unsafe {
-            check_cudnn(sys::cudnnRNNForward(
-                handle.raw(),
-                packed_weights.rnn_desc().raw(),
-                sys::cudnnForwardMode_t::CUDNN_FWD_MODE_INFERENCE,
-                seq_dev_ptr as *const i32,
-                x_desc.raw(),
-                x_ptr as *const c_void,
-                y_desc.raw(),
-                y_ptr as *mut c_void,
-                h_desc.raw(),
-                hx_ptr,
-                ptr::null_mut(), // hy: don't need final hidden state
-                c_desc.raw(),
-                cx_ptr,
-                ptr::null_mut(), // cy: don't need final cell state
-                packed_weights.size(),
-                w_ptr as *const c_void,
-                work_space_size,
-                workspace_ptr,
-                0,               // reserveSpaceSize: 0 for inference
-                ptr::null_mut(), // reserveSpace: null for inference
-            ))?;
-        }
+        ctx.dnn()
+            .rnn_forward_with_plan(
+                ctx.garboard_stream(),
+                plan,
+                x_slice,
+                y_slice,
+                hx_slice,
+                None, // hy: final hidden state not needed
+                cx_slice,
+                None, // cy: final cell state not needed
+                packed_weights.buffer(),
+            )
+            .map_err(|e| CudaError::Cudnn(format!("rnn_forward_with_plan failed: {}", e)))?;
     }
 
-    // cuDNN output Y is [seq_len, batch, num_directions * hidden_size]
-    // but the existing gpu_lstm returns [seq_len, num_directions, batch, hidden_size]
-    // Reshape to match the expected output format
+    // cuDNN's output is [seq_len, batch, num_directions * hidden_size].
+    // The reference `gpu_lstm` produces [seq_len, num_directions, batch,
+    // hidden_size]. For batch==1 these are bitwise identical — just
+    // reshape with no data movement. batch>1 would need a transpose
+    // kernel; Kokoro never exercises that path.
     let y_reshaped = y
         .reshape(vec![seq_len, batch_size, num_directions, hidden_size])
         .ok_or_else(|| CudaError::Cudnn("Failed to reshape Y for direction split".into()))?;
 
-    // Transpose from [seq, batch, dirs, hidden] to [seq, dirs, batch, hidden]
-    // This matches the ONNX LSTM output layout that gpu_lstm produces.
-    //
-    // For batch=1 (Kokoro's case), [seq, 1, dirs, hidden] == [seq, dirs, 1, hidden]
-    // so reshape alone suffices with no data movement. For batch>1 a transpose
-    // kernel would be needed.
     if batch_size == 1 {
         y_reshaped
             .reshape(vec![seq_len, num_directions, batch_size, hidden_size])
@@ -679,9 +465,6 @@ pub fn cudnn_lstm_forward(
                 CudaError::Cudnn("Failed to reshape Y to [seq, dirs, batch, hidden]".into())
             })
     } else {
-        // General case: need actual data movement for transposition
-        // [seq, batch, dirs, hidden] -> [seq, dirs, batch, hidden]
-        // For Kokoro all LSTMs have batch=1, so this path is not exercised.
         Err(CudaError::Cudnn(format!(
             "cuDNN LSTM with batch_size={} > 1 not yet supported (needs transpose kernel)",
             batch_size
@@ -700,19 +483,21 @@ mod tests {
     use crate::cuda::memory_pool::GpuMemoryPool;
     use crate::cuda::ops::OpsKernelCache;
 
-    // Compile-time assertion: cuDNN RNN types must be Send+Sync so
-    // GpuGraphExecutor (which contains them) can be used across threads.
+    // Compile-time assertion: the packed weights and plan types must be
+    // `Send` so the executor can be moved across threads. They are
+    // stored inside `RefCell` on the executor, which is already
+    // non-`Sync`, so we do *not* require `Sync` here — requiring it
+    // would break compilation because `RnnPlan` is deliberately
+    // `!Sync` upstream.
     const _: () = {
-        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_send<T: Send>() {}
         fn check() {
-            assert_send_sync::<DropoutDescriptor>();
-            assert_send_sync::<RnnDescriptor>();
-            assert_send_sync::<RnnDataDescriptor>();
-            assert_send_sync::<PackedLstmWeights>();
+            assert_send::<PackedLstmWeights>();
+            assert_send::<RnnPlan<'static>>();
         }
     };
 
-    /// Helper: create a GpuTensor from a Vec<f32> with given shape
+    /// Helper: create a GpuTensor from a Vec<f32> with given shape.
     fn gpu_from_vec(
         ctx: &IconnxCudaContext,
         data: Vec<f32>,
@@ -721,7 +506,7 @@ mod tests {
         GpuTensor::from_host_f32(ctx, &data, shape).expect("Failed to create GPU tensor")
     }
 
-    /// Helper: download GPU tensor to host
+    /// Helper: download GPU tensor to host.
     fn to_host(ctx: &IconnxCudaContext, t: &GpuTensor) -> Vec<f32> {
         t.to_host_f32(ctx).expect("Failed to download tensor")
     }
@@ -729,12 +514,12 @@ mod tests {
     #[test]
     #[ignore = "requires CUDA GPU with cuDNN"]
     fn test_cudnn_lstm_matches_gpu_lstm() {
-        // Small synthetic LSTM: seq_len=3, batch=1, input_size=4, hidden=4, bidirectional
+        // Bidirectional LSTM with Some(&h_init) + Some(&c_init), matching
+        // Kokoro's production path (where ConstantOfShape(0) supplies
+        // zero-filled initial states). Passing None here would narrow
+        // the test contract and hide bugs in the Some path, so this
+        // test deliberately exercises both state arguments.
         let ctx = IconnxCudaContext::new().expect("Failed to create CUDA context");
-        let handle = CudnnHandle::new().expect("Failed to create cuDNN handle");
-        handle
-            .set_stream(ctx.stream())
-            .expect("Failed to set stream");
 
         let seq_len = 3;
         let batch = 1;
@@ -742,43 +527,34 @@ mod tests {
         let hidden = 4;
         let num_dirs = 2;
 
-        // Create deterministic inputs
         let x_data: Vec<f32> = (0..seq_len * batch * input_size)
             .map(|i| (i as f32) * 0.1 - 0.5)
             .collect();
         let x = gpu_from_vec(&ctx, x_data, vec![seq_len, batch, input_size]);
 
-        // Weights: W [num_dirs, 4*hidden, input_size]
         let w_data: Vec<f32> = (0..num_dirs * 4 * hidden * input_size)
             .map(|i| ((i as f32) * 0.02 - 0.5).sin() * 0.1)
             .collect();
-        let w = gpu_from_vec(
-            &ctx,
-            w_data,
-            vec![num_dirs, 4 * hidden, input_size],
-        );
+        let w = gpu_from_vec(&ctx, w_data, vec![num_dirs, 4 * hidden, input_size]);
 
-        // Recurrence: R [num_dirs, 4*hidden, hidden]
         let r_data: Vec<f32> = (0..num_dirs * 4 * hidden * hidden)
             .map(|i| ((i as f32) * 0.03 + 0.7).cos() * 0.1)
             .collect();
-        let r = gpu_from_vec(
-            &ctx,
-            r_data,
-            vec![num_dirs, 4 * hidden, hidden],
-        );
+        let r = gpu_from_vec(&ctx, r_data, vec![num_dirs, 4 * hidden, hidden]);
 
-        // Bias: B [num_dirs, 8*hidden]
         let b_data: Vec<f32> = (0..num_dirs * 8 * hidden)
             .map(|i| (i as f32) * 0.01 - 0.3)
             .collect();
         let b = gpu_from_vec(&ctx, b_data, vec![num_dirs, 8 * hidden]);
 
-        // Initial hidden state: h_init [num_dirs, batch, hidden]
+        // Zero-filled initial states — the production invariant for
+        // Kokoro's LSTMs and what `ConstantOfShape(value=0)` produces.
         let h_data: Vec<f32> = vec![0.0; num_dirs * batch * hidden];
         let h_init = gpu_from_vec(&ctx, h_data, vec![num_dirs, batch, hidden]);
+        let c_data: Vec<f32> = vec![0.0; num_dirs * batch * hidden];
+        let c_init = gpu_from_vec(&ctx, c_data, vec![num_dirs, batch, hidden]);
 
-        // Run gpu_lstm (reference implementation)
+        // Reference: legacy per-timestep LSTM.
         let lstm_cache = LstmKernelCache::new(&ctx).expect("Failed to create LSTM cache");
         let ops_cache = OpsKernelCache::new(&ctx).expect("Failed to create ops cache");
         let mut pool = GpuMemoryPool::new();
@@ -793,38 +569,31 @@ mod tests {
             &r,
             Some(&b),
             Some(&h_init),
-            None, // c_init
+            Some(&c_init),
         )
         .expect("gpu_lstm failed");
 
-        // Run cudnn_lstm_forward
-        let mut workspace = Workspace::new();
+        // Pack weights + build plan via the cached-descriptor API.
         let packed = pack_lstm_weights_for_cudnn(
-            &handle,
-            &ctx,
-            &w,
-            &r,
-            Some(&b),
-            hidden,
-            input_size,
-            num_dirs,
+            &ctx, &w, &r, Some(&b), hidden, input_size, num_dirs,
         )
         .expect("Weight packing failed");
 
-        let cudnn_output = cudnn_lstm_forward(
-            &handle,
+        let plan = prepare_lstm_plan(&ctx, &packed, batch, seq_len)
+            .expect("prepare_lstm_plan failed");
+
+        let cudnn_output = lstm_forward(
             &ctx,
-            &mut workspace,
             &packed,
+            &plan,
             &x,
             Some(&h_init),
-            None, // c_init
+            Some(&c_init),
             hidden,
             num_dirs,
         )
-        .expect("cudnn_lstm_forward failed");
+        .expect("lstm_forward failed");
 
-        // Compare shapes
         assert_eq!(
             reference_output.shape(),
             cudnn_output.shape(),
@@ -833,17 +602,10 @@ mod tests {
             cudnn_output.shape()
         );
 
-        // Compare values
         let ref_data = to_host(&ctx, &reference_output);
         let cudnn_data = to_host(&ctx, &cudnn_output);
 
-        // Track max difference for diagnostics
         let mut max_diff: f32 = 0.0;
-
-        // Tolerance: 1e-4 because float accumulation order differs between
-        // per-timestep cuBLAS GEMMs and cuDNN's fused implementation.
-        // On long sequences the divergence grows, but for seq_len=3 it
-        // should be well within this bound.
         let tolerance = 1e-4;
         for (i, (r_val, c_val)) in ref_data.iter().zip(cudnn_data.iter()).enumerate() {
             let diff = (r_val - c_val).abs();
@@ -868,12 +630,9 @@ mod tests {
     #[test]
     #[ignore = "requires CUDA GPU with cuDNN"]
     fn test_cudnn_lstm_unidirectional() {
-        // Verify unidirectional LSTM works (num_directions=1)
+        // Smoke test: unidirectional LSTM with no initial states, using
+        // the cached-descriptor path end-to-end.
         let ctx = IconnxCudaContext::new().expect("Failed to create CUDA context");
-        let handle = CudnnHandle::new().expect("Failed to create cuDNN handle");
-        handle
-            .set_stream(ctx.stream())
-            .expect("Failed to set stream");
 
         let seq_len = 3;
         let batch = 1;
@@ -896,17 +655,15 @@ mod tests {
             .collect();
         let r = gpu_from_vec(&ctx, r_data, vec![num_dirs, 4 * hidden, hidden]);
 
-        let mut workspace = Workspace::new();
-        let packed = pack_lstm_weights_for_cudnn(
-            &handle, &ctx, &w, &r, None, hidden, input_size, num_dirs,
-        )
-        .expect("Weight packing failed");
+        let packed =
+            pack_lstm_weights_for_cudnn(&ctx, &w, &r, None, hidden, input_size, num_dirs)
+                .expect("Weight packing failed");
 
-        let output = cudnn_lstm_forward(
-            &handle, &ctx, &mut workspace, &packed, &x, None, None,
-            hidden, num_dirs,
-        )
-        .expect("cudnn_lstm_forward failed");
+        let plan = prepare_lstm_plan(&ctx, &packed, batch, seq_len)
+            .expect("prepare_lstm_plan failed");
+
+        let output = lstm_forward(&ctx, &packed, &plan, &x, None, None, hidden, num_dirs)
+            .expect("lstm_forward failed");
 
         assert_eq!(
             output.shape(),
@@ -914,7 +671,6 @@ mod tests {
             "Unidirectional output shape mismatch"
         );
 
-        // Verify output is not all zeros (sanity check that computation ran)
         let data = to_host(&ctx, &output);
         let max_val = data.iter().cloned().fold(0.0f32, f32::max);
         assert!(
