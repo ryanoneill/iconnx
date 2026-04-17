@@ -9,7 +9,7 @@ use super::context::{CudaError, IconnxCudaContext};
 use super::conv::{add_bias, gpu_conv2d, gpu_conv_transpose_2d, Conv2dParams, ConvKernelCache};
 use super::cudnn::{
     garboard_conv_1d, garboard_conv_transpose_1d, lstm_forward, pack_lstm_weights_for_cudnn,
-    prepare_lstm_plan, ConvAlgoCache, PackedLstmWeights,
+    prepare_lstm_plan, PackedLstmWeights,
 };
 use super::cufft::StftKernelCache;
 use super::kernels::fused::{
@@ -40,7 +40,6 @@ use super::tensor::GpuTensor;
 use crate::attributes::NodeAttributes;
 use crate::operators::fftw_stft::fftw_stft;
 use crate::tensor::Tensor;
-use cudarc::driver::sys::CUdeviceptr;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -272,8 +271,6 @@ pub struct GpuGraphExecutor {
     stft_kernels: StftKernelCache,
     fused_kernels: FusedKernelCache,
 
-    /// cuDNN algorithm selection cache (RefCell for interior mutability)
-    conv_algo_cache: RefCell<ConvAlgoCache>,
     /// cuDNN packed LSTM weight cache (RefCell for interior mutability)
     lstm_weight_cache: RefCell<LstmWeightCache>,
     /// garboard `RnnPlan` cache, keyed by (W_ptr, R_ptr, seq_length).
@@ -283,8 +280,10 @@ pub struct GpuGraphExecutor {
     lstm_plan_cache: RefCell<LstmPlanCache>,
 
     /// Dynamic cache for Int64 values (cleared each run due to memory pool pointer reuse)
-    /// Keyed by GPU device pointer, stores computed Int64 values during a single run
-    i64_cache: RefCell<HashMap<CUdeviceptr, Vec<i64>>>,
+    /// Keyed by GPU device pointer (raw `u64` from garboard's
+    /// `DeviceSlice::as_raw_device_ptr`), stores computed Int64 values during
+    /// a single run.
+    i64_cache: RefCell<HashMap<u64, Vec<i64>>>,
 
     /// Static cache for Int64 values keyed by tensor name (persists across runs)
     /// Used for initializers and Constant nodes - values are known at graph construction time
@@ -459,7 +458,6 @@ impl GpuGraphExecutor {
             ops_kernels,
             stft_kernels,
             fused_kernels,
-            conv_algo_cache: RefCell::new(ConvAlgoCache::new()),
             lstm_weight_cache: RefCell::new(LstmWeightCache::new()),
             lstm_plan_cache: RefCell::new(LstmPlanCache::new()),
             i64_cache: RefCell::new(HashMap::new()),

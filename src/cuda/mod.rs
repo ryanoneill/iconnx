@@ -1,16 +1,13 @@
 /// CUDA GPU acceleration module for Iconnx.
 ///
-/// Provides GPU-accelerated inference on top of garboard (memory and
-/// device management) with cudarc (kernel launches, cuBLAS, cuDNN)
-/// migrating over per the Phase 1 plan.
+/// Provides GPU-accelerated inference on top of [`garboard`], which handles
+/// device discovery, memory allocation, stream management, NVRTC kernel
+/// compilation, cuBLAS GEMMs, and cuDNN conv/RNN operations.
 ///
 /// Key components:
 /// - `IconnxCudaContext` — Device management and memory allocation
 /// - `GpuTensor` — GPU tensor storage (wraps garboard `DeviceSlice`)
-/// - `bridge::CudarcView` — RAII adapter from garboard slices to cudarc
-///   slices for the duration of the migration
 /// - Operators: GPU-accelerated operator implementations
-pub(crate) mod bridge;
 mod context;
 mod conv;
 pub mod cudnn;
@@ -121,23 +118,29 @@ pub use memory_pool::GpuMemoryPool;
 #[allow(unused_imports)]
 pub use tensor::{GpuTensor, TypedSlice};
 
-/// Check if CUDA is available on this system
+/// Check if CUDA is available on this system.
+///
+/// Probes garboard's CUDA backend by attempting to create a `Device` for
+/// ordinal 0. Returns `false` if no CUDA driver / device is present.
 pub fn cuda_available() -> bool {
-    cudarc::driver::CudaContext::new(0).is_ok()
+    garboard::Device::new_cuda(0).is_ok()
 }
 
-/// Get the number of available CUDA devices
+/// Get the number of available CUDA devices.
+///
+/// Garboard does not expose `cuDeviceGetCount` on the safe surface, so we
+/// probe ordinals 0..16 until `Device::new_cuda` fails. The upper bound
+/// is a sanity limit; no realistic system has more than 16 GPUs visible
+/// to a single process.
 pub fn cuda_device_count() -> usize {
-    // cudarc doesn't have a direct device count API in the safe layer
-    // Try to create contexts for devices 0..N until one fails
-    let mut count = 0;
-    while cudarc::driver::CudaContext::new(count).is_ok() {
+    let mut count = 0i32;
+    while garboard::Device::new_cuda(count).is_ok() {
         count += 1;
         if count > 16 {
-            break; // Reasonable upper limit
+            break;
         }
     }
-    count
+    count as usize
 }
 
 #[cfg(test)]

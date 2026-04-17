@@ -5,8 +5,9 @@ use crate::cuda::context::{CudaError, IconnxCudaContext};
 use garboard::{Module, Program};
 
 /// Compiled convolution kernels (im2col, col2im, add_bias variants)
-/// loaded as a garboard `Module`. cuDNN conv is still cudarc; this cache
-/// only covers the custom kernels.
+/// loaded as a garboard `Module`. cuDNN-backed conv/conv-transpose go
+/// through garboard's `DnnContext` (see `cuda::cudnn`); this cache only
+/// covers the custom im2col-style kernels.
 pub struct ConvKernelCache {
     module: Module<'static>,
 }

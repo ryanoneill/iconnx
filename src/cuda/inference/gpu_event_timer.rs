@@ -133,8 +133,8 @@ impl<'s> GpuEventTimer<'s> {
                     i, label, e
                 ))
             })?;
-            // Garboard clamps negative elapsed to zero internally, so we
-            // skip the defensive .max(0.0) the cudarc version needed.
+            // Garboard clamps negative elapsed to zero internally, so a
+            // defensive `.max(0.0)` here is unnecessary.
             let elapsed_us = (elapsed_secs * 1_000_000.0) as u64;
             let entry = map.entry(label).or_insert((0, 0));
             entry.0 += elapsed_us;

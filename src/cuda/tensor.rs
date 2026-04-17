@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::sys::CUdeviceptr;
 use garboard::DeviceSlice;
 
 use super::context::{CudaError, IconnxCudaContext};
@@ -116,10 +115,11 @@ impl GpuTensor {
     }
 
     /// Get the raw CUDA device pointer (for cache keying and direct GPU
-    /// operations). The `ctx` argument is accepted for API parity with
-    /// the old cudarc-backed implementation, which required the stream
-    /// for read/write tracking. Garboard needs no stream here.
-    pub fn device_ptr(&self, _ctx: &IconnxCudaContext) -> CUdeviceptr {
+    /// operations). Returns the `u64` `CUdeviceptr` value straight from the
+    /// underlying garboard `DeviceSlice`. The `ctx` argument is accepted
+    /// for API parity with older call sites that required a stream handle
+    /// for read/write tracking; garboard needs no stream here.
+    pub fn device_ptr(&self, _ctx: &IconnxCudaContext) -> u64 {
         match self {
             GpuTensor::Float32 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::Int64 { data, .. } => data.as_raw_device_ptr(),
@@ -203,11 +203,11 @@ impl GpuTensor {
 
     /// Get a mutable reference to the underlying Float32 `DeviceSlice`.
     ///
-    /// Fails if the `Arc` has multiple references — unlike the previous
-    /// cudarc implementation, garboard's `DeviceSlice` does not implement
-    /// `Clone`, so we cannot perform copy-on-write here. Shared-Arc
-    /// mutation would have been a bug anyway (two aliases would see
-    /// different post-mutation values).
+    /// Fails if the `Arc` has multiple references: garboard's
+    /// `DeviceSlice` does not implement `Clone`, so a copy-on-write
+    /// fallback is not possible here. Shared-`Arc` mutation would have
+    /// been a bug anyway (two aliases would see different post-mutation
+    /// values).
     pub fn data_f32_mut(&mut self) -> Result<&mut DeviceSlice<'static, f32>, CudaError> {
         match self {
             GpuTensor::Float32 { data, .. } => Arc::get_mut(data).ok_or_else(|| {

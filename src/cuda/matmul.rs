@@ -4,9 +4,8 @@
 //! GPU Matrix Multiplication via garboard's `BlasContext` (cuBLAS under the hood).
 //!
 //! MatMul / Gemm / BatchedMatMul call into `BlasContext::gemm` and
-//! `BlasContext::gemm_strided_batched`. All calls pass garboard
-//! `DeviceSlice` references directly; the prior cudarc `CudarcView` bridge
-//! is no longer needed.
+//! `BlasContext::gemm_strided_batched`, passing garboard `DeviceSlice`
+//! references directly.
 
 use core::ffi::c_longlong;
 

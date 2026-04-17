@@ -28,21 +28,23 @@ thiserror = "1.0"
 rustfft = "6.2"
 fftw = "0.8"
 
-[dependencies.cudarc]
-version = "0.17"
-features = ["cublas", "nvrtc", "cuda-12000"]
-optional = true
-
-# Garboard — safe Rust CUDA bindings. Migration target (see
-# docs/analysis/2026-04-14-iconnx-garboard-migration-plan.md in
-# rust-ai-explorations). Coexists with cudarc during Phase 1: this PR
-# migrates IconnxCudaContext's memory API (alloc_zeros/htod/dtoh) to
-# garboard; kernel launches, cuBLAS, and cuDNN remain on cudarc until
-# subsequent PRs migrate them one kernel cache at a time.
+# Garboard — safe Rust CUDA bindings. Iconnx's sole CUDA dependency
+# post-Phase-1 migration: device, stream, memory, NVRTC, cuBLAS, and
+# cuDNN conv/RNN all go through garboard.
 [dependencies.garboard]
 git = "https://github.com/ryanoneill/garboard.git"
 branch = "main"
 features = ["cuda"]
+optional = true
+
+# garboard-sys — raw CUDA Driver FFI bindings. Needed for the
+# init-time LSTM weight-pack D2D copies (`cuMemcpyDtoD_v2`) in
+# `cuda/cudnn/rnn.rs`, until garboard exposes a sub-slice /
+# stream-scoped D2D API. Pinned to the same git source + branch as
+# `garboard` to keep the CUDA-header version in lockstep.
+[dependencies.garboard-sys]
+git = "https://github.com/ryanoneill/garboard.git"
+branch = "main"
 optional = true
 
 # bytemuck — garboard's DeviceSlice<T> requires T: bytemuck::Pod. Used by
@@ -52,12 +54,23 @@ version = "1.14"
 features = ["derive"]
 optional = true
 
+# serde / serde_json — used by the `debug-inference` checkpoint system
+# to (de)serialize ORT reference metadata.
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+optional = true
+
+[dependencies.serde_json]
+version = "1.0"
+optional = true
+
 [features]
 default = ["cuda"]
 # Enable CUDA GPU acceleration.
-cuda = ["dep:cudarc", "dep:garboard", "dep:bytemuck"]
+cuda = ["dep:garboard", "dep:garboard-sys", "dep:bytemuck"]
 # Enable GPU inference debugging: tensor validation, checkpoints, differential testing
-debug-inference = []
+debug-inference = ["dep:serde", "dep:serde_json"]
 
 [build-dependencies]
 prost-build = "0.13"

@@ -138,8 +138,7 @@ extern "C" __global__ void transpose_general_i64_kernel(
 // Functionally identical to transpose_general_kernel — both move 4-byte
 // scalars by index — but exists as its own symbol so the Rust type system
 // (garboard's TypedKernel) can enforce that an i32 slice is paired with
-// an i32-typed kernel. Pre-migration cudarc could erase the pointer type
-// and reuse the float kernel; garboard cannot.
+// an i32-typed kernel. The cost is one extra NVRTC symbol in the module.
 extern "C" __global__ void transpose_general_i32_kernel(
     int* out, const int* inp,
     const size_t* in_shape, const size_t* in_strides,

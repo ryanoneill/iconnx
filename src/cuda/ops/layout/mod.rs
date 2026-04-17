@@ -284,9 +284,10 @@ pub fn gpu_transpose_nd(
         GpuTensor::Int32 { .. } => {
             let mut output = pool.get_tensor_i32(ctx, out_shape)?;
             // SAFETY: transpose_general_i32_kernel signature mirrors transpose_general_kernel
-            // with `int*` (i32) data pointers in place of `float*`. Pre-garboard the
-            // float kernel was reused via cudarc's type-erased pointer wrapper; garboard
-            // requires a properly typed kernel symbol.
+            // with `int*` (i32) data pointers in place of `float*`. Garboard's
+            // `TypedKernel` requires the kernel's parameter types to match the
+            // Rust-side tuple, so we compile a dedicated i32 symbol rather than
+            // reusing the f32 kernel.
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
                     &mut garboard::DeviceSlice<'_, i32>,

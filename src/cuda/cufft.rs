@@ -9,8 +9,6 @@
 use std::ffi::c_int;
 use std::ptr;
 
-use cudarc::driver::{DeviceRepr, ValidAsZeroBits};
-
 use super::context::{CudaError, IconnxCudaContext};
 use super::tensor::GpuTensor;
 
@@ -159,12 +157,8 @@ pub struct CufftComplex {
     pub y: f32, // imaginary
 }
 
-// SAFETY: CufftComplex is a #[repr(C)] struct containing only f32 values,
-// which are valid for GPU memory operations. The layout matches cuFloatComplex.
-unsafe impl DeviceRepr for CufftComplex {}
-
-// SAFETY: CufftComplex is valid when zero-initialized (0.0 + 0.0i is valid)
-unsafe impl ValidAsZeroBits for CufftComplex {}
+// `CufftComplex` derives `bytemuck::Pod` + `bytemuck::Zeroable` above,
+// which is the trait surface garboard's `DeviceSlice<T>` requires.
 
 // FFI declarations for cuFFT
 #[link(name = "cufft")]

@@ -16,17 +16,15 @@
 //!   `(w_ptr, r_ptr, seq_length)` (since plans bake seq_length into the
 //!   RNN data descriptors).
 //!
-//! The weight packing D2D copies still use `cudarc::driver::sys::
-//! cuMemcpyDtoDAsync_v2` — garboard does not yet expose sub-slicing of
-//! `DeviceSlice<u8>`. Packing happens at most once per unique weight pair
-//! per process lifetime, so this is not a hot path and will be cleaned up
-//! in PR 5d together with the rest of the cudarc dependency removal.
-//!
-//! Ordering guarantee: the cudarc stream (used for weight-pack D2Ds) and
-//! the garboard stream (used for `rnn_forward_with_plan`) are both
-//! blocking streams (flags=0), so they implicitly serialize through the
-//! legacy null stream — packing always completes before the first forward
-//! call observes the packed buffer.
+//! The weight-packing D2D copies use `garboard_sys::cuMemcpyDtoD_v2`
+//! directly — the synchronous driver-level memcpy — because garboard's
+//! safe surface does not yet expose sub-slicing of `DeviceSlice<u8>`
+//! (needed to target individual cuDNN linLayerID offsets within the
+//! packed weight buffer). Packing happens at most once per unique
+//! weight pair per process lifetime (~72 small copies for a Kokoro
+//! BiLSTM), so the sync-copy cost is well under 1 ms at model-load
+//! time and never on the inference hot path. Follow-up: replace with
+//! `Stream::copy_device_to_device` once garboard adds a sub-slice API.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -164,10 +162,10 @@ pub fn pack_lstm_weights_for_cudnn(
     // Allocate packed weight buffer (zero-initialized for safety).
     let weight_buffer = ctx.alloc_zeros::<u8>(weight_space_size)?;
 
-    // Use the cudarc stream for the init-time D2D copies. Both streams
-    // are blocking (flags=0), so subsequent `rnn_forward_with_plan` on
-    // the garboard stream observes the packed buffer.
-    let cudarc_stream = ctx.stream().cu_stream();
+    // The alloc_zeros above queued a `cuMemsetD8Async` on the garboard
+    // user stream; drain before issuing the sync D2D copies so the
+    // zero-fill is observed.
+    ctx.sync()?;
 
     for dir in 0..num_directions {
         let pseudo_layer = dir as i32;
@@ -192,16 +190,20 @@ pub fn pack_lstm_weights_for_cudnn(
             let src_ptr =
                 (w_base_ptr as usize + w_offset_floats * std::mem::size_of::<f32>()) as u64;
 
+            // SAFETY: dst_ptr is a valid device pointer inside
+            // `weight_buffer` (offset returned by cuDNN itself), src_ptr
+            // is a valid device pointer inside `w.data_f32()`, and
+            // `w_size_bytes` is the per-gate weight tile size that cuDNN
+            // expects. The call is synchronous; no stream handle required.
             unsafe {
-                let status = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                let status = garboard_sys::cuMemcpyDtoD_v2(
                     dst_ptr,
                     src_ptr,
                     w_size_bytes,
-                    cudarc_stream,
                 );
-                if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                if status != garboard_sys::cudaError_enum::CUDA_SUCCESS {
                     return Err(CudaError::Transfer(format!(
-                        "cuMemcpyDtoDAsync failed for W gate {}: {:?}",
+                        "cuMemcpyDtoD failed for W gate {}: {:?}",
                         onnx_gate, status
                     )));
                 }
@@ -230,16 +232,19 @@ pub fn pack_lstm_weights_for_cudnn(
             let src_ptr =
                 (r_base_ptr as usize + r_offset_floats * std::mem::size_of::<f32>()) as u64;
 
+            // SAFETY: see W-weight copy above — dst is inside
+            // weight_buffer at the cuDNN-reported offset, src is inside
+            // `r.data_f32()`, and `r_size_bytes` is the per-gate
+            // recurrence-weight tile. Synchronous copy.
             unsafe {
-                let status = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                let status = garboard_sys::cuMemcpyDtoD_v2(
                     dst_ptr,
                     src_ptr,
                     r_size_bytes,
-                    cudarc_stream,
                 );
-                if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                if status != garboard_sys::cudaError_enum::CUDA_SUCCESS {
                     return Err(CudaError::Transfer(format!(
-                        "cuMemcpyDtoDAsync failed for R gate {}: {:?}",
+                        "cuMemcpyDtoD failed for R gate {}: {:?}",
                         onnx_gate, status
                     )));
                 }
@@ -282,16 +287,19 @@ pub fn pack_lstm_weights_for_cudnn(
                         + wb_offset_floats * std::mem::size_of::<f32>())
                         as u64;
 
+                    // SAFETY: dst is the cuDNN-reported bias offset
+                    // within weight_buffer, src is inside the ONNX
+                    // bias tensor's device storage; `bias_size_bytes`
+                    // is the per-gate bias size. Synchronous copy.
                     unsafe {
-                        let status = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                        let status = garboard_sys::cuMemcpyDtoD_v2(
                             dst_ptr,
                             src_ptr,
                             bias_size_bytes,
-                            cudarc_stream,
                         );
-                        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                        if status != garboard_sys::cudaError_enum::CUDA_SUCCESS {
                             return Err(CudaError::Transfer(format!(
-                                "cuMemcpyDtoDAsync failed for Wb gate {}: {:?}",
+                                "cuMemcpyDtoD failed for Wb gate {}: {:?}",
                                 onnx_gate, status
                             )));
                         }
@@ -328,16 +336,18 @@ pub fn pack_lstm_weights_for_cudnn(
                         + rb_offset_floats * std::mem::size_of::<f32>())
                         as u64;
 
+                    // SAFETY: recurrence-bias variant of the Wb copy
+                    // above; same device-pointer validity argument.
+                    // Synchronous copy.
                     unsafe {
-                        let status = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                        let status = garboard_sys::cuMemcpyDtoD_v2(
                             dst_ptr,
                             src_ptr,
                             bias_size_bytes,
-                            cudarc_stream,
                         );
-                        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                        if status != garboard_sys::cudaError_enum::CUDA_SUCCESS {
                             return Err(CudaError::Transfer(format!(
-                                "cuMemcpyDtoDAsync failed for Rb gate {}: {:?}",
+                                "cuMemcpyDtoD failed for Rb gate {}: {:?}",
                                 onnx_gate, status
                             )));
                         }

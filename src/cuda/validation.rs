@@ -8,11 +8,9 @@
 //! All validation is performed on-device to minimize data transfers.
 //! This module is compile-gated behind the `debug-inference` feature.
 
-use super::bridge::GbKernelArg;
 use super::context::{CudaError, IconnxCudaContext};
 use super::tensor::GpuTensor;
-use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
-use garboard::DeviceSlice;
+use garboard::{DeviceSlice, LaunchConfig, Module, Program};
 use std::sync::Arc;
 
 /// Validation mode flags
@@ -312,27 +310,38 @@ extern "C" __global__ void validate_f32(
 }
 "#;
 
-/// Cache for validation kernel
+/// Cache for validation kernel.
+///
+/// The kernel is compiled once via garboard's NVRTC wrapper and loaded
+/// into a module; lookups happen per-launch (~200 ns) because
+/// `TypedKernel<'d, Args>` bakes concrete lifetimes into `Args`, which
+/// cannot be stored as a struct field when the args reference local
+/// buffers allocated inside `validate_f32`.
 pub struct ValidationKernelCache {
-    validate_f32: CudaFunction,
+    module: Module<'static>,
 }
 
 impl ValidationKernelCache {
-    /// Compile and cache validation kernels
+    /// Compile and cache validation kernels via garboard's NVRTC wrapper.
     pub fn new(ctx: &IconnxCudaContext) -> Result<Self, CudaError> {
-        let ptx = cudarc::nvrtc::compile_ptx(VALIDATE_KERNEL_SRC)
-            .map_err(|e| CudaError::Kernel(format!("Validation kernel compile failed: {}", e)))?;
+        let program = Program::compile_for_device(
+            VALIDATE_KERNEL_SRC,
+            ctx.garboard_device(),
+            &[],
+        )
+        .map_err(|e| CudaError::Kernel(format!("Validation kernel compile failed: {}", e)))?;
 
         let module = ctx
-            .context()
-            .load_module(ptx)
+            .garboard_device()
+            .load_module(&program)
             .map_err(|e| CudaError::Kernel(format!("Module load failed: {}", e)))?;
 
-        let validate_f32 = module
-            .load_function("validate_f32")
-            .map_err(|e| CudaError::Kernel(format!("Function load failed: {}", e)))?;
+        // Verify the kernel symbol is present at cache-construction time.
+        module
+            .function("validate_f32")
+            .map_err(|e| CudaError::Kernel(format!("Function lookup failed: {}", e)))?;
 
-        Ok(Self { validate_f32 })
+        Ok(Self { module })
     }
 
     /// Validate an f32 tensor on GPU
@@ -358,28 +367,46 @@ impl ValidationKernelCache {
         let block_size = 256usize;
         let grid_size = len.div_ceil(block_size).min(1024);
 
-        // Launch kernel using stream.launch_builder pattern
         let cfg = LaunchConfig {
-            block_dim: (block_size as u32, 1, 1),
             grid_dim: (grid_size as u32, 1, 1),
+            block_dim: (block_size as u32, 1, 1),
             shared_mem_bytes: 0,
         };
 
         let len_u32 = len as u32;
 
-        unsafe {
-            ctx.stream()
-                .launch_builder(&self.validate_f32)
-                .arg(&GbKernelArg::new(data))
-                .arg(&len_u32)
-                .arg(&GbKernelArg::new_mut(&mut nan_count))
-                .arg(&GbKernelArg::new_mut(&mut inf_count))
-                .arg(&GbKernelArg::new_mut(&mut min_val))
-                .arg(&GbKernelArg::new_mut(&mut max_val))
-                .arg(&GbKernelArg::new_mut(&mut sum))
-                .launch(cfg)
-                .map_err(|e| CudaError::Kernel(format!("Validation kernel launch failed: {}", e)))?;
+        // SAFETY: C signature is
+        // `(const float* data, unsigned int len, unsigned int* nan_count,
+        //    unsigned int* inf_count, float* min_val, float* max_val,
+        //    double* sum)`.
+        let kernel = unsafe {
+            self.module.typed_kernel::<(
+                &DeviceSlice<'_, f32>,
+                u32,
+                &mut DeviceSlice<'_, u32>,
+                &mut DeviceSlice<'_, u32>,
+                &mut DeviceSlice<'_, f32>,
+                &mut DeviceSlice<'_, f32>,
+                &mut DeviceSlice<'_, f64>,
+            )>("validate_f32")
         }
+        .map_err(|e| CudaError::Kernel(format!("validate_f32 lookup failed: {}", e)))?;
+
+        kernel
+            .launch(
+                ctx.garboard_stream(),
+                &cfg,
+                (
+                    data,
+                    len_u32,
+                    &mut nan_count,
+                    &mut inf_count,
+                    &mut min_val,
+                    &mut max_val,
+                    &mut sum,
+                ),
+            )
+            .map_err(|e| CudaError::Kernel(format!("Validation kernel launch failed: {}", e)))?;
 
         ctx.sync()?;
 

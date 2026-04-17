@@ -4,8 +4,7 @@
 //! memory by (dtype, size) and returns pooled memory when available,
 //! falling back to fresh allocation when not.
 //!
-//! Post-garboard migration: the pool stores garboard
-//! `DeviceSlice<'static, T>` instead of cudarc `CudaSlice<T>`.
+//! Pooled buffers are stored as garboard `DeviceSlice<'static, T>`.
 
 use std::collections::HashMap;
 use std::sync::Arc;

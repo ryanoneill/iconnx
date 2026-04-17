@@ -44,11 +44,11 @@ mod tests {
 
     /// Microbenchmark: per-call cost of small host-to-device uploads via
     /// `IconnxCudaContext::htod_usize` (which goes through garboard's
-    /// `Device::copy_host_to_device`, the synchronous `cuMemcpyHtoD_v2`).
-    /// Diagnostic for the post-PR-5b regression — every shape/stride
-    /// upload in layout ops blocks the CPU on completion. With many
-    /// such uploads per inference, this could account for the gap to
-    /// the cudarc baseline.
+    /// `Stream::copy_host_to_device`, the asynchronous
+    /// `cuMemcpyHtoDAsync`). Diagnostic kept around for regression
+    /// triage — every layout op does a shape/stride upload, so any
+    /// regression here compounds across the ~2400 ops in a Kokoro
+    /// inference.
     #[test]
     #[ignore = "microbenchmark — requires CUDA GPU"]
     fn bench_htod_usize_cost() {

@@ -6,7 +6,7 @@
 //! ## Features
 //!
 //! - **ONNX Opset 17+ support** - Modern operators for transformer models
-//! - **CUDA GPU acceleration** - Native cuBLAS/cuDNN integration via cudarc
+//! - **CUDA GPU acceleration** - Native cuBLAS/cuDNN integration via garboard
 //! - **Concurrent inference** - Multiple streams share weights for optimal GPU utilization
 //! - **CPU fallback** - Full CPU implementation for testing and portability
 //! - **Pure Rust** - No C++ dependencies, just Rust + CUDA

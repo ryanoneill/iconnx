@@ -1,11 +1,10 @@
 //! GPU Elementwise Kernels via garboard NVRTC + TypedKernel.
 //!
-//! This is the first kernel cache migrated from cudarc launches to
-//! garboard's typed launch pattern (Phase 1 plan step 4). The kernel
-//! source strings are unchanged — NVRTC compiles them either way. What
-//! changes is the Rust side: `Module::typed_kernel::<Args>` gives us
-//! compile-time parameter-type checking at the cost of the `unsafe`
-//! declaration of the kernel's C signature.
+//! Elementwise kernels are compiled once into a garboard `Module` and
+//! launched via the typed-kernel API on garboard's user stream.
+//! `Module::typed_kernel::<Args>` gives us compile-time parameter-type
+//! checking at the cost of an `unsafe` declaration of the kernel's C
+//! signature at each launch site.
 //!
 //! Kernels are resolved per-launch via `Module::typed_kernel`, which is
 //! a thin wrapper over `cuModuleGetFunction`. That lookup cost (~200 ns)
