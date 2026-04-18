@@ -12,6 +12,7 @@ use super::patterns::{FusedPattern, FusedPatternInfo};
 use crate::cuda::context::IconnxCudaContext;
 use crate::cuda::inference::ExecutionNode;
 use crate::cuda::tensor::GpuTensor;
+use crate::tensor::Tensor;
 
 /// Detect all fuseable operator patterns in the given node list.
 ///
@@ -35,6 +36,65 @@ pub(crate) fn detect_fused_patterns(
     nodes: &[ExecutionNode],
     weights: &HashMap<String, GpuTensor>,
     ctx: &IconnxCudaContext,
+) -> (
+    HashMap<String, FusedPatternInfo>,
+    HashSet<String>,
+    HashMap<String, FusedPatternInfo>,
+) {
+    detect_with_scalar_lookup(
+        nodes,
+        |name| {
+            weights
+                .get(name)
+                .filter(|t| t.len() == 1)
+                .and_then(|t| t.to_host_f32(ctx).ok())
+        },
+        |name| weights.contains_key(name),
+    )
+}
+
+/// CPU-side variant used by `ir::passes::fusion`. Identical pattern-matching
+/// logic to `detect_fused_patterns` but sources scalar values from CPU
+/// `Tensor` initializers instead of round-tripping them through the GPU via
+/// `to_host_f32(ctx)`. Eliminates the D2H copy during fusion detection.
+pub(crate) fn detect_fused_patterns_from_cpu(
+    nodes: &[ExecutionNode],
+    initializers: &HashMap<String, Tensor>,
+) -> (
+    HashMap<String, FusedPatternInfo>,
+    HashSet<String>,
+    HashMap<String, FusedPatternInfo>,
+) {
+    detect_with_scalar_lookup(
+        nodes,
+        |name| {
+            initializers.get(name).and_then(|t| match t {
+                Tensor::Float32(_) if t.len() == 1 => Some(t.as_slice()),
+                _ => None,
+            })
+        },
+        |name| initializers.contains_key(name),
+    )
+}
+
+/// Shared core of the fusion detector, parameterised by scalar-lookup and
+/// presence-check closures so the same pattern-matching logic can serve
+/// both the GPU entry point (`detect_fused_patterns`, reads scalars via
+/// `to_host_f32`) and the CPU entry point (`detect_fused_patterns_from_cpu`,
+/// reads scalars directly from CPU `Tensor` initializers).
+///
+/// `read_f32(name)` returns `Some(vec)` when `name` refers to a length-1
+/// float tensor whose value has been brought to host memory (for GPU: via
+/// `to_host_f32`; for CPU: via `Tensor::as_slice`), or `None` otherwise
+/// (name not registered, wrong dtype, not scalar, or GPU D2H failure).
+///
+/// `is_initializer(name)` returns `true` iff `name` is registered as an
+/// initializer (regardless of dtype). The detector uses this for static-
+/// value predicates that don't need to inspect the value itself.
+fn detect_with_scalar_lookup(
+    nodes: &[ExecutionNode],
+    read_f32: impl Fn(&str) -> Option<Vec<f32>>,
+    is_initializer: impl Fn(&str) -> bool,
 ) -> (
     HashMap<String, FusedPatternInfo>,
     HashSet<String>,
@@ -84,7 +144,7 @@ pub(crate) fn detect_fused_patterns(
     // or any other chain. A broader shape/value inference pass would be
     // needed for those.
     let is_static = |name: &str| -> bool {
-        weights.contains_key(name)
+        is_initializer(name)
             || output_to_node
                 .get(name)
                 .map(|n| n.op_type == "Constant")
@@ -275,17 +335,9 @@ pub(crate) fn detect_fused_patterns(
 
             // Check if exponent is 3 (for GELU pattern)
             let exp_input = &node.inputs[1];
-            let exp_is_three = weights.get(exp_input).is_some_and(|t| {
-                if t.len() == 1 {
-                    if let Ok(data) = t.to_host_f32(ctx) {
-                        (data[0] - 3.0).abs() < 1e-6
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            });
+            let exp_is_three = read_f32(exp_input)
+                .map(|data| (data[0] - 3.0).abs() < 1e-6)
+                .unwrap_or(false);
 
             if !exp_is_three {
                 continue;
@@ -471,15 +523,9 @@ pub(crate) fn detect_fused_patterns(
             continue;
         }
         let p_input = &pow_node.inputs[1];
-        let p_is_integer_scalar_weight = weights.get(p_input).is_some_and(|t| {
-            if t.len() != 1 {
-                return false;
-            }
-            match t.to_host_f32(ctx) {
-                Ok(data) => data[0].fract() == 0.0,
-                Err(_) => false,
-            }
-        });
+        let p_is_integer_scalar_weight = read_f32(p_input)
+            .map(|data| data[0].fract() == 0.0)
+            .unwrap_or(false);
         if !p_is_integer_scalar_weight {
             continue;
         }
@@ -580,7 +626,7 @@ pub(crate) fn detect_fused_patterns(
                 // Only fuse if c is a weight (constant) to ensure shape compatibility
                 // Fused kernels don't support broadcasting, so we can't use computed values
                 // that might have different shapes requiring broadcast
-                if !weights.contains_key(&c_input) {
+                if !is_initializer(&c_input) {
                     continue;
                 }
 
@@ -633,7 +679,7 @@ pub(crate) fn detect_fused_patterns(
 
                 // Only fuse if c is a weight (constant) to ensure shape compatibility
                 // Fused kernels don't support broadcasting
-                if !weights.contains_key(&c_input) {
+                if !is_initializer(&c_input) {
                     continue;
                 }
 
@@ -685,7 +731,7 @@ pub(crate) fn detect_fused_patterns(
 
                 // Only fuse if c is a weight (constant) to ensure shape compatibility
                 // Fused kernels don't support broadcasting
-                if !weights.contains_key(&c_input) {
+                if !is_initializer(&c_input) {
                     continue;
                 }
 
@@ -737,7 +783,7 @@ pub(crate) fn detect_fused_patterns(
 
                 // Only fuse if c is a weight (constant) to ensure shape compatibility
                 // Fused kernels don't support broadcasting
-                if !weights.contains_key(&c_input) {
+                if !is_initializer(&c_input) {
                     continue;
                 }
 

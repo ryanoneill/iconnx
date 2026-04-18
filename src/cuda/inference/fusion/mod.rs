@@ -14,4 +14,4 @@ pub(crate) mod patterns;
 pub(crate) mod detection;
 
 pub use patterns::{FusedPattern, FusedPatternInfo};
-pub(crate) use detection::detect_fused_patterns;
+pub(crate) use detection::{detect_fused_patterns, detect_fused_patterns_from_cpu};

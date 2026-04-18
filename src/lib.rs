@@ -61,6 +61,7 @@ pub mod cuda;
 pub mod engine;
 pub mod graph;
 pub mod graph_executor;
+pub mod ir;
 pub mod onnx_parser;
 pub mod operators;
 pub mod tensor;
