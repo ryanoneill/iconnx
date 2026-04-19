@@ -142,7 +142,7 @@ pub fn constant_folding(graph: OptimizableGraph) -> OptimizableGraph;
 - Semi-constant chain (one dynamic input) → unchanged.
 - Unknown op type → unchanged.
 - Shape tensor folded from Constant → ConstantOfShape chain.
-- Numerical equivalence: fold a known subgraph manually; assert CPU-folded result matches pre-fold GPU result to 1e-7.
+- Numerical equivalence: fold a known subgraph manually; assert CPU-folded result matches pre-fold GPU result. **Tolerance: 1e-7 for single-op subgraphs** (roughly f32 epsilon); **1e-6 for chains of ≥ 2 folded ops** (cumulative rounding can exceed f32 epsilon across consecutive operations).
 
 ### Commit #3: `shape_inference` + Reshape precompute upgrade
 
@@ -191,7 +191,7 @@ src/ir/passes/shape_inference/
 **Tests:**
 - Graph with known input shapes (`[1, 3, 224, 224]`) → every intermediate shape fully static.
 - Dynamic-batch case (`[None, 3, 224, 224]`) → batch propagates as `None` through all ops; feature dims stay static.
-- Reshape with `[-1, 512]` against inferred `[None, 16, 512]` → resolves to `[None * 16, 512]` (i.e. `[None, 512]` since the first dim is dynamic).
+- Reshape with `[-1, 512]` against inferred `[None, 16, 512]` → resolves to `[None, 512]`. **Known limitation:** the inferencer collapses `None * 16` to `None` rather than tracking the multiplicative structure across dynamic dims. Acceptable for Kokoro (single-batch inference); would need extension for multi-batch dynamic-shape inference where preserving divisibility constraints matters for downstream pass correctness.
 - Unknown op (NonZero) in middle → propagation halts at its output; downstream dims become `None`.
 - Consistency: re-running shape_inference on its own output produces the same map.
 
@@ -235,7 +235,7 @@ pub enum FusedPattern {
 
 **Phase 2 adapter disposition** (`src/ir/passes/fusion.rs`):
 - The Phase 2 adapter is a thin wrapper over `cuda::inference::fusion::detect_fused_patterns_from_cpu`. It writes `FusionAnnotations`.
-- After elementwise_fusion lands, the new pass writes `FusionAnnotations` directly. If it fully subsumes the adapter (i.e., every pattern today's adapter finds is also found by elementwise_fusion to numerical equivalence), delete `src/ir/passes/fusion.rs` and route lowering through elementwise_fusion only. If any pattern is lost, keep both passes in sequence: `elementwise_fusion(g)` then `detect_fusion(g)` — two passes writing into the same annotations map.
+- After elementwise_fusion lands, the new pass writes `FusionAnnotations` directly. If it fully subsumes the adapter (i.e., every pattern today's adapter finds is also found by elementwise_fusion to numerical equivalence), delete `src/ir/passes/fusion.rs` and route lowering through elementwise_fusion only. If any pattern is lost, keep both passes in sequence: `elementwise_fusion(g)` then `detect_fusion(g)` — two passes writing into the same annotations map. **Merge rule** when both run: `detect_fusion` only annotates head nodes that are NOT already annotated by `elementwise_fusion` (elementwise_fusion wins any conflict). Prevents double-annotation on an op that both passes recognize as a fusion head.
 - This decision is made at commit #4 implementation time based on equivalence-test results. **The hand-coded kernels in `src/cuda/executor/fused.rs` ARE NOT affected** by this decision — they stay under option (a) lock regardless.
 
 **Line budgets:**
