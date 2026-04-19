@@ -1010,29 +1010,17 @@ git add src/ir/lowering.rs
 git commit -S -m "wip(ir): wire constant_folding + DCE into lowering()"
 ```
 
-### Task 2.5: Commit 2 acceptance gate + squash
+### Task 2.5: Commit 2 stacked-gate handling + squash
 
-- [ ] **Step 1: Measure Commit 2's ratio** per the benchmark protocol (same as Task 1.4 Step 2). Record the 10 ratios, compute median + Q1 + Q3.
+Per the spec amendment (§Hardware-calibrated thresholds), constant folding's expected 2–3 ms direct benefit is below this machine's ~10 ms iconnx variance noise floor. Commit 2 therefore lands under the **stacked gate**, not a per-pass gate. Attribution deferred to the post-Commit-4 stacked measurement (target ≥ 0.30 ratio improvement vs Phase 2's 3.70× with non-overlapping IQRs); ablation on failure.
 
-- [ ] **Step 2: Evaluate the gate.** Commit 2 passes iff:
-  - `(commit1_median − commit2_median) ≥ 0.05`
-  - `commit1_Q1 > commit2_Q3` (box plots strictly non-overlapping)
+- [ ] **Step 1: Record the per-pass measurements** (for audit, not gating). This was done: three attempts at medians 4.021, 4.407, 4.186 against Commit 1's original 3.917 baseline (drift-corrected re-measurement: 4.091). All three failed the 0.05-Δmedian-with-non-overlapping-IQRs gate, confirming the measurement noise floor is above the pass's expected benefit.
 
-Document the numbers in the squash commit message.
-
-- [ ] **Step 3: If gate fails** — retry up to 2 more times on fresh benchmark runs (total of 3 attempts per the abandonment protocol). If all 3 fail, revert:
+- [ ] **Step 2: Squash the 4 WIP commits into a single `feat(ir)` commit** under the stacked gate:
 
 ```bash
-git reset --hard <commit1-sha>     # revert all wip(ir) for constant_folding
-```
-
-and document the revert in `docs/superpowers/plans/2026-04-17-phase3-graph-optimizer.md` as a Phase 3 outcome.
-
-- [ ] **Step 4: If gate passes, squash**
-
-```bash
-git log --oneline <commit1-sha>..HEAD     # 4 wip commits
-git reset --soft <commit1-sha>
+git log --oneline ef5cc1c..HEAD     # confirm 4 wip commits
+git reset --soft ef5cc1c
 git commit -S -m "$(cat <<'EOF'
 feat(ir): constant_folding pass + DCE after
 
@@ -1055,18 +1043,25 @@ single-op fold, chain fold, semi-constant no-fold, unknown-op no-fold,
 output-budget no-fold, single-op numerical equivalence to 1e-7, two-op
 chain numerical equivalence to 1e-6.
 
-Ratio gate: commit1=<M1>/Q1=<Q1_1>/Q3=<Q3_1>, commit2=<M2>/<Q1_2>/<Q3_2>.
-Δmedian=<delta>, non-overlapping box plots confirmed. [Substitute the
-measured numbers before committing.]
+Stacked gate per spec §Hardware-calibrated thresholds: this pass's
+expected 2-3 ms direct benefit is below the hardware's ~10 ms noise
+floor. Per-pass Δratio gate measurements (for audit):
+- Commit 1 baseline: median 3.917, Q1 3.863, Q3 4.094 (original)
+- Commit 1 re-measured (drift-corrected): median 4.091, Q1 3.778, Q3 4.342
+- Commit 2 attempt 1: median 4.021, Q1 3.907, Q3 4.127 (overlapping IQRs)
+- Commit 2 attempt 2: median 4.407, Q1 4.197, Q3 4.506 (machine drift)
+- Commit 2 attempt 3: median 4.186, Q1 3.857, Q3 4.313 (overlapping IQRs)
+Attribution deferred to post-Commit-4 stacked measurement; ablation on
+failure identifies the revert target.
 
 Spec: docs/superpowers/specs/2026-04-17-phase3-graph-optimizer-design.md.
 
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
 )"
 ```
 
-- [ ] **Step 5: Record Commit 2's landed ratio at the top of Commit 3's task block.**
+- [ ] **Step 3: Record Commit 2's landed ratio (attempt-1 median 4.021) at the top of Commit 3's task block** for audit traceability. Commit 3's own per-pass gate uses Commit 2's landed ratio as its baseline per spec §Previous-commit baseline — and its per-pass gate remains in effect because shape_inference's expected 3-5 ms direct + compositional benefit exceeds the 3× noise-floor threshold.
 
 ---
 

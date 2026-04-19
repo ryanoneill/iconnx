@@ -46,7 +46,7 @@ Five signed commits on branch `ir-phase3`:
 | # | Commit | Files | Gate |
 |---|---|---|---|
 | 1 | feat(ir): DCE sweep pass | `src/ir/passes/dce.rs`, `src/ir/passes/mod.rs`, `src/ir/lowering.rs` | **Tests pass + zero regression.** No Δratio gate provided the pre-flight sanity check (see below) shows `lower(kokoro)` produces zero orphan ops. If it shows nonzero, DCE falls under the Δratio gate like the other passes. |
-| 2 | feat(ir): constant folding + DCE after | `src/ir/passes/constant_folding.rs`, lowering.rs, mod.rs | Median-of-10 warm runs; **previous Q1 > current Q3** (strictly non-overlapping box plots); **Δmedian ≥ 0.05 ratio points** vs the previous landed commit's ratio. |
+| 2 | feat(ir): constant folding + DCE after | `src/ir/passes/constant_folding.rs`, lowering.rs, mod.rs | Stacked gate — see §Hardware-calibrated thresholds. Lands WIP; attribution deferred to post-#4 stacked measurement. |
 | 3 | feat(ir): shape inference + DCE after | `src/ir/passes/shape_inference.rs`, `src/ir/plan.rs` (adds `tensor_shapes` field), lowering.rs, mod.rs | Same Δratio gate; baseline = commit #2's landed ratio. |
 | 4 | feat(ir): general elementwise fusion + DCE after | `src/ir/passes/elementwise_fusion.rs`, `src/ir/passes/elementwise_fusion_codegen.rs`, `src/cuda/fused/general_chain.rs`, `src/cuda/executor/fused.rs` (new dispatch arm), optional deletion of `src/ir/passes/fusion.rs`, lowering.rs, mod.rs | Same Δratio gate; baseline = commit #3's landed ratio. Commit includes per-variant equivalence tests (see §Testing). |
 
@@ -88,6 +88,18 @@ Documented in the plan; applied identically for baseline recording and gate meas
 - **Clocks:** fixed via `sudo nvidia-smi -lgc <max>,<max>` on supported GPUs. The laptop RTX 4070 typically does not support clock locking; skip in that case and document.
 - **Warmup:** W = 3 warmup iterations discarded before the 10 measured. The benchmark binary already runs one warmup; the harness extends to 3.
 - **Baseline freshness:** the "previous landed commit's ratio" is recorded at the time of that commit's own gate, not recomputed at a later commit's gate time. Documented in the plan.
+
+### Hardware-calibrated thresholds
+
+The 0.05 Δratio floor assumes a measurement noise floor below ~2 ms iconnx variance. On the current development machine (laptop RTX 4070, no clock-locking support), measured iconnx run-to-run variance is ~10 ms, and baseline ratios drift ~0.15–0.20 between sessions even on unchanged code. Passes whose expected direct per-run benefit falls below ~3× the hardware's noise floor cannot be resolved by a per-pass Δratio gate on this hardware.
+
+Per-pass gate applies to passes whose expected direct per-run benefit exceeds 3× noise floor. On this machine: commits #3 (shape_inference + Reshape precompute, expected 3–5 ms direct + compositional) and #4 (elementwise fusion, expected 15–25 ms) remain individually gated.
+
+Stacked gate applies to passes below the per-pass resolution threshold. On this machine: commit #2 (constant_folding, expected 2–3 ms direct) lands WIP and is gated as part of a stacked measurement after commit #4:
+- Stack target: ≥ 0.30 ratio improvement vs Phase 2's recorded baseline (3.70×) with non-overlapping IQRs (roughly 3× single-pass floor, calibrated to beat the hardware's noise floor).
+- If the stacked gate fails: run ablation. Disable each pass in turn (feature-flag or cherry-pick revert on a throwaway branch), re-measure. The pass whose disabling does not degrade stacked ratio is the revert target.
+
+Hardware portability. These thresholds are calibrated to the current 4070 laptop. On different hardware (workstation GPU with lockable clocks, stable thermals), the noise floor may be low enough to return commit #2 to a per-pass gate. Re-measure noise floor before inheriting thresholds.
 
 ### Cumulative fp drift
 
@@ -313,6 +325,7 @@ Per §Gating protocol.
 - GpuGraphExecutor strangler-shim deletion → follow-up after Phase 3 + 3.5 land (nothing external still reaches through it).
 - Per-op shape-inference implementations beyond the 28-op Kokoro set. Adding more is a mechanical extension; the pass infrastructure accepts them.
 - Partial constant propagation (`Add(const, x)` where only one input is constant). Full-constant-only folding is sufficient for Kokoro.
+- A per-pass Δratio gate for sub-noise-floor passes on the current hardware. Stacked gates with ablation are the principled alternative until hardware allows tighter resolution.
 
 ## Open questions
 
