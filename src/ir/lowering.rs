@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use crate::cuda::cudnn::pack_lstm_weights_for_cudnn;
 use crate::cuda::{CudaError, GpuTensor, IconnxCudaContext};
 use crate::ir::graph::OptimizableGraph;
-use crate::ir::passes::{detect_fusion, precompute_params, topo_sort};
+use crate::ir::passes::{dead_code_elimination, detect_fusion, precompute_params, topo_sort};
 use crate::ir::plan::{
     ExecutionPlan, LstmPlanCache, LstmWeightCache, OpKind, PlannedOp,
 };
@@ -30,22 +30,27 @@ pub fn lower(
     // 1. Topological sort.
     let graph = topo_sort(graph)?;
 
-    // 2. Precompute params (pure, no GPU).
+    // 2. DCE sweep. Structural no-op at landing per Kokoro sanity check;
+    // becomes active once constant_folding and elementwise_fusion start
+    // creating orphans.
+    let graph = dead_code_elimination(graph);
+
+    // 3. Precompute params (pure, no GPU).
     let precomputed_by_name = precompute_params(&graph);
 
-    // 3. Detect fusion (pure, no GPU).
+    // 4. Detect fusion (pure, no GPU).
     let fusion = detect_fusion(&graph);
 
-    // 4. Upload initializers to GPU.
+    // 5. Upload initializers to GPU.
     let weights = upload_initializers(&graph, ctx)?;
 
-    // 5. Build static_i64 for fast lookup at runtime.
+    // 6. Build static_i64 for fast lookup at runtime.
     let static_i64 = collect_static_i64(&graph);
 
-    // 6. Pack LSTM weights eagerly.
+    // 7. Pack LSTM weights eagerly.
     let lstm_weights = pack_lstm_weights_eagerly(&graph, &weights, ctx)?;
 
-    // 7. Build PlannedOp sequence from sorted nodes + fusion + precomputed.
+    // 8. Build PlannedOp sequence from sorted nodes + fusion + precomputed.
     let ops: Vec<PlannedOp> = graph
         .nodes
         .iter()
@@ -69,7 +74,7 @@ pub fn lower(
         })
         .collect();
 
-    // 8. Compute tensor_last_use for memory-pool return timing.
+    // 9. Compute tensor_last_use for memory-pool return timing.
     let tensor_last_use = compute_tensor_last_use(&ops, &graph.outputs, &weights);
 
     Ok(ExecutionPlan {

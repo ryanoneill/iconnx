@@ -88,6 +88,13 @@ impl OptimizableGraphBuilder {
         self
     }
 
+    /// Read-only view of accumulated nodes. Used by the `GpuGraphExecutor`
+    /// shim to filter requested output names against the node set before
+    /// seeding `graph.outputs` at lowering time.
+    pub fn nodes_snapshot(&self) -> &[GraphNode] {
+        &self.nodes
+    }
+
     pub fn build(self) -> OptimizableGraph {
         OptimizableGraph {
             inputs: self.inputs,
