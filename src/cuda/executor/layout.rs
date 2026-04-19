@@ -1,0 +1,820 @@
+//! Layout / shape / metadata op dispatch.
+//!
+//! Default bucket for every op not claimed by another dispatcher — includes
+//! Reshape, Transpose, Concat, Slice, Unsqueeze, Squeeze, Shape, Gather,
+//! Cast, Pad, Resize, Range, Where, Expand, ConstantOfShape, ScatterND,
+//! NonZero, CumSum, Identity.
+//!
+//! Takes the full [`ExecutionPlan`] because layout ops consume precomputed
+//! Slice/Reshape/Unsqueeze/Squeeze parameters (via `op.precomputed`) and
+//! may read `plan.static_i64` for initializer-sourced i64 tensors.
+//!
+//! Dispatch target parity with today's
+//! `execute_gpu_operator_with_precomputed` in `src/cuda/inference/mod.rs`:
+//! same per-op `gpu_*` wrappers, same attribute defaults, same fallback
+//! semantics (precomputed → static cache → D2H). Kernel wrappers stay in
+//! their source modules; this file owns only the dispatch match.
+
+#![allow(clippy::needless_range_loop)] // Explicit indexing is clearer for tensor ops (matches inference/mod.rs).
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use crate::cuda::inference::{compute_broadcast_shape, maybe_expand};
+use crate::cuda::ops::{
+    gpu_cast, gpu_concat, gpu_constant_of_shape_direct, gpu_copy, gpu_cumsum, gpu_expand,
+    gpu_gather_from_gpu, gpu_nonzero, gpu_pad, gpu_range, gpu_range_i64, gpu_resize,
+    gpu_scatter_nd, gpu_shape, gpu_slice_nd, gpu_transpose_2d, gpu_transpose_nd, gpu_where,
+    ResizeCoordMode, ResizeMode, ResizeNearestMode,
+};
+use crate::cuda::tensor::DType;
+use crate::cuda::{CudaError, GpuTensor};
+use crate::ir::{ExecutionPlan, PlannedOp};
+
+use super::{resolve_inputs, Executor};
+
+impl Executor {
+    /// Dispatch a single layout/shape/metadata op to its `gpu_*` wrapper.
+    ///
+    /// Matches on `op.node.op_type`. Each arm mirrors the corresponding
+    /// arm in today's `execute_gpu_operator_with_precomputed`: same kernel
+    /// calls, same attribute reads, same precomputed/cache fallback order.
+    /// Unknown op_types return a Kernel error.
+    pub(crate) fn dispatch_layout(
+        &self,
+        op: &PlannedOp,
+        values: &HashMap<String, GpuTensor>,
+        plan: &ExecutionPlan,
+    ) -> Result<GpuTensor, CudaError> {
+        let weights = &plan.weights;
+        let inputs = resolve_inputs(&op.node.inputs, values, weights)?;
+        let input_names = &op.node.inputs;
+        let attributes = &op.node.attributes;
+        let precomputed = &op.precomputed;
+        let mut pool = self.memory_pool.borrow_mut();
+
+        match op.node.op_type.as_str() {
+            // --- Where with tri-input broadcasting -----------------------
+            "Where" => {
+                let (condition, x, y) = (inputs[0], inputs[1], inputs[2]);
+
+                // Cast condition to Float32 if it's Int32/Int64 (e.g., from Bool cast).
+                // Use Cow to avoid cloning when no cast is needed.
+                let condition: Cow<'_, GpuTensor> = if condition.dtype() != DType::Float32 {
+                    Cow::Owned(gpu_cast(
+                        &self.ctx,
+                        &self.ops_kernels,
+                        condition,
+                        DType::Float32,
+                    )?)
+                } else {
+                    Cow::Borrowed(condition)
+                };
+
+                if condition.shape() == x.shape() && x.shape() == y.shape() {
+                    return gpu_where(&self.ctx, &self.ops_kernels, &mut pool, &condition, x, y);
+                }
+
+                let shape_cx =
+                    compute_broadcast_shape(condition.shape(), x.shape()).ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Where: condition {:?} and x {:?} are not broadcastable",
+                            condition.shape(),
+                            x.shape()
+                        ))
+                    })?;
+                let broadcast_shape =
+                    compute_broadcast_shape(&shape_cx, y.shape()).ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Where: intermediate {:?} and y {:?} are not broadcastable",
+                            shape_cx,
+                            y.shape()
+                        ))
+                    })?;
+
+                let cond_expanded = maybe_expand(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    &mut pool,
+                    &condition,
+                    broadcast_shape.clone(),
+                )?;
+                let x_expanded = maybe_expand(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    &mut pool,
+                    x,
+                    broadcast_shape.clone(),
+                )?;
+                let y_expanded = maybe_expand(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    &mut pool,
+                    y,
+                    broadcast_shape,
+                )?;
+
+                gpu_where(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    &mut pool,
+                    &cond_expanded,
+                    &x_expanded,
+                    &y_expanded,
+                )
+            }
+
+            // --- Shape: produces Int64, cache result for downstream ops --
+            "Shape" => {
+                let shape_values: Vec<i64> = inputs[0].shape().iter().map(|&d| d as i64).collect();
+                let result = gpu_shape(&self.ctx, inputs[0])?;
+                self.cache_i64(&result, shape_values);
+                Ok(result)
+            }
+
+            // --- Cast: dtype routing via TensorProto enum -----------------
+            "Cast" => {
+                let target_type = attributes
+                    .get_int("to")
+                    .ok_or_else(|| CudaError::Kernel("Cast: missing 'to' attribute".into()))?;
+                let target_dtype = match target_type {
+                    1 => DType::Float32, // FLOAT
+                    6 => DType::Int32,   // INT32
+                    7 => DType::Int64,   // INT64
+                    9 => DType::Int32,   // BOOL -> treat as Int32 (0 or 1)
+                    _ => {
+                        return Err(CudaError::Kernel(format!(
+                            "Cast: unsupported target type {}",
+                            target_type
+                        )));
+                    }
+                };
+                gpu_cast(&self.ctx, &self.ops_kernels, inputs[0], target_dtype)
+            }
+
+            // --- ConstantOfShape: fill tensor of given shape with value ---
+            "ConstantOfShape" => {
+                let value = attributes
+                    .get_tensor("value")
+                    .map(|t| t.as_slice()[0])
+                    .unwrap_or(0.0f32);
+
+                let shape_name = input_names.first().map(|s| s.as_str()).unwrap_or("");
+                let target_shape: Vec<usize> = self
+                    .get_or_fetch_i64(shape_name, inputs[0], plan)?
+                    .iter()
+                    .map(|&d| d as usize)
+                    .collect();
+
+                gpu_constant_of_shape_direct(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    &mut pool,
+                    target_shape,
+                    value,
+                )
+            }
+
+            // --- Transpose with perm-length repair -----------------------
+            "Transpose" => {
+                let shape = inputs[0].shape();
+                let ndim = shape.len();
+
+                let mut perm: Vec<i64> = if let Some(perm_attr) = attributes.get_ints("perm") {
+                    perm_attr.to_vec()
+                } else {
+                    (0..ndim as i64).rev().collect()
+                };
+
+                // Handle perm length mismatch (dynamic shapes / static perm
+                // for varying tensor shapes).
+                if perm.len() > ndim {
+                    perm.retain(|&d| (d as usize) < ndim || (d < 0 && (ndim as i64 + d) >= 0));
+                    if perm.len() != ndim {
+                        perm = (0..ndim as i64).rev().collect();
+                    }
+                } else if perm.len() < ndim {
+                    for i in perm.len()..ndim {
+                        perm.push(i as i64);
+                    }
+                }
+
+                // 2D fast path (Float32 only); general N-D for everything else.
+                if shape.len() == 2 && perm == [1, 0] && inputs[0].dtype() == DType::Float32 {
+                    gpu_transpose_2d(&self.ctx, &self.ops_kernels, &mut pool, inputs[0])
+                } else {
+                    gpu_transpose_nd(&self.ctx, &self.ops_kernels, &mut pool, inputs[0], &perm)
+                }
+            }
+
+            // --- Gather with transpose-front-gather-transpose-back -------
+            "Gather" => {
+                let axis_raw = attributes.get_int("axis").unwrap_or(0);
+                let ndim = inputs[0].shape().len() as i64;
+                let axis = if axis_raw < 0 {
+                    (ndim + axis_raw) as usize
+                } else {
+                    axis_raw as usize
+                };
+                let indices_shape = inputs[1].shape().to_vec();
+
+                if axis == 0 {
+                    gpu_gather_from_gpu(
+                        &self.ctx,
+                        &self.ops_kernels,
+                        &mut pool,
+                        inputs[0],
+                        inputs[1],
+                    )
+                } else {
+                    let input_shape = inputs[0].shape();
+                    let mut perm: Vec<i64> = (0..ndim).collect();
+                    perm.remove(axis);
+                    perm.insert(0, axis as i64);
+
+                    let transposed = gpu_transpose_nd(
+                        &self.ctx,
+                        &self.ops_kernels,
+                        &mut pool,
+                        inputs[0],
+                        &perm,
+                    )?;
+
+                    let gathered = gpu_gather_from_gpu(
+                        &self.ctx,
+                        &self.ops_kernels,
+                        &mut pool,
+                        &transposed,
+                        inputs[1],
+                    )?;
+
+                    let gathered_shape = gathered.shape();
+                    if indices_shape.is_empty() {
+                        // Scalar indices: axis dim is removed. Inverse
+                        // permutation is already encoded in the gathered
+                        // shape; returning gathered directly matches today's
+                        // behavior.
+                        let mut inv_perm: Vec<i64> = Vec::with_capacity(gathered_shape.len());
+                        for (new_pos, &old_pos) in perm.iter().skip(1).enumerate() {
+                            let target = if old_pos > axis as i64 {
+                                old_pos - 1
+                            } else {
+                                old_pos
+                            };
+                            inv_perm.push(target);
+                            let _ = new_pos;
+                        }
+                        Ok(gathered)
+                    } else {
+                        let indices_dims = indices_shape.len();
+                        let remaining_dims = input_shape.len() - 1;
+
+                        let total_dims = indices_dims + remaining_dims;
+                        let mut inv_perm = vec![0i64; total_dims];
+                        for i in 0..axis {
+                            inv_perm[i] = (indices_dims + i) as i64;
+                        }
+                        for i in 0..indices_dims {
+                            inv_perm[axis + i] = i as i64;
+                        }
+                        for i in axis..remaining_dims {
+                            inv_perm[indices_dims + i] = (indices_dims + i) as i64;
+                        }
+
+                        gpu_transpose_nd(
+                            &self.ctx,
+                            &self.ops_kernels,
+                            &mut pool,
+                            &gathered,
+                            &inv_perm,
+                        )
+                    }
+                }
+            }
+
+            // --- Slice with precomputed-first param resolution -----------
+            "Slice" => {
+                if inputs.len() < 3 {
+                    return Err(CudaError::Kernel(
+                        "Slice requires at least 3 inputs: data, starts, ends".into(),
+                    ));
+                }
+
+                let slice_pre = precomputed.slice.as_ref();
+
+                let starts = if let Some(precomp) =
+                    slice_pre.and_then(|p| p.starts.as_ref())
+                {
+                    precomp.clone()
+                } else {
+                    let starts_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
+                    self.get_or_fetch_i64(starts_name, inputs[1], plan)?
+                };
+
+                let ends =
+                    if let Some(precomp) = slice_pre.and_then(|p| p.ends.as_ref()) {
+                        precomp.clone()
+                    } else {
+                        let ends_name = input_names.get(2).map(|s| s.as_str()).unwrap_or("");
+                        self.get_or_fetch_i64(ends_name, inputs[2], plan)?
+                    };
+
+                if std::env::var("DEBUG_SLICE").is_ok() {
+                    let axes_dbg = if inputs.len() > 3 && !inputs[3].is_empty() {
+                        let name = input_names.get(3).map(|s| s.as_str()).unwrap_or("");
+                        self.get_or_fetch_i64(name, inputs[3], plan).ok()
+                    } else {
+                        None
+                    };
+                    let steps_dbg = if inputs.len() > 4 && !inputs[4].is_empty() {
+                        let name = input_names.get(4).map(|s| s.as_str()).unwrap_or("");
+                        self.get_or_fetch_i64(name, inputs[4], plan).ok()
+                    } else {
+                        None
+                    };
+                    eprintln!(
+                        "DEBUG Slice: input_shape={:?} starts={:?} ends={:?} axes={:?} steps={:?}",
+                        inputs[0].shape(),
+                        starts,
+                        ends,
+                        axes_dbg,
+                        steps_dbg
+                    );
+                }
+
+                // Broadcast / truncate starts ↔ ends to a common length.
+                let starts_len = starts.len();
+                let ends_len = ends.len();
+                let (starts, ends) = if starts_len != ends_len {
+                    if starts_len == 1 && ends_len > 1 {
+                        (vec![starts[0]; ends_len], ends)
+                    } else if ends_len == 1 && starts_len > 1 {
+                        (starts, vec![ends[0]; starts_len])
+                    } else {
+                        let len = starts_len.min(ends_len);
+                        (starts[..len].to_vec(), ends[..len].to_vec())
+                    }
+                } else {
+                    (starts, ends)
+                };
+
+                let num_slices = starts.len();
+
+                let axes = if let Some(precomp) = slice_pre.and_then(|p| p.axes.as_ref()) {
+                    if precomp.len() == num_slices {
+                        Some(precomp.clone())
+                    } else {
+                        None
+                    }
+                } else if inputs.len() > 3 && !inputs[3].is_empty() {
+                    let axes_name = input_names.get(3).map(|s| s.as_str()).unwrap_or("");
+                    let axes_data = self.get_or_fetch_i64(axes_name, inputs[3], plan)?;
+                    if axes_data.len() == num_slices {
+                        Some(axes_data)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let steps = if let Some(precomp) = slice_pre.and_then(|p| p.steps.as_ref()) {
+                    if precomp.len() == num_slices {
+                        Some(precomp.clone())
+                    } else {
+                        None
+                    }
+                } else if inputs.len() > 4 && !inputs[4].is_empty() {
+                    let steps_name = input_names.get(4).map(|s| s.as_str()).unwrap_or("");
+                    let steps_data = self.get_or_fetch_i64(steps_name, inputs[4], plan)?;
+                    if steps_data.len() == num_slices {
+                        Some(steps_data)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                gpu_slice_nd(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    &mut pool,
+                    inputs[0],
+                    &starts,
+                    &ends,
+                    axes.as_deref(),
+                    steps.as_deref(),
+                )
+            }
+
+            // --- Reshape with 0/-1 resolution ----------------------------
+            "Reshape" => {
+                let input_shape = inputs[0].shape();
+                let input_len = inputs[0].len();
+
+                let shape_data: Vec<i64> = if let Some(precomp) = precomputed.reshape_shape.as_ref()
+                {
+                    precomp.clone()
+                } else if let Some(shape_attr) = attributes.get_ints("shape") {
+                    shape_attr.to_vec()
+                } else if inputs.len() > 1 {
+                    let shape_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
+                    self.get_or_fetch_i64(shape_name, inputs[1], plan)?
+                } else {
+                    return Err(CudaError::Kernel(
+                        "Reshape requires shape attribute or second input".into(),
+                    ));
+                };
+
+                // ONNX Reshape semantics: 0 = copy from input, -1 = infer.
+                let mut new_shape: Vec<usize> = Vec::with_capacity(shape_data.len());
+                let mut neg_one_idx: Option<usize> = None;
+                let mut known_product = 1usize;
+
+                for (i, &dim) in shape_data.iter().enumerate() {
+                    let resolved = if dim == 0 {
+                        if i < input_shape.len() {
+                            input_shape[i]
+                        } else {
+                            1
+                        }
+                    } else if dim == -1 {
+                        neg_one_idx = Some(i);
+                        1
+                    } else {
+                        dim as usize
+                    };
+                    if dim != -1 {
+                        known_product *= resolved;
+                    }
+                    new_shape.push(resolved);
+                }
+
+                if let Some(idx) = neg_one_idx {
+                    if known_product > 0 {
+                        new_shape[idx] = input_len / known_product;
+                    }
+                }
+
+                inputs[0].clone().reshape(new_shape.clone()).ok_or_else(|| {
+                    let new_len: usize = new_shape.iter().product();
+                    CudaError::Kernel(format!(
+                        "Reshape: element count mismatch. Input has {} elements (shape {:?}), target shape {:?} has {} elements. Raw shape_data: {:?}",
+                        input_len, input_shape, new_shape, new_len, shape_data
+                    ))
+                })
+            }
+
+            // --- Squeeze: removes dims of size 1 -------------------------
+            "Squeeze" => {
+                let axes: Option<Vec<i64>> = if let Some(precomp) =
+                    precomputed.squeeze_axes.as_ref()
+                {
+                    Some(precomp.clone())
+                } else if let Some(axes_attr) = attributes.get_ints("axes") {
+                    Some(axes_attr.to_vec())
+                } else if inputs.len() > 1 {
+                    let axes_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
+                    Some(self.get_or_fetch_i64(axes_name, inputs[1], plan)?)
+                } else {
+                    None
+                };
+
+                let old_shape = inputs[0].shape();
+                let new_shape: Vec<usize> = if let Some(axes) = axes {
+                    let ndim = old_shape.len() as i64;
+                    let axes_set: std::collections::HashSet<usize> = axes
+                        .iter()
+                        .map(|&a| if a < 0 { (ndim + a) as usize } else { a as usize })
+                        .collect();
+                    old_shape
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, &dim)| !(dim == 1 && axes_set.contains(i)))
+                        .map(|(_, &dim)| dim)
+                        .collect()
+                } else {
+                    old_shape.iter().copied().filter(|&d| d != 1).collect()
+                };
+                inputs[0]
+                    .clone()
+                    .reshape(new_shape)
+                    .ok_or_else(|| CudaError::Kernel("Squeeze: element count mismatch".into()))
+            }
+
+            // --- Unsqueeze: inserts dims of size 1 -----------------------
+            "Unsqueeze" => {
+                let axes: Vec<i64> = if let Some(precomp) = precomputed.unsqueeze_axes.as_ref() {
+                    precomp.clone()
+                } else if let Some(axes_attr) = attributes.get_ints("axes") {
+                    axes_attr.to_vec()
+                } else if inputs.len() > 1 {
+                    let axes_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
+                    self.get_or_fetch_i64(axes_name, inputs[1], plan)?
+                } else {
+                    return Err(CudaError::Kernel(
+                        "Unsqueeze requires 'axes' attribute or second input tensor".into(),
+                    ));
+                };
+
+                let old_shape = inputs[0].shape();
+                let new_ndim = old_shape.len() + axes.len();
+                let mut new_shape = vec![1usize; new_ndim];
+
+                let mut axes_sorted: Vec<usize> = axes
+                    .iter()
+                    .map(|&a| {
+                        if a < 0 {
+                            (new_ndim as i64 + a) as usize
+                        } else {
+                            a as usize
+                        }
+                    })
+                    .collect();
+                axes_sorted.sort();
+
+                let mut old_idx = 0;
+                for i in 0..new_ndim {
+                    if !axes_sorted.contains(&i) {
+                        new_shape[i] = old_shape[old_idx];
+                        old_idx += 1;
+                    }
+                }
+
+                inputs[0]
+                    .clone()
+                    .reshape(new_shape)
+                    .ok_or_else(|| CudaError::Kernel("Unsqueeze: element count mismatch".into()))
+            }
+
+            // --- Identity: GPU copy --------------------------------------
+            "Identity" => gpu_copy(&self.ctx, &self.ops_kernels, &mut pool, inputs[0]),
+
+            // --- Concat / Expand ----------------------------------------
+            "Concat" => {
+                let axis = attributes.get_int("axis").unwrap_or(0);
+                gpu_concat(&self.ctx, &self.ops_kernels, &mut pool, &inputs, axis)
+            }
+            "Expand" => {
+                let out_shape: Vec<usize> = if let Some(shape_attr) = attributes.get_ints("shape") {
+                    shape_attr.iter().map(|&x| x as usize).collect()
+                } else if inputs.len() > 1 {
+                    let shape_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
+                    self.get_or_fetch_i64(shape_name, inputs[1], plan)?
+                        .iter()
+                        .map(|&x| x as usize)
+                        .collect()
+                } else {
+                    return Err(CudaError::Kernel(
+                        "Expand requires shape attribute or second input".into(),
+                    ));
+                };
+                gpu_expand(&self.ctx, &self.ops_kernels, &mut pool, inputs[0], out_shape)
+            }
+
+            // --- Pad with constant/reflect/edge modes --------------------
+            "Pad" => {
+                let pads: Vec<i64> = if let Some(attr_pads) = attributes.get_ints("pads") {
+                    attr_pads.to_vec()
+                } else if inputs.len() >= 2 {
+                    let pads_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
+                    self.get_or_fetch_i64(pads_name, inputs[1], plan)?
+                } else {
+                    return Err(CudaError::Kernel(
+                        "Pad requires 'pads' attribute or input".into(),
+                    ));
+                };
+                let value = if inputs.len() > 2 {
+                    let constant_data = inputs[2].to_host_f32(&self.ctx)?;
+                    constant_data.first().copied().unwrap_or(0.0)
+                } else {
+                    attributes.get_float("value").unwrap_or(0.0)
+                };
+                let mode = attributes.get_string("mode").unwrap_or("constant");
+                gpu_pad(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    &mut pool,
+                    inputs[0],
+                    &pads,
+                    value,
+                    mode,
+                )
+            }
+
+            // --- Resize with coord/nearest/interp modes ------------------
+            "Resize" => {
+                // Inputs: [X, roi, scales] or [X, roi, scales, sizes].
+                // scales_idx depends on how many non-empty inputs survived.
+                let scales_idx = if inputs.len() == 2 { 1 } else { 2 };
+                let scales = inputs[scales_idx].to_host_f32(&self.ctx)?;
+
+                if std::env::var("DEBUG_RESIZE").is_ok() {
+                    let inp_shape = inputs[0].shape();
+                    let out_shape: Vec<usize> = inp_shape
+                        .iter()
+                        .zip(scales.iter())
+                        .map(|(&dim, &scale)| (dim as f32 * scale).round() as usize)
+                        .collect();
+                    eprintln!(
+                        "DEBUG Resize: input={:?} scales={:?} -> output={:?}",
+                        inp_shape, scales, out_shape
+                    );
+                }
+
+                let coord_mode_str = attributes
+                    .get_string("coordinate_transformation_mode")
+                    .unwrap_or("half_pixel");
+                let coord_mode = match coord_mode_str {
+                    "asymmetric" => ResizeCoordMode::Asymmetric,
+                    _ => ResizeCoordMode::HalfPixel,
+                };
+
+                let nearest_mode_str = attributes
+                    .get_string("nearest_mode")
+                    .unwrap_or("round_prefer_floor");
+                let nearest_mode = match nearest_mode_str {
+                    "floor" => ResizeNearestMode::Floor,
+                    _ => ResizeNearestMode::RoundPreferFloor,
+                };
+
+                let mode_str = attributes.get_string("mode").unwrap_or("nearest");
+                let mode = match mode_str {
+                    "linear" => ResizeMode::Linear,
+                    _ => ResizeMode::Nearest,
+                };
+
+                gpu_resize(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    &mut pool,
+                    inputs[0],
+                    &scales,
+                    coord_mode,
+                    nearest_mode,
+                    mode,
+                )
+            }
+
+            // --- NonZero -------------------------------------------------
+            "NonZero" => gpu_nonzero(&self.ctx, inputs[0]),
+
+            // --- ScatterND -----------------------------------------------
+            "ScatterND" => {
+                if inputs.len() < 3 {
+                    return Err(CudaError::Kernel(
+                        "ScatterND requires 3 inputs: data, indices, updates".into(),
+                    ));
+                }
+                let indices_host = inputs[1].to_host_i64(&self.ctx)?;
+                let indices_shape = inputs[1].shape().to_vec();
+                gpu_scatter_nd(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    &mut pool,
+                    inputs[0],
+                    &indices_host,
+                    inputs[2],
+                    &indices_shape,
+                )
+            }
+
+            // --- Range (Float32 and Int64) -------------------------------
+            "Range" => {
+                if inputs.len() != 3 {
+                    return Err(CudaError::Kernel(format!(
+                        "Range requires 3 inputs, got {}",
+                        inputs.len()
+                    )));
+                }
+                let dtype = inputs[0].dtype();
+                match dtype {
+                    DType::Float32 => {
+                        let start_data = inputs[0].to_host_f32(&self.ctx)?;
+                        let limit_data = inputs[1].to_host_f32(&self.ctx)?;
+                        let delta_data = inputs[2].to_host_f32(&self.ctx)?;
+                        let start = start_data[0];
+                        let limit = limit_data[0];
+                        let delta = delta_data[0];
+                        let n = ((limit - start) / delta).ceil().max(0.0) as usize;
+
+                        if std::env::var("DEBUG_SHAPES").is_ok() {
+                            eprintln!(
+                                "DEBUG_RANGE_F32: start={}, limit={}, delta={}, n={}",
+                                start, limit, delta, n
+                            );
+                        }
+
+                        gpu_range(&self.ctx, &self.ops_kernels, start, delta, n)
+                    }
+                    DType::Int64 => {
+                        let start_name = input_names.first().map(|s| s.as_str()).unwrap_or("");
+                        let start = self.get_or_fetch_i64(start_name, inputs[0], plan)?[0];
+                        let limit_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
+                        let limit = self.get_or_fetch_i64(limit_name, inputs[1], plan)?[0];
+                        let delta_name = input_names.get(2).map(|s| s.as_str()).unwrap_or("");
+                        let delta = self.get_or_fetch_i64(delta_name, inputs[2], plan)?[0];
+
+                        if std::env::var("DEBUG_SHAPES").is_ok() {
+                            eprintln!(
+                                "DEBUG_RANGE_I64: start={}, limit={}, delta={}",
+                                start, limit, delta
+                            );
+                        }
+
+                        let n = if delta == 0 {
+                            return Err(CudaError::Kernel("Range: delta cannot be 0".into()));
+                        } else if delta > 0 {
+                            if limit <= start {
+                                0
+                            } else {
+                                let diff = limit - start;
+                                ((diff + delta - 1) / delta) as usize
+                            }
+                        } else if limit >= start {
+                            0
+                        } else {
+                            let diff = start - limit;
+                            let abs_delta = -delta;
+                            ((diff + abs_delta - 1) / abs_delta) as usize
+                        };
+                        gpu_range_i64(&self.ctx, &self.ops_kernels, start, delta, n)
+                    }
+                    _ => Err(CudaError::Kernel(format!(
+                        "Range: unsupported dtype {}",
+                        dtype.name()
+                    ))),
+                }
+            }
+
+            // --- CumSum --------------------------------------------------
+            "CumSum" => {
+                let exclusive = attributes.get_int("exclusive").unwrap_or(0) != 0;
+                let reverse = attributes.get_int("reverse").unwrap_or(0) != 0;
+
+                let axis = if inputs.len() > 1 {
+                    let axis_tensor = inputs[1];
+                    if axis_tensor.is_i64() {
+                        axis_tensor.to_host_i64(&self.ctx)?[0]
+                    } else if axis_tensor.is_i32() {
+                        axis_tensor.to_host_i32(&self.ctx)?[0] as i64
+                    } else {
+                        return Err(CudaError::Kernel(
+                            "CumSum: axis must be int64 or int32".to_string(),
+                        ));
+                    }
+                } else {
+                    -1
+                };
+
+                gpu_cumsum(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    inputs[0],
+                    axis,
+                    exclusive,
+                    reverse,
+                )
+            }
+
+            other => Err(CudaError::Kernel(format!(
+                "dispatch_layout called with non-layout op '{}'",
+                other
+            ))),
+        }
+    }
+
+    /// Get Int64 values by name, falling back to D2H transfer if not cached.
+    ///
+    /// Lookup order mirrors today's `Inference::get_or_fetch_i64`:
+    /// 1. `plan.static_i64` — per-plan cache populated at lowering time
+    ///    from initializers and Constant-node values.
+    /// 2. D2H transfer — reads the tensor contents from the device.
+    ///
+    /// Intentionally does NOT cache D2H results: dynamic values (e.g. Shape
+    /// op outputs with varying sequence lengths) would produce stale data
+    /// across runs. The per-run `i64_cache` (keyed by device pointer) is
+    /// populated only by `Shape` via `cache_i64` and consumed implicitly
+    /// through ownership of `GpuTensor` identity — matching today's code.
+    fn get_or_fetch_i64(
+        &self,
+        name: &str,
+        tensor: &GpuTensor,
+        plan: &ExecutionPlan,
+    ) -> Result<Vec<i64>, CudaError> {
+        if let Some(cached) = plan.static_i64.get(name) {
+            return Ok(cached.clone());
+        }
+        tensor.to_host_i64(&self.ctx)
+    }
+
+    /// Cache Int64 values for a tensor by device pointer (used within a
+    /// single run). Written by the `Shape` arm to short-circuit downstream
+    /// Reshape / Unsqueeze / Squeeze D2H reads — parity with today's
+    /// `Inference::cache_i64`.
+    fn cache_i64(&self, tensor: &GpuTensor, values: Vec<i64>) {
+        let ptr = tensor.device_ptr(&self.ctx);
+        self.i64_cache.borrow_mut().insert(ptr, values);
+    }
+}

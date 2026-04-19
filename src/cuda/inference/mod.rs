@@ -316,6 +316,26 @@ pub struct GpuGraphExecutor {
     /// Tensor validator for NaN/Inf detection (compile-gated)
     #[cfg(feature = "debug-inference")]
     validator: RefCell<Option<super::validation::TensorValidator>>,
+
+    /// Transitional (Commit 2 only): new Executor that actually runs the
+    /// plan for each call. Commit 3 replaces this whole struct with a
+    /// thin shim around the executor and compiled plan.
+    executor: crate::cuda::executor::Executor,
+
+    /// Transitional (Commit 2 only): CPU copies of initializers, populated
+    /// alongside the GPU upload in [`Self::add_initializer`]. Consumed by
+    /// [`Self::build_graph_from_self`] to lower into an
+    /// [`crate::ir::ExecutionPlan`]. Deleted in Commit 3 when
+    /// [`GpuGraphExecutor`] becomes a strangler shim around an
+    /// [`crate::ir::OptimizableGraphBuilder`].
+    initializers_cpu: HashMap<String, Tensor>,
+
+    /// Transitional (Commit 2 only): lazily-built execution plan, cached
+    /// so we don't re-run the full topo-sort + precompute + fusion +
+    /// LSTM-weight-packing pipeline on every inference call. Invalidated
+    /// by `add_initializer` / `add_node` (graph structure changes).
+    /// Commit 3 folds this into the strangler shim directly.
+    compiled_plan: RefCell<Option<crate::ir::ExecutionPlan>>,
 }
 
 /// Pre-computed Slice parameters extracted at graph construction time.
@@ -445,6 +465,15 @@ impl GpuGraphExecutor {
             eprintln!("  Fused kernels (NVRTC): {:?}", start.elapsed());
         }
 
+        // Transitional (Commit 2 only): build the new Executor that holds
+        // its own parallel kernel caches + memory pool. Commit 3 replaces
+        // GpuGraphExecutor's internals with this executor alone.
+        let start = Instant::now();
+        let executor = crate::cuda::executor::Executor::new()?;
+        if profile {
+            eprintln!("  Executor (parallel kernel caches): {:?}", start.elapsed());
+        }
+
         if profile {
             eprintln!("  TOTAL initialization: {:?}", total_start.elapsed());
         }
@@ -472,6 +501,9 @@ impl GpuGraphExecutor {
             memory_pool: RefCell::new(GpuMemoryPool::new()),
             #[cfg(feature = "debug-inference")]
             validator: RefCell::new(None),
+            executor,
+            initializers_cpu: HashMap::new(),
+            compiled_plan: RefCell::new(None),
         })
     }
 
@@ -480,6 +512,15 @@ impl GpuGraphExecutor {
     /// Int64 tensors are cached by NAME in static_i64_cache for fast parameter retrieval
     /// (avoids D2H transfers across multiple inference runs)
     pub fn add_initializer(&mut self, name: String, tensor: &Tensor) -> Result<(), CudaError> {
+        // Transitional (Commit 2 only): mirror the CPU tensor into
+        // `initializers_cpu` so `build_graph_from_self` can hand every
+        // initializer to `ir::lower` without a D2H round-trip. CPU
+        // tensors are Arc-backed, so `.clone()` is cheap. Commit 3
+        // removes this field along with the whole old dispatch path.
+        self.initializers_cpu.insert(name.clone(), tensor.clone());
+        // Invalidate the cached plan; it references the old weights set.
+        *self.compiled_plan.borrow_mut() = None;
+
         let gpu_tensor = match tensor {
             Tensor::Float32(_) => {
                 let data = tensor.as_slice();
@@ -588,6 +629,8 @@ impl GpuGraphExecutor {
         self.nodes_to_skip.borrow_mut().clear();
         self.dynamic_candidates.borrow_mut().clear();
         *self.patterns_detected.borrow_mut() = false;
+        // Transitional (Commit 2): drop the cached plan; the op list changed.
+        *self.compiled_plan.borrow_mut() = None;
     }
 
     /// Try to pre-compute Slice parameters from initializers
@@ -2868,6 +2911,69 @@ impl GpuGraphExecutor {
         inputs: HashMap<String, Tensor>,
         output_names: Vec<&str>,
     ) -> Result<HashMap<String, Tensor>, CudaError> {
+        // Transitional (Commit 2): build an OptimizableGraph from today's
+        // fields, lower it to an ExecutionPlan, and delegate execution to
+        // the new Executor. The plan is cached across calls; the old
+        // ~500-line body below is preserved as `run_old` (dead code)
+        // until Commit 3 deletes it outright.
+        self.ensure_compiled()?;
+        let plan = self.compiled_plan.borrow();
+        self.executor
+            .run(plan.as_ref().unwrap(), inputs, &output_names)
+    }
+
+    /// Ensure a lowered [`crate::ir::ExecutionPlan`] is cached in
+    /// `compiled_plan`. No-op if a plan is already cached; otherwise
+    /// builds an `OptimizableGraph` from `self.nodes` +
+    /// `self.initializers_cpu` and lowers it.
+    ///
+    /// Transitional helper for Commit 2. Commit 3 lifts this pattern
+    /// into the strangler shim proper (the builder is owned directly
+    /// and the plan is cached next to it).
+    fn ensure_compiled(&self) -> Result<(), CudaError> {
+        if self.compiled_plan.borrow().is_some() {
+            return Ok(());
+        }
+        let graph = self.build_graph_from_self();
+        let plan = crate::ir::lower(graph, &self.ctx)?;
+        *self.compiled_plan.borrow_mut() = Some(plan);
+        Ok(())
+    }
+
+    /// Build an [`crate::ir::OptimizableGraph`] from this executor's
+    /// accumulated nodes and initializers. Transitional helper for
+    /// Commit 2 — Commit 3 replaces the struct with a strangler shim
+    /// around an `OptimizableGraphBuilder`, at which point this method
+    /// is deleted.
+    fn build_graph_from_self(&self) -> crate::ir::OptimizableGraph {
+        let mut builder = crate::ir::OptimizableGraphBuilder::new();
+        for (name, tensor) in &self.initializers_cpu {
+            builder.add_initializer(name.clone(), tensor.clone());
+        }
+        for node in &self.nodes {
+            builder.add_node(
+                node.name.clone(),
+                node.op_type.clone(),
+                node.inputs.clone(),
+                node.outputs.clone(),
+                node.attributes.clone(),
+            );
+        }
+        // Graph inputs and outputs aren't tracked on GpuGraphExecutor
+        // today; lowering treats empty lists as "no static metadata"
+        // and still produces a valid plan.
+        builder.build()
+    }
+
+    /// Legacy direct-dispatch `run` kept for reference during Commit 2.
+    /// Every test now flows through [`Self::run`] which delegates to the
+    /// new [`crate::cuda::executor::Executor`]. Deleted in Commit 3.
+    #[allow(dead_code)]
+    fn run_old(
+        &self,
+        inputs: HashMap<String, Tensor>,
+        output_names: Vec<&str>,
+    ) -> Result<HashMap<String, Tensor>, CudaError> {
         // Clear the i64 cache before each run to avoid stale values from previous runs.
         // This is necessary because the memory pool reuses device pointers, and the cache
         // is keyed by device pointer. Without clearing, we'd get incorrect cached values
@@ -3389,6 +3495,36 @@ impl GpuGraphExecutor {
     > {
         use super::validation::ValidationError;
 
+        // Transitional (Commit 2): ensure the plan is lowered + cached,
+        // then delegate.
+        self.ensure_compiled().map_err(ValidationError::from)?;
+        let plan = self.compiled_plan.borrow();
+        self.executor.run_with_validation(
+            plan.as_ref().unwrap(),
+            inputs,
+            &output_names,
+            mode,
+        )
+    }
+
+    /// Legacy direct-dispatch run_with_validation kept as dead code for
+    /// Commit 2. Deleted in Commit 3.
+    #[cfg(feature = "debug-inference")]
+    #[allow(dead_code)]
+    fn run_with_validation_old(
+        &self,
+        inputs: HashMap<String, Tensor>,
+        output_names: Vec<&str>,
+        mode: super::validation::ValidationMode,
+    ) -> Result<
+        (
+            HashMap<String, Tensor>,
+            super::validation::ValidationReport,
+        ),
+        super::validation::ValidationError,
+    > {
+        use super::validation::ValidationError;
+
         // Create a new validator for this run
         let mut validator = super::validation::TensorValidator::new(mode, &self.ctx)
             .map_err(ValidationError::from)?;
@@ -3687,6 +3823,34 @@ impl GpuGraphExecutor {
     /// Only available with `debug-inference` feature flag.
     #[cfg(feature = "debug-inference")]
     pub fn run_with_checkpoints(
+        &self,
+        inputs: HashMap<String, Tensor>,
+        output_names: Vec<&str>,
+        config: super::checkpoints::CheckpointConfig,
+    ) -> Result<
+        (
+            HashMap<String, Tensor>,
+            super::checkpoints::CheckpointManager,
+        ),
+        CudaError,
+    > {
+        // Transitional (Commit 2): ensure the plan is lowered + cached,
+        // then delegate.
+        self.ensure_compiled()?;
+        let plan = self.compiled_plan.borrow();
+        self.executor.run_with_checkpoints(
+            plan.as_ref().unwrap(),
+            inputs,
+            &output_names,
+            config,
+        )
+    }
+
+    /// Legacy direct-dispatch run_with_checkpoints kept as dead code for
+    /// Commit 2. Deleted in Commit 3.
+    #[cfg(feature = "debug-inference")]
+    #[allow(dead_code)]
+    fn run_with_checkpoints_old(
         &self,
         inputs: HashMap<String, Tensor>,
         output_names: Vec<&str>,
@@ -4119,6 +4283,22 @@ impl GpuGraphExecutor {
         inputs: HashMap<String, Tensor>,
         output_names: Vec<&str>,
     ) -> Result<(HashMap<String, Tensor>, Vec<NodeExecutionLog>), CudaError> {
+        // Transitional (Commit 2): ensure the plan is lowered + cached,
+        // then delegate.
+        self.ensure_compiled()?;
+        let plan = self.compiled_plan.borrow();
+        self.executor
+            .run_with_logging(plan.as_ref().unwrap(), inputs, &output_names)
+    }
+
+    /// Legacy direct-dispatch run_with_logging kept as dead code for
+    /// Commit 2. Deleted in Commit 3.
+    #[allow(dead_code)]
+    fn run_with_logging_old(
+        &self,
+        inputs: HashMap<String, Tensor>,
+        output_names: Vec<&str>,
+    ) -> Result<(HashMap<String, Tensor>, Vec<NodeExecutionLog>), CudaError> {
         // Clear the i64 cache before each run (see run() for explanation)
         self.i64_cache.borrow_mut().clear();
 
@@ -4530,6 +4710,22 @@ impl GpuGraphExecutor {
     ///
     /// Returns timing breakdown in addition to outputs
     pub fn run_with_profiling(
+        &self,
+        inputs: HashMap<String, Tensor>,
+        output_names: Vec<&str>,
+    ) -> Result<(HashMap<String, Tensor>, ProfileData), CudaError> {
+        // Transitional (Commit 2): ensure the plan is lowered + cached,
+        // then delegate.
+        self.ensure_compiled()?;
+        let plan = self.compiled_plan.borrow();
+        self.executor
+            .run_with_profiling(plan.as_ref().unwrap(), inputs, &output_names)
+    }
+
+    /// Legacy direct-dispatch run_with_profiling kept as dead code for
+    /// Commit 2. Deleted in Commit 3.
+    #[allow(dead_code)]
+    fn run_with_profiling_old(
         &self,
         inputs: HashMap<String, Tensor>,
         output_names: Vec<&str>,
@@ -4999,7 +5195,7 @@ impl GpuGraphExecutor {
 /// Compute the broadcast shape for two tensor shapes using NumPy-style broadcasting rules.
 ///
 /// Returns None if the shapes are not broadcastable.
-fn compute_broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+pub(crate) fn compute_broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
     // Pad shorter shape with 1s on the left
     let max_ndim = a.len().max(b.len());
     let mut result = Vec::with_capacity(max_ndim);
@@ -5032,7 +5228,7 @@ fn compute_broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
 /// This is more memory-pool-friendly than cloning because it doesn't increment
 /// the Arc refcount when no expansion is needed, allowing the original tensor
 /// to be returned to the pool later.
-fn maybe_expand<'a>(
+pub(crate) fn maybe_expand<'a>(
     ctx: &IconnxCudaContext,
     kernels: &OpsKernelCache,
     pool: &mut GpuMemoryPool,

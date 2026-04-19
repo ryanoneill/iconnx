@@ -12,6 +12,7 @@ mod context;
 mod conv;
 pub mod cudnn;
 pub mod cufft;
+pub mod executor;
 pub mod inference;
 mod kernels;
 mod lstm;
