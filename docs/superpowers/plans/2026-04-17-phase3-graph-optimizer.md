@@ -1067,6 +1067,8 @@ EOF
 
 ## Commit 3: `shape_inference` + Reshape precompute upgrade
 
+**Previous-commit baseline (Commit 2, landed `e08e303`):** attempt-1 median 4.021, Q1 3.907, Q3 4.127. Commit 2 landed WIP under the stacked gate per spec §Hardware-calibrated thresholds; Commit 3 still takes a per-pass Δratio gate because shape_inference's expected 3–5 ms direct + compositional benefit exceeds the 3× noise-floor threshold on this hardware.
+
 **Commit goal:** `shape_inference` runs after DCE (which runs after constant_folding from commit #2), populates `ExecutionPlan::tensor_shapes`, and unlocks Reshape precomputation against inferred input shapes. Δratio gate.
 
 ### Task 3.1: Add `tensor_shapes` field to `ExecutionPlan`
