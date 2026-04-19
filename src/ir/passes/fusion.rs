@@ -5,9 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::cuda::inference::ExecutionNode;
 use crate::cuda::inference::fusion::{FusedPatternInfo, detect_fused_patterns_from_cpu};
-use crate::ir::graph::{GraphNode, OptimizableGraph};
+use crate::ir::graph::OptimizableGraph;
 
 /// Result of the fusion pass — attached to an `OptimizableGraph` so
 /// lowering can thread the annotations into each `PlannedOp`.
@@ -20,35 +19,12 @@ pub struct FusionAnnotations {
 
 /// Detect fusion patterns in an `OptimizableGraph`.
 ///
-/// The detection library currently takes `&[ExecutionNode]`. We build a
-/// throwaway `ExecutionNode` list from the graph's nodes. The extra
-/// `precomputed_*` fields on `ExecutionNode` are irrelevant to fusion
-/// detection — they're filled in at lowering and don't affect pattern
-/// matching — so they are left as `None` here.
+/// The detection library operates directly on `&[GraphNode]`. Initializer
+/// values are read from `graph.initializers` without any D2H round-trip.
 pub fn detect_fusion(graph: &OptimizableGraph) -> FusionAnnotations {
-    let exec_nodes: Vec<ExecutionNode> = graph
-        .nodes
-        .iter()
-        .map(graph_node_to_execution_node)
-        .collect();
-
     let (heads, skipped, dynamic_candidates) =
-        detect_fused_patterns_from_cpu(&exec_nodes, &graph.initializers);
+        detect_fused_patterns_from_cpu(&graph.nodes, &graph.initializers);
     FusionAnnotations { heads, skipped, dynamic_candidates }
-}
-
-fn graph_node_to_execution_node(n: &GraphNode) -> ExecutionNode {
-    ExecutionNode {
-        name: n.name.clone(),
-        op_type: n.op_type.clone(),
-        inputs: n.inputs.clone(),
-        outputs: n.outputs.clone(),
-        attributes: n.attributes.clone(),
-        precomputed_slice: None,
-        precomputed_reshape_shape: None,
-        precomputed_unsqueeze_axes: None,
-        precomputed_squeeze_axes: None,
-    }
 }
 
 #[cfg(test)]

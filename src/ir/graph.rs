@@ -42,7 +42,7 @@ pub struct OptimizableGraph {
 /// an `OptimizableGraph` via [`OptimizableGraphBuilder::build`]. The
 /// builder preserves insertion order of nodes (the topo-sort pass reorders
 /// later if the insertion order isn't already a valid topological order).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct OptimizableGraphBuilder {
     inputs: Vec<GraphInput>,
     outputs: Vec<String>,

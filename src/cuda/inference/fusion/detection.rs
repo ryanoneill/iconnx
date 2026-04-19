@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::patterns::{FusedPattern, FusedPatternInfo};
 use crate::cuda::context::IconnxCudaContext;
-use crate::cuda::inference::ExecutionNode;
 use crate::cuda::tensor::GpuTensor;
+use crate::ir::graph::GraphNode;
 use crate::tensor::Tensor;
 
 /// Detect all fuseable operator patterns in the given node list.
@@ -33,7 +33,7 @@ use crate::tensor::Tensor;
 /// must be exactly 3.0). It is not used for any GPU computation during
 /// detection.
 pub(crate) fn detect_fused_patterns(
-    nodes: &[ExecutionNode],
+    nodes: &[GraphNode],
     weights: &HashMap<String, GpuTensor>,
     ctx: &IconnxCudaContext,
 ) -> (
@@ -58,7 +58,7 @@ pub(crate) fn detect_fused_patterns(
 /// `Tensor` initializers instead of round-tripping them through the GPU via
 /// `to_host_f32(ctx)`. Eliminates the D2H copy during fusion detection.
 pub(crate) fn detect_fused_patterns_from_cpu(
-    nodes: &[ExecutionNode],
+    nodes: &[GraphNode],
     initializers: &HashMap<String, Tensor>,
 ) -> (
     HashMap<String, FusedPatternInfo>,
@@ -92,7 +92,7 @@ pub(crate) fn detect_fused_patterns_from_cpu(
 /// initializer (regardless of dtype). The detector uses this for static-
 /// value predicates that don't need to inspect the value itself.
 fn detect_with_scalar_lookup(
-    nodes: &[ExecutionNode],
+    nodes: &[GraphNode],
     read_f32: impl Fn(&str) -> Option<Vec<f32>>,
     is_initializer: impl Fn(&str) -> bool,
 ) -> (
@@ -101,7 +101,7 @@ fn detect_with_scalar_lookup(
     HashMap<String, FusedPatternInfo>,
 ) {
     // Build lookup maps
-    let output_to_node: HashMap<&str, &ExecutionNode> = nodes
+    let output_to_node: HashMap<&str, &GraphNode> = nodes
         .iter()
         .flat_map(|n| n.outputs.iter().map(move |o| (o.as_str(), n)))
         .collect();

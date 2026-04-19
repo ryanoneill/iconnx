@@ -1,12 +1,12 @@
-//! Test-only bridge for exercising the fusion detection walker from
-//! integration tests without exposing the private executor internals.
+//! Test-only bridge for exercising fusion detection and plan-level
+//! precomputation state from integration tests without reaching into
+//! the private internals of the Phase 2 executor.
 //!
-//! The testing module lives inside `cuda::inference` so it can reach the
-//! `pub(in crate::cuda::inference)` internals of `ExecutionNode` and the
-//! fusion submodule's `pub(super)` re-exports. It publishes a minimal
-//! public surface that only echoes already-public types (`FusedPattern`,
-//! `FusedPatternInfo`) so integration tests can detect patterns against a
-//! hand-built node list.
+//! With the Phase 2 strangler shim, precompute/fusion state lives on a
+//! lazily-constructed [`crate::ir::ExecutionPlan`] rather than on
+//! mutable fields of [`crate::cuda::inference::GpuGraphExecutor`]. These
+//! helpers trigger `compile()` and inspect the resulting plan so tests
+//! can assert against the actual compiled form.
 //!
 //! Consumers should only call these functions from `#[cfg(test)]` or
 //! integration-test contexts — nothing in the production path depends on
@@ -17,8 +17,9 @@ use std::collections::{HashMap, HashSet};
 use crate::attributes::NodeAttributes;
 use crate::cuda::context::IconnxCudaContext;
 use crate::cuda::inference::fusion::detect_fused_patterns;
-use crate::cuda::inference::ExecutionNode;
 use crate::cuda::tensor::GpuTensor;
+use crate::ir::graph::GraphNode;
+use crate::ir::plan::OpKind;
 
 // Re-export the pattern types on the testing surface so integration
 // tests can consume them without walking the private `fusion` submodule
@@ -26,12 +27,9 @@ use crate::cuda::tensor::GpuTensor;
 // is the only way external integration tests can reach them.
 pub use crate::cuda::inference::fusion::{FusedPattern, FusedPatternInfo};
 
-/// Testing mirror of the internal `ExecutionNode` shape.
-///
-/// Tests construct these directly and the conversion inside
-/// `detect_fused_patterns_for_tests` fills in the private
-/// `precomputed_slice` field (always `None` in tests, which is what the
-/// real executor does for non-`Slice` nodes).
+/// Testing mirror of the GraphNode shape — tests can construct these
+/// directly. The conversion inside `detect_fused_patterns_for_tests`
+/// widens them to `GraphNode`.
 pub struct ExecutionNodeForTests {
     pub name: String,
     pub op_type: String,
@@ -55,18 +53,14 @@ pub fn detect_fused_patterns_for_tests(
     HashSet<String>,
     HashMap<String, FusedPatternInfo>,
 ) {
-    let converted: Vec<ExecutionNode> = nodes
+    let converted: Vec<GraphNode> = nodes
         .iter()
-        .map(|n| ExecutionNode {
+        .map(|n| GraphNode {
             name: n.name.clone(),
             op_type: n.op_type.clone(),
             inputs: n.inputs.clone(),
             outputs: n.outputs.clone(),
             attributes: n.attributes.clone(),
-            precomputed_slice: None,
-            precomputed_reshape_shape: None,
-            precomputed_unsqueeze_axes: None,
-            precomputed_squeeze_axes: None,
         })
         .collect();
     detect_fused_patterns(&converted, weights, ctx)
@@ -83,8 +77,8 @@ pub fn is_mul_sin_pow_mul_add(info: &FusedPatternInfo) -> bool {
 
 /// Snapshot of a node's precomputed shape-op parameters, for test
 /// inspection. Opaque to callers outside the testing facade — just a
-/// read-only view of the three `Option<Vec<i64>>` fields that Cycle 2
-/// adds to `ExecutionNode`.
+/// read-only view of the three `Option<Vec<i64>>` fields on the node's
+/// `NodePrecomputed` bundle in the compiled plan.
 #[derive(Debug, Clone, Default)]
 pub struct NodePrecomputedSnapshot {
     pub reshape_shape: Option<Vec<i64>>,
@@ -92,21 +86,27 @@ pub struct NodePrecomputedSnapshot {
     pub squeeze_axes: Option<Vec<i64>>,
 }
 
-/// Look up a node in the executor's internal node list by name and return
-/// a snapshot of its precomputed shape-op fields. Returns `None` if no
+/// Look up a node in the executor's compiled plan by name and return a
+/// snapshot of its precomputed shape-op fields. Returns `None` if no
 /// node with that name is registered.
 ///
-/// This is a test-only helper — production code should never need to
-/// inspect the executor's internal node state directly.
+/// Forces compilation of the executor's graph so tests can inspect
+/// precompute state before calling `run()`. The executor's cached plan
+/// is populated as a side effect; subsequent `run()` calls reuse it.
 pub fn get_node_precomputed(
     executor: &crate::cuda::inference::GpuGraphExecutor,
     node_name: &str,
 ) -> Option<NodePrecomputedSnapshot> {
-    let node = executor.nodes.iter().find(|n| n.name == node_name)?;
+    executor
+        .compile()
+        .expect("compile executor graph for test inspection");
+    let plan_ref = executor.compiled_plan();
+    let plan = plan_ref.as_ref()?;
+    let op = plan.ops.iter().find(|op| op.node.name == node_name)?;
     Some(NodePrecomputedSnapshot {
-        reshape_shape: node.precomputed_reshape_shape.clone(),
-        unsqueeze_axes: node.precomputed_unsqueeze_axes.clone(),
-        squeeze_axes: node.precomputed_squeeze_axes.clone(),
+        reshape_shape: op.precomputed.reshape_shape.clone(),
+        unsqueeze_axes: op.precomputed.unsqueeze_axes.clone(),
+        squeeze_axes: op.precomputed.squeeze_axes.clone(),
     })
 }
 
@@ -125,35 +125,38 @@ pub struct PrecomputeStats {
 }
 
 /// Count precompute hits and totals for Unsqueeze, Reshape, and Squeeze
-/// nodes in the executor's graph.
+/// nodes in the executor's compiled plan.
 ///
-/// A "hit" means the ExecutionNode has its precomputed field populated
-/// (`Some(_)`). A "miss" is when the field is `None` — meaning
-/// try_precompute_* failed to find the axes/shape input in the static
-/// cache at add_node time, typically because the input comes from a
-/// runtime-computed chain (Shape -> Cast -> Gather -> ...) rather than
-/// a Constant or initializer.
+/// Forces compilation if the plan hasn't been built yet.
 pub fn count_precomputed_shape_ops(
     executor: &crate::cuda::inference::GpuGraphExecutor,
 ) -> PrecomputeStats {
+    executor
+        .compile()
+        .expect("compile executor graph for test inspection");
+    let plan_ref = executor.compiled_plan();
+    let plan = match plan_ref.as_ref() {
+        Some(p) => p,
+        None => return PrecomputeStats::default(),
+    };
     let mut stats = PrecomputeStats::default();
-    for node in &executor.nodes {
-        match node.op_type.as_str() {
+    for op in &plan.ops {
+        match op.node.op_type.as_str() {
             "Unsqueeze" => {
                 stats.unsqueeze_total += 1;
-                if node.precomputed_unsqueeze_axes.is_some() {
+                if op.precomputed.unsqueeze_axes.is_some() {
                     stats.unsqueeze_hits += 1;
                 }
             }
             "Reshape" => {
                 stats.reshape_total += 1;
-                if node.precomputed_reshape_shape.is_some() {
+                if op.precomputed.reshape_shape.is_some() {
                     stats.reshape_hits += 1;
                 }
             }
             "Squeeze" => {
                 stats.squeeze_total += 1;
-                if node.precomputed_squeeze_axes.is_some() {
+                if op.precomputed.squeeze_axes.is_some() {
                     stats.squeeze_hits += 1;
                 }
             }
@@ -184,32 +187,43 @@ pub struct PatternCount {
 }
 
 /// Count how many of each fused-pattern variant the detection walker
-/// has registered on the given executor. Call AFTER a `run()` or
-/// `run_with_profiling()` invocation has triggered `detect_fused_patterns`.
+/// has registered on the given executor's compiled plan.
 ///
-/// This is a test-only helper — production code should not need it.
-///
-/// Panics if `executor.fused_patterns` is currently mutably borrowed by
-/// another thread (which cannot happen in normal test usage because the
-/// walker is called inline inside `run_with_profiling` and completes
-/// before returning).
+/// Counts both static patterns (`OpKind::FusedHead`) and dynamic
+/// candidates (`plan.dynamic_candidates`). Forces compilation if the
+/// plan hasn't been built yet.
 pub fn count_fused_patterns(
     executor: &crate::cuda::inference::GpuGraphExecutor,
 ) -> PatternCount {
-    let patterns = executor.fused_patterns.borrow();
-    let dynamic = executor.dynamic_candidates.borrow();
+    executor
+        .compile()
+        .expect("compile executor graph for test inspection");
+    let plan_ref = executor.compiled_plan();
+    let plan = match plan_ref.as_ref() {
+        Some(p) => p,
+        None => return PatternCount::default(),
+    };
     let mut count = PatternCount::default();
-    for info in patterns.values().chain(dynamic.values()) {
-        match &info.pattern {
-            FusedPattern::DivRsqrt { .. } => count.div_rsqrt += 1,
-            FusedPattern::AddMulAdd { .. } => count.add_mul_add += 1,
-            FusedPattern::Gelu { .. } => count.gelu += 1,
-            FusedPattern::MulSinPowMulAdd { .. } => count.mul_sin_pow_mul_add += 1,
-            FusedPattern::MulAdd { .. } => count.mul_add += 1,
-            FusedPattern::AddMul { .. } => count.add_mul += 1,
-            FusedPattern::SubMul { .. } => count.sub_mul += 1,
-            FusedPattern::DivMul { .. } => count.div_mul += 1,
+    for op in &plan.ops {
+        if let OpKind::FusedHead(pattern) = &op.kind {
+            increment(&mut count, pattern);
         }
     }
+    for info in plan.dynamic_candidates.values() {
+        increment(&mut count, &info.pattern);
+    }
     count
+}
+
+fn increment(count: &mut PatternCount, pattern: &FusedPattern) {
+    match pattern {
+        FusedPattern::DivRsqrt { .. } => count.div_rsqrt += 1,
+        FusedPattern::AddMulAdd { .. } => count.add_mul_add += 1,
+        FusedPattern::Gelu { .. } => count.gelu += 1,
+        FusedPattern::MulSinPowMulAdd { .. } => count.mul_sin_pow_mul_add += 1,
+        FusedPattern::MulAdd { .. } => count.mul_add += 1,
+        FusedPattern::AddMul { .. } => count.add_mul += 1,
+        FusedPattern::SubMul { .. } => count.sub_mul += 1,
+        FusedPattern::DivMul { .. } => count.div_mul += 1,
+    }
 }
