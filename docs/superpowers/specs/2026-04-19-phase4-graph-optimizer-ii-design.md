@@ -170,23 +170,30 @@ assert!(
 
 **Input data.** `ExecutionPlan` fields populated by earlier passes: `tensor_shapes: HashMap<String, Vec<Option<usize>>>` and `tensor_last_use: HashMap<String, usize>` (last op-index at which each tensor is consumed). Plus `ops: Vec<PlannedOp>` providing the topological ordering and per-op first-use (op-index that produces each output).
 
-**Eligibility predicate (single function).**
+**Eligibility predicate (semantic — single function).**
 
 ```rust
 // src/ir/passes/memory_planner.rs
 pub(crate) fn is_planner_eligible(
     tensor_name: &str,
     tensor_shapes: &HashMap<String, Vec<Option<usize>>>,
+    graph_inputs: &[String],
     graph_outputs: &[String],
     dtype_bytes: usize,
     element_count: usize,
 ) -> bool {
+    // Not a graph input (inputs are written by the input-transfer
+    // path, not by any op's output — arena-backing would have no
+    // clean reconciliation with the input buffer at run() time).
+    if graph_inputs.iter().any(|i| i == tensor_name) { return false; }
+
+    // Not a graph output (runtime may need to hand ownership back
+    // to the caller past the arena's lifetime).
+    if graph_outputs.iter().any(|o| o == tensor_name) { return false; }
+
     // All dims fully known.
     let Some(shape) = tensor_shapes.get(tensor_name) else { return false };
     if shape.iter().any(|d| d.is_none()) { return false; }
-
-    // Not a graph output (runtime may need to hand ownership back).
-    if graph_outputs.iter().any(|o| o == tensor_name) { return false; }
 
     // Size >= 4 KiB (matches pool's size-class threshold).
     if dtype_bytes * element_count < 4096 { return false; }
@@ -195,7 +202,20 @@ pub(crate) fn is_planner_eligible(
 }
 ```
 
-Single predicate, one function. Adding conditions later (e.g., dtype restrictions) happens in one place.
+**Structural filter (separate from the semantic predicate).** Tensors produced by `PlannedOp::kind == Skip` ops (the targets of fusion head-writes) are structurally ineligible — the fused kernel writes directly into the head's slot, so the skipped op's output is never allocated at runtime. The planner's enumeration applies this filter alongside the semantic predicate:
+
+```rust
+let eligible_tensors: Vec<_> = all_tensors
+    .into_iter()
+    .filter(|t| is_planner_eligible(
+        &t.name, &tensor_shapes, &graph_inputs, &graph_outputs,
+        t.dtype_bytes, t.element_count,
+    ))
+    .filter(|t| !is_fusion_skipped(&t.producer_op_idx, &fusion_annotations))
+    .collect();
+```
+
+Two concerns (semantic eligibility, structural dead-slot avoidance), two filters, no signature bloat on the predicate. `is_fusion_skipped` is a short internal helper in `memory_planner.rs` that inspects the fusion annotations for each tensor's producer op.
 
 **Allocation algorithm.** Greedy linear scan with size-class slots. Deterministic by construction:
 
@@ -239,6 +259,9 @@ pub struct MemoryPlan {
     pub slot_count: usize,
     slot_assignments: HashMap<String, usize>,  // tensor_name -> slot_idx
     slot_offsets_bytes: Vec<usize>,            // slot_idx -> byte offset in arena
+    /// Classification counts computed at plan construction time so the
+    /// accessor is parameter-less.
+    classification: PlannerClassification,
 }
 
 impl MemoryPlan {
@@ -247,12 +270,21 @@ impl MemoryPlan {
         Some(self.slot_offsets_bytes[slot_idx])
     }
 
-    pub fn classification_counts(&self, /* eligibility input */) -> PlannerClassification;
+    pub fn classification_counts(&self) -> &PlannerClassification {
+        &self.classification
+    }
 }
 
 pub struct PlannerClassification {
+    /// Tensors passing `is_planner_eligible` AND the fusion-skipped filter.
     pub arena_eligible: usize,
+    /// Subset of `arena_eligible` actually assigned a slot. Equal to
+    /// `arena_eligible` unless the slot-assignment algorithm declines
+    /// an eligible tensor (shouldn't happen under the current greedy
+    /// algorithm; guarded by assertion in the planner).
     pub arena_assigned: usize,
+    /// Tensors that did NOT pass `is_planner_eligible` or were filtered
+    /// by the fusion-skipped filter. Take the pool path at runtime.
     pub pool_classified: usize,
 }
 ```
@@ -271,8 +303,14 @@ impl GpuMemoryPool {
 }
 
 pub struct ArenaBuffer {
-    // DeviceSlice<'static, u8> held by RAII; slice_at(...) returns
-    // typed sub-slices into the arena for per-op allocation.
+    // Holds a DeviceSlice<'_, u8> whose lifetime ties to the
+    // ArenaBuffer itself (not 'static — the buffer lives exactly as
+    // long as the surrounding run(), and dropping it returns the
+    // allocation to the pool). Concrete lifetime form (explicit
+    // lifetime param vs. Arc<DeviceSlice<'static>> vs. other) is an
+    // implementation detail to be settled in the plan against the
+    // actual garboard DeviceSlice surface; spec requires only the
+    // RAII + slice_at(offset, bytes_typed) semantics.
 }
 ```
 
@@ -347,8 +385,10 @@ let planned_ops = build_planned_ops(&graph, &precomputed, &fusion, &memory_plan)
 
 - `is_planner_eligible_all_dims_known_yields_true`
 - `is_planner_eligible_any_none_dim_yields_false`
+- `is_planner_eligible_graph_input_yields_false`
 - `is_planner_eligible_graph_output_yields_false`
 - `is_planner_eligible_below_4kb_yields_false`
+- `fusion_skipped_tensor_filtered_out_even_when_otherwise_eligible`: tensor whose producer op has `PlannedOp::kind == Skip`. Assert it is NOT in `arena_eligible` count.
 - `slot_assignment_reuses_slot_for_disjoint_lifetimes`: two eligible f32 tensors of same size where `last_use(a) < first_use(b)`. Expect single slot.
 - `slot_assignment_creates_new_slot_for_overlapping_lifetimes`: two eligible tensors with overlapping lifetimes. Expect two slots.
 - `slot_assignment_preserves_size_class_separation`: one f32 (8192 bytes) and one i64 (8192 bytes) with disjoint lifetimes. Expect two slots (different dtypes can't share).
