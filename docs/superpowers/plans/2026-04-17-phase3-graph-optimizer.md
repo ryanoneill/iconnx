@@ -2757,6 +2757,36 @@ Plan complete.
 
 ---
 
+## Phase 3 outcomes (for Phase 4 baseline reference)
+
+Phase 3 landed as four signed feat(ir) commits on `main` (via `ir-phase3` ff-merge):
+
+| # | SHA | Title | Landing frame |
+|---|---|---|---|
+| 1 | `ef5cc1c` | feat(ir): dead_code_elimination sweep pass | No-op clause (Kokoro has zero pre-existing orphans) |
+| 2 | `e08e303` | feat(ir): constant_folding pass + DCE after | Stacked gate — sub-noise on this hardware |
+| 3 | `8ddd402` | feat(ir): shape inference + Reshape precompute upgrade | Stacked gate — sub-noise on Kokoro (51/61 Reshapes blocked by runtime-computed Shape→Cast→Gather chains) |
+| 4 | `361b6d5` | feat(ir): general elementwise fusion + GeneralChain variant + test hygiene | Generic-infrastructure frame — Kokoro has no unclaimed elementwise chains; Whisper will exercise |
+
+**Final informational Kokoro measurement** (not a gate per spec amendment):
+- iconnx median ~110.6 ms, ORT median ~28.6 ms
+- Ratio median **3.954** (Q1 3.557, Q3 4.057)
+- Phase 2 landed baseline was median 3.70× ratio (iconnx ~110 ms / ORT ~31 ms)
+- iconnx timing within noise of Phase 2; ORT got faster (different ORT version cached / driver update), dominating the ratio drift
+
+**Zero net per-run benefit on Kokoro** is the honest finding — expected given Commits 1–3 land sub-noise and Commit 4 is generic-infrastructure. Phase 3's deliverables are correctness infrastructure (shape inference, DCE, generic fusion) that Phase 4 + the incoming Whisper benchmark will build on.
+
+**Phase 4 starting baseline:** ratio median 3.954, iconnx 110.6 ms. Note: the ≥ 0.30 stacked-gate target was retired (see spec §Gating protocol); Phase 4 sets its own gating framework.
+
+**Known follow-ups for Phase 4 or later:**
+- Constant-folding extension to cover `Shape → Cast → Gather` runtime-shape chains (would unblock ~23 of the remaining 51 Reshape precompute misses on Kokoro).
+- `infer_transpose` silently pads with `None` when `perm` length exceeds src rank (unreachable from Kokoro post-Gather-fix but a latent landmine).
+- Pre-existing silent-skip patterns in `tests/kokoro_inference_test.rs`, `tests/kokoro_progressive_test.rs`, `tests/kokoro_debug_test.rs`, `tests/kokoro_validation_test.rs`, `tests/validation_test.rs`, `tests/onnx_parser_test.rs`, `tests/weight_extraction_test.rs`, `tests/end_to_end_test.rs` — pre-Phase-3 baggage; recommend same "fail loud" cleanup pattern before Phase 4 work lands.
+- Legacy `detect_fusion` (`src/cuda/inference/fusion/detection.rs`) still runs as a secondary producer; delete once Phase 4's dynamic_candidates subsumes its role.
+- GpuGraphExecutor strangler shim (still ~567 lines post-Phase-2); delete when nothing external reaches through it.
+
+---
+
 ## Execution Handoff
 
 **Plan complete and saved to `docs/superpowers/plans/2026-04-17-phase3-graph-optimizer.md`. Two execution options:**
