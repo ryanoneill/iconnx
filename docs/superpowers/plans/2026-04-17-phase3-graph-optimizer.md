@@ -2776,14 +2776,18 @@ Phase 3 landed as four signed feat(ir) commits on `main` (via `ir-phase3` ff-mer
 
 **Zero net per-run benefit on Kokoro** is the honest finding — expected given Commits 1–3 land sub-noise and Commit 4 is generic-infrastructure. Phase 3's deliverables are correctness infrastructure (shape inference, DCE, generic fusion) that Phase 4 + the incoming Whisper benchmark will build on.
 
-**Phase 4 starting baseline:** ratio median 3.954, iconnx 110.6 ms. Note: the ≥ 0.30 stacked-gate target was retired (see spec §Gating protocol); Phase 4 sets its own gating framework.
+**Phase 4 starting baseline:** ratio median 3.954, iconnx 110.6 ms, on current machine + driver state. The ≥ 0.30 stacked-gate target was retired (see spec §Gating protocol); Phase 4 sets its own gating framework. **Critical: do NOT carry Phase 2's 3.54 forward** — between Phase 2 and Phase 3, ORT got ~2.4 ms faster (31 → 28.6 ms) while iconnx held at ~110 ms. Baselines shift when the comparison target shifts; always re-baseline on the current stack.
+
+**Stacked-gate verdict for commits #2 and #3:** unresolved — direct Kokoro benefit sub-noise, compositional benefit defers to Phase 4's memory planner resolving the 51/61 Shape→Cast→Gather Reshape chains. Those Reshapes are the explicit Phase 4 unlock target.
 
 **Known follow-ups for Phase 4 or later:**
-- Constant-folding extension to cover `Shape → Cast → Gather` runtime-shape chains (would unblock ~23 of the remaining 51 Reshape precompute misses on Kokoro).
+- **Benchmark provenance (tracked TODO per leadline):** record ORT version + CUDA driver version + cuDNN version alongside every baseline entry. Cargo pins `ort = "2.0.0-rc.10"` so the Rust side is stable, but ORT's bundled CUDA/cuDNN binaries can pull different versions on rebuild, and system NVIDIA drivers drift independently. Without that provenance, a 6-month-old baseline becomes uninterpretable — can't tell if drift is iconnx regression, ORT change, or driver change. Candidate recording site: `leadline-bench/src/bin/bench-hardware.rs` or a new provenance stamp in the compare binary's `.leadline` output.
+- Constant-folding extension to cover `Shape → Cast → Gather` runtime-shape chains (would unblock ~23 of the remaining 51 Reshape precompute misses on Kokoro). **This is the Phase 4 unlock target per the stacked-gate verdict.**
 - `infer_transpose` silently pads with `None` when `perm` length exceeds src rank (unreachable from Kokoro post-Gather-fix but a latent landmine).
 - Pre-existing silent-skip patterns in `tests/kokoro_inference_test.rs`, `tests/kokoro_progressive_test.rs`, `tests/kokoro_debug_test.rs`, `tests/kokoro_validation_test.rs`, `tests/validation_test.rs`, `tests/onnx_parser_test.rs`, `tests/weight_extraction_test.rs`, `tests/end_to_end_test.rs` — pre-Phase-3 baggage; recommend same "fail loud" cleanup pattern before Phase 4 work lands.
 - Legacy `detect_fusion` (`src/cuda/inference/fusion/detection.rs`) still runs as a secondary producer; delete once Phase 4's dynamic_candidates subsumes its role.
 - GpuGraphExecutor strangler shim (still ~567 lines post-Phase-2); delete when nothing external reaches through it.
+- **Whisper (HuggingFace ONNX export) as a second single-model benchmark** per leadline's trajectory note. Encoder-decoder attention-heavy; will exercise `FusedPattern::GeneralChain` on chains Kokoro doesn't reach, giving the commit #4 generic-infrastructure frame real-world validation.
 
 ---
 
