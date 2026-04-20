@@ -22,6 +22,7 @@ pub mod cos;
 pub mod cumsum;
 pub mod div;
 pub mod equal;
+pub mod erf;
 pub mod exp;
 pub mod expand;
 pub mod fftw_stft;

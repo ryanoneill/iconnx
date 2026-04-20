@@ -76,6 +76,7 @@ fn emit_op(op_type: &str, attrs: &NodeAttributes) -> String {
     match op_type {
         "Sqrt" => "    v = sqrtf(v);\n".into(),
         "Exp" => "    v = expf(v);\n".into(),
+        "Erf" => "    v = erff(v);\n".into(),
         "Sin" => "    v = sinf(v);\n".into(),
         "Cos" => "    v = cosf(v);\n".into(),
         "Tanh" => "    v = tanhf(v);\n".into(),
@@ -197,5 +198,12 @@ mod tests {
         let k = generate("Sqrt", &ops);
         assert!(k.source.contains("extern \"C\" __global__"));
         assert!(k.source.contains(&k.entry_name));
+    }
+
+    #[test]
+    fn emit_op_produces_erff_for_erf() {
+        let attrs = NodeAttributes::new();
+        let src = emit_op("Erf", &attrs);
+        assert_eq!(src, "    v = erff(v);\n");
     }
 }

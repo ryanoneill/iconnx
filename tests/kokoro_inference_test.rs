@@ -1,27 +1,24 @@
 /// Kokoro full inference test
 ///
 /// This is the ULTIMATE test - run the complete Kokoro model end-to-end
+#[path = "common/mod.rs"]
+mod common;
+
 use iconnx::graph_executor::GraphExecutor;
 use iconnx::onnx_parser::OnnxParser;
 use iconnx::tensor::Tensor;
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Test: Load full Kokoro model and build executor
 #[test]
 #[ignore] // Expensive test - run manually
 fn test_load_full_kokoro_model() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-
-    if !model_path.exists() {
-        println!("Skipping - kokoro-v1.0.onnx not found");
-        return;
-    }
+    let model_path = common::kokoro_model::kokoro_model_path();
 
     println!("\n=== Loading Kokoro Model ===");
 
     // Step 1: Parse model
-    let model = OnnxParser::parse_file(model_path).unwrap();
+    let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
     println!("✅ Model parsed");
 
     // Step 2: Extract weights
@@ -68,17 +65,12 @@ fn test_load_full_kokoro_model() {
 #[test]
 #[ignore] // Expensive - run manually
 fn test_run_minimal_kokoro_inference() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-
-    if !model_path.exists() {
-        println!("Skipping - kokoro-v1.0.onnx not found");
-        return;
-    }
+    let model_path = common::kokoro_model::kokoro_model_path();
 
     println!("\n=== Running Kokoro Inference ===");
 
     // Load and build executor (same as above)
-    let model = OnnxParser::parse_file(model_path).unwrap();
+    let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
     let weights = model.extract_weights();
     let graph = model.computation_graph();
 

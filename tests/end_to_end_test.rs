@@ -7,11 +7,13 @@
 ///
 /// We'll use Kokoro itself as the test model, but only execute
 /// a small subgraph that uses our implemented operators.
+#[path = "common/mod.rs"]
+mod common;
+
 use iconnx::graph_executor::GraphExecutor;
 use iconnx::onnx_parser::OnnxParser;
 use iconnx::tensor::Tensor;
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Test: Load Kokoro and extract a simple subgraph we can execute
 ///
@@ -81,15 +83,9 @@ fn test_simple_linear_layer_simulation() {
 /// Test: Validate ONYCHES can load and inspect Kokoro model
 #[test]
 fn test_load_kokoro_model_structure() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-
-    if !model_path.exists() {
-        println!("Skipping - kokoro-v1.0.onnx not found");
-        return;
-    }
-
+    let model_path = common::kokoro_model::kokoro_model_path();
     // Load model
-    let model = OnnxParser::parse_file(model_path).unwrap();
+    let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
 
     // Get model info
     let inputs = model.inputs();

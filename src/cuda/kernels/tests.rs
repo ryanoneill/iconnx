@@ -121,6 +121,35 @@ fn test_gpu_tanh() {
 
 #[test]
 #[ignore] // Requires CUDA GPU
+fn test_gpu_erf() {
+    // Verifies the erff() intrinsic wrapped by gpu_erf matches the
+    // CPU A&S reference within 1e-6 across 10k inputs on [-5, 5].
+    let (ctx, kernels, mut pool) = setup();
+
+    // Representative range: [-5, 5] at ~10k points.
+    let input_vec: Vec<f32> = (0..10_000)
+        .map(|i| -5.0 + (i as f32) * 10.0 / 10_000.0)
+        .collect();
+    let input = GpuTensor::from_host_f32(&ctx, &input_vec, vec![10_000]).unwrap();
+
+    let output = gpu_erf(&ctx, &kernels, &mut pool, &input).unwrap();
+    let gpu_vals = output.to_host_f32(&ctx).unwrap();
+
+    for (i, &x) in input_vec.iter().enumerate() {
+        let expected = crate::operators::erf::erf_f32(x);
+        let got = gpu_vals[i];
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "gpu_erf disagrees with CPU at x={}: got {}, expected {}",
+            x,
+            got,
+            expected,
+        );
+    }
+}
+
+#[test]
+#[ignore] // Requires CUDA GPU
 fn test_gpu_relu() {
     let (ctx, kernels, mut pool) = setup();
 

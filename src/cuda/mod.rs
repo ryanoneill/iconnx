@@ -53,6 +53,7 @@ pub use kernels::{
     gpu_clip,
     gpu_cos,
     gpu_div,
+    gpu_erf,
     // Math ops
     gpu_exp,
     gpu_floor,

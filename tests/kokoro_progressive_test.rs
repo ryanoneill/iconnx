@@ -1,20 +1,18 @@
 /// Progressive Kokoro execution tests
 ///
 /// Run increasingly larger subgraphs to validate execution
+#[path = "common/mod.rs"]
+mod common;
+
 use iconnx::graph_executor::GraphExecutor;
 use iconnx::onnx_parser::OnnxParser;
 use iconnx::tensor::Tensor;
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Helper: Run first N nodes of Kokoro
 fn run_kokoro_first_n_nodes(n: usize) -> Result<(), String> {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-    if !model_path.exists() {
-        return Err("Model not found".to_string());
-    }
-
-    let model = OnnxParser::parse_file(model_path).map_err(|e| e.to_string())?;
+    let model_path = common::kokoro_model::kokoro_model_path();
+    let model = OnnxParser::parse_file(&model_path).map_err(|e| e.to_string())?;
     let weights = model.extract_weights();
     let graph = model.computation_graph();
     let nodes = graph.nodes();
@@ -97,13 +95,8 @@ fn test_run_first_50_nodes() {
 #[test]
 #[ignore] // Might be slow
 fn test_run_first_100_nodes() {
-    // Skip gracefully when the kokoro model isn't available locally —
-    // same pattern as test_run_full_kokoro. Only a true execution
-    // failure should panic.
-    if !Path::new("kokoro-v1.0.onnx").exists() {
-        println!("⚠️  Kokoro model not found, skipping");
-        return;
-    }
+    // run_kokoro_first_n_nodes calls kokoro_model_path() which panics if
+    // the model is missing — a silent skip here would hide regressions.
     println!("\n🚀 Testing first 100 Kokoro nodes...");
     match run_kokoro_first_n_nodes(100) {
         Ok(_) => println!("✅ SUCCESS: First 100 nodes executed!"),
@@ -115,13 +108,8 @@ fn test_run_first_100_nodes() {
 #[test]
 #[ignore] // Run manually: cargo test test_run_full_kokoro -- --ignored --nocapture
 fn test_run_full_kokoro() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-    if !model_path.exists() {
-        println!("⚠️  Kokoro model not found, skipping");
-        return;
-    }
-
-    let model = OnnxParser::parse_file(model_path).unwrap();
+    let model_path = common::kokoro_model::kokoro_model_path();
+    let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
     let graph = model.computation_graph();
     let total_nodes = graph.nodes().len();
 

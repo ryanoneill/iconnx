@@ -1,18 +1,14 @@
 /// Test weight extraction from ONNX models
+#[path = "common/mod.rs"]
+mod common;
+
 use iconnx::onnx_parser::OnnxParser;
-use std::path::Path;
 
 /// Test: Extract weights from Kokoro model
 #[test]
 fn test_extract_kokoro_weights() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-
-    if !model_path.exists() {
-        println!("Skipping - kokoro-v1.0.onnx not found");
-        return;
-    }
-
-    let model = OnnxParser::parse_file(model_path).unwrap();
+    let model_path = common::kokoro_model::kokoro_model_path();
+    let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
     let weights = model.extract_weights();
 
     println!("\n=== Weight Extraction ===");

@@ -36,7 +36,7 @@ const CHAIN_CAP: usize = 8;
 /// [`UNARY_ELEMENTWISE_OPS`]); binary-containing chains that fail to
 /// match a specialized variant are dropped unfused.
 const ELEMENTWISE_OPS: &[&str] = &[
-    "Add", "Sub", "Mul", "Div", "Pow", "Sqrt", "Exp", "Sin", "Cos", "Tanh", "Sigmoid",
+    "Add", "Sub", "Mul", "Div", "Pow", "Sqrt", "Exp", "Erf", "Sin", "Cos", "Tanh", "Sigmoid",
     "LeakyRelu", "Atan", "Floor", "Clip", "Round",
 ];
 
@@ -45,7 +45,7 @@ const ELEMENTWISE_OPS: &[&str] = &[
 /// eligible for `GeneralChain` fallback; chains with a binary op that
 /// didn't match a specialized variant are dropped unfused.
 const UNARY_ELEMENTWISE_OPS: &[&str] = &[
-    "Sqrt", "Exp", "Sin", "Cos", "Tanh", "Sigmoid", "LeakyRelu", "Atan", "Floor", "Clip",
+    "Sqrt", "Exp", "Erf", "Sin", "Cos", "Tanh", "Sigmoid", "LeakyRelu", "Atan", "Floor", "Clip",
     "Round",
 ];
 

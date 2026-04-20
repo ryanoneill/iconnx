@@ -1,19 +1,16 @@
 /// Kokoro model validation tests
 ///
 /// Tests ONYCHES against real Kokoro model subgraphs
+#[path = "common/mod.rs"]
+mod common;
+
 use iconnx::onnx_parser::OnnxParser;
 use std::collections::HashSet;
-use std::path::Path;
 
 /// Find nodes in Kokoro that we can execute with our operators
 #[test]
 fn test_find_executable_kokoro_subgraph() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-
-    if !model_path.exists() {
-        println!("Skipping - kokoro-v1.0.onnx not found");
-        return;
-    }
+    let model_path = common::kokoro_model::kokoro_model_path();
 
     // Our implemented operators (49 total - 100% Kokoro coverage!)
     let supported: HashSet<&str> = vec![
@@ -72,7 +69,7 @@ fn test_find_executable_kokoro_subgraph() {
     .collect();
 
     // Load Kokoro
-    let model = OnnxParser::parse_file(model_path).unwrap();
+    let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
     let graph = model.computation_graph();
     let nodes = graph.nodes();
 
