@@ -6,6 +6,10 @@
 //! the test functions are compiled.
 
 #[cfg(feature = "debug-inference")]
+#[path = "common/mod.rs"]
+mod common;
+
+#[cfg(feature = "debug-inference")]
 use std::collections::HashMap;
 #[cfg(feature = "debug-inference")]
 use std::path::Path;
@@ -22,21 +26,19 @@ use iconnx::onnx_parser::OnnxParser;
 use iconnx::tensor::Tensor;
 
 #[cfg(feature = "debug-inference")]
-fn setup_kokoro_executor() -> Option<GpuGraphExecutor> {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-    if !model_path.exists() {
-        return None;
-    }
-
-    let model = OnnxParser::parse_file(model_path).ok()?;
+fn setup_kokoro_executor() -> GpuGraphExecutor {
+    let model_path = common::kokoro_model::kokoro_model_path();
+    let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
     let weights = model.extract_weights();
     let graph = model.computation_graph();
     let nodes = graph.nodes();
 
-    let mut executor = GpuGraphExecutor::new().ok()?;
+    let mut executor = GpuGraphExecutor::new().expect("create CUDA executor");
 
     for (name, tensor) in &weights {
-        executor.add_initializer(name.clone(), tensor).ok()?;
+        executor
+            .add_initializer(name.clone(), tensor)
+            .expect("add initializer");
     }
 
     for (idx, node) in nodes.iter().enumerate() {
@@ -51,7 +53,7 @@ fn setup_kokoro_executor() -> Option<GpuGraphExecutor> {
         executor.add_node(node_name, &node.op_type, inputs, outputs, node.attributes.clone());
     }
 
-    Some(executor)
+    executor
 }
 
 #[cfg(feature = "debug-inference")]
@@ -122,14 +124,7 @@ fn load_fixture_inputs() -> HashMap<String, Tensor> {
 #[ignore] // Requires CUDA GPU and model file
 #[cfg(feature = "debug-inference")]
 fn test_validation_encoder_nodes() {
-    let executor = match setup_kokoro_executor() {
-        Some(e) => e,
-        None => {
-            println!("Model not found - skipping");
-            return;
-        }
-    };
-
+    let executor = setup_kokoro_executor();
     let inputs = test_inputs();
 
     // Run with validation in full mode (log all stats)
@@ -162,14 +157,7 @@ fn test_validation_encoder_nodes() {
 #[ignore] // Requires CUDA GPU and model file
 #[cfg(feature = "debug-inference")]
 fn test_validation_finds_nan() {
-    let executor = match setup_kokoro_executor() {
-        Some(e) => e,
-        None => {
-            println!("Model not found - skipping");
-            return;
-        }
-    };
-
+    let executor = setup_kokoro_executor();
     let inputs = test_inputs();
 
     // Run with validation but don't stop on error (accumulate all issues)
@@ -211,14 +199,7 @@ fn test_validation_finds_nan() {
 #[ignore] // Requires CUDA GPU and model file
 #[cfg(feature = "debug-inference")]
 fn test_validation_nan_inf_only_mode() {
-    let executor = match setup_kokoro_executor() {
-        Some(e) => e,
-        None => {
-            println!("Model not found - skipping");
-            return;
-        }
-    };
-
+    let executor = setup_kokoro_executor();
     let inputs = test_inputs();
     let mode = ValidationMode::nan_inf_only();
 
@@ -244,14 +225,7 @@ fn test_validation_nan_inf_only_mode() {
 #[ignore] // Requires CUDA GPU, model file, and ORT fixtures
 #[cfg(feature = "debug-inference")]
 fn test_checkpoint_load_ort_references() {
-    let executor = match setup_kokoro_executor() {
-        Some(e) => e,
-        None => {
-            println!("Model not found - skipping");
-            return;
-        }
-    };
-
+    let executor = setup_kokoro_executor();
     let inputs = test_inputs();
     let config = CheckpointConfig::ort_comparison();
 
@@ -286,14 +260,7 @@ fn test_checkpoint_load_ort_references() {
 #[ignore] // Requires CUDA GPU, model file, and ORT fixtures
 #[cfg(feature = "debug-inference")]
 fn test_checkpoint_find_divergence() {
-    let executor = match setup_kokoro_executor() {
-        Some(e) => e,
-        None => {
-            println!("Model not found - skipping");
-            return;
-        }
-    };
-
+    let executor = setup_kokoro_executor();
     // Use actual fixture inputs to match ORT reference values
     let inputs = load_fixture_inputs();
 
@@ -346,20 +313,15 @@ fn test_tolerance_presets() {
 #[ignore] // Requires CUDA GPU, model file, and ORT fixtures
 #[cfg(feature = "debug-inference")]
 fn test_differential_encoder_nodes() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
+    let model_path = common::kokoro_model::kokoro_model_path();
     let fixture_path = Path::new("tests/fixtures/ort_reference");
-
-    if !model_path.exists() {
-        println!("Model not found - skipping");
-        return;
-    }
 
     if !fixture_path.exists() {
         println!("Fixture path not found - skipping");
         return;
     }
 
-    let runner = match DifferentialRunner::new(model_path, fixture_path, DiffTolerance::default()) {
+    let runner = match DifferentialRunner::new(&model_path, fixture_path, DiffTolerance::default()) {
         Ok(r) => r,
         Err(e) => {
             println!("Failed to create runner: {}", e);
@@ -390,13 +352,8 @@ fn test_differential_encoder_nodes() {
 #[ignore] // Requires CUDA GPU, model file, and ORT fixtures
 #[cfg(feature = "debug-inference")]
 fn test_differential_find_divergence() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
+    let model_path = common::kokoro_model::kokoro_model_path();
     let fixture_path = Path::new("tests/fixtures/ort_reference");
-
-    if !model_path.exists() {
-        println!("Model not found - skipping");
-        return;
-    }
 
     if !fixture_path.exists() {
         println!("Fixture path not found - skipping");
@@ -409,7 +366,7 @@ fn test_differential_find_divergence() {
         allow_shape_mismatch: false,
     };
 
-    let runner = match DifferentialRunner::new(model_path, fixture_path, tolerance) {
+    let runner = match DifferentialRunner::new(&model_path, fixture_path, tolerance) {
         Ok(r) => r,
         Err(e) => {
             println!("Failed to create runner: {}", e);

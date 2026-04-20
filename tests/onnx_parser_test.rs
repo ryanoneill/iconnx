@@ -2,23 +2,17 @@
 ///
 /// TDD: These tests are written FIRST, before implementation.
 /// They define the behavior we expect from the ONNX parser.
-use std::path::Path;
+#[path = "common/mod.rs"]
+mod common;
 
 /// Test 1: Parse kokoro-v1.0.onnx file
 ///
 /// This is our first test - it will FAIL until we implement OnnxParser.
 #[test]
 fn test_parse_kokoro_onnx_file() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-
-    if !model_path.exists() {
-        println!("Skipping test - kokoro-v1.0.onnx not found");
-        println!("Place model in project root to run this test");
-        return;
-    }
-
+    let model_path = common::kokoro_model::kokoro_model_path();
     // TDD: This will fail initially - OnnxParser doesn't parse yet!
-    let model = iconnx::onnx_parser::OnnxParser::parse_file(model_path);
+    let model = iconnx::onnx_parser::OnnxParser::parse_file(&model_path);
 
     // Once implemented, should succeed
     assert!(model.is_ok(), "Should parse Kokoro ONNX file");
@@ -27,14 +21,8 @@ fn test_parse_kokoro_onnx_file() {
 /// Test 2: Extract model metadata
 #[test]
 fn test_extract_model_metadata() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-
-    if !model_path.exists() {
-        println!("Skipping test - kokoro-v1.0.onnx not found");
-        return;
-    }
-
-    let model = iconnx::onnx_parser::OnnxParser::parse_file(model_path).unwrap();
+    let model_path = common::kokoro_model::kokoro_model_path();
+    let model = iconnx::onnx_parser::OnnxParser::parse_file(&model_path).unwrap();
 
     // Should extract basic info
     let inputs = model.inputs();
@@ -54,14 +42,8 @@ fn test_extract_model_metadata() {
 /// Test 3: Extract initializer weights
 #[test]
 fn test_extract_weights_from_model() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-
-    if !model_path.exists() {
-        println!("Skipping test - kokoro-v1.0.onnx not found");
-        return;
-    }
-
-    let model = iconnx::onnx_parser::OnnxParser::parse_file(model_path).unwrap();
+    let model_path = common::kokoro_model::kokoro_model_path();
+    let model = iconnx::onnx_parser::OnnxParser::parse_file(&model_path).unwrap();
     let weight_names = model.list_weight_names();
 
     // Kokoro should have many weight tensors (hundreds)
@@ -81,14 +63,8 @@ fn test_extract_weights_from_model() {
 /// Test 4: List all operators used by Kokoro
 #[test]
 fn test_list_unique_operators() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-
-    if !model_path.exists() {
-        println!("Skipping test - kokoro-v1.0.onnx not found");
-        return;
-    }
-
-    let model = iconnx::onnx_parser::OnnxParser::parse_file(model_path).unwrap();
+    let model_path = common::kokoro_model::kokoro_model_path();
+    let model = iconnx::onnx_parser::OnnxParser::parse_file(&model_path).unwrap();
     let operators = model.list_unique_operators();
 
     // Print for visibility
@@ -114,14 +90,8 @@ fn test_list_unique_operators() {
 /// Test 5: Parse computation graph nodes
 #[test]
 fn test_parse_computation_graph() {
-    let model_path = Path::new("kokoro-v1.0.onnx");
-
-    if !model_path.exists() {
-        println!("Skipping test - kokoro-v1.0.onnx not found");
-        return;
-    }
-
-    let model = iconnx::onnx_parser::OnnxParser::parse_file(model_path).unwrap();
+    let model_path = common::kokoro_model::kokoro_model_path();
+    let model = iconnx::onnx_parser::OnnxParser::parse_file(&model_path).unwrap();
     let graph = model.computation_graph();
 
     // Should have many nodes for a complex model like Kokoro
