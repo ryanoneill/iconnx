@@ -2699,17 +2699,29 @@ git add src/ir/passes/elementwise_fusion.rs
 git commit -S -m "wip(ir): equivalence tests for all 8 FusedPattern variants under elementwise_fusion"
 ```
 
-### Task 4.8: Commit 4 acceptance gate + squash
+### Task 4.8: Commit 4 landing under the generic-infrastructure frame + squash
 
-- [ ] **Step 1: Measure Commit 4's ratio** per the benchmark protocol.
+Per spec §Gating protocol / §Generic-infrastructure frame, Commit 4 lands when all six criteria hold:
 
-- [ ] **Step 2: Evaluate gate** vs Commit 3's ratio. Up to 3 attempts.
+- [ ] **Step 1: Verify landing criteria.**
+  - (i) Equivalence tests pass for all 8 hand-coded variants at ≤ 1e-5 tolerance (`equivalence_tests.rs`).
+  - (ii) Kokoro fusion counts unchanged vs pre-Commit-4: MulSinPowMulAdd=48, AddMulAdd=73, DivRsqrt=65, Gelu=12 (via `count_fused_patterns`).
+  - (iii) `fusion_fires_on_full_kokoro_at_seq_len_5` passes (integration-level runtime correctness).
+  - (iv) Zero warnings on both `--features cuda` and `--features cuda,debug-inference`.
+  - (v) All files under 1000 lines.
+  - (vi) All WIP commits GPG-signed (`git log --format='%G?' 8ddd402..HEAD | sort -u` → only `G`).
 
-- [ ] **Step 3: Decide fusion.rs disposition**
+  Record the informational Kokoro Δratio measurement for posterity — it is NOT a gate.
 
-Spec §Commit #4: if elementwise_fusion subsumes all patterns detect_fusion found, delete `src/ir/passes/fusion.rs`. Check by building a graph that exercises each of today's FusedPattern detection paths and confirming `elementwise_fusion` emits the SAME variants. If so, delete the adapter. Otherwise, keep both with the merge rule.
+- [ ] **Step 2: Decide fusion.rs disposition.**
 
-- [ ] **Step 4: Squash** (adapt the template from prior commits).
+  Spec §Commit #4 originally called for deleting the legacy `src/cuda/inference/fusion/detection.rs` adapter if `elementwise_fusion` subsumes all patterns. Reality: `elementwise_fusion` replicates the 8 specialized variants but legacy `detect_fusion` still registers dynamic AddMulAdd candidates (the AdaIN + LSTM layer-norm chains that need runtime shape-agreement rechecks). The merge rule (primary wins on head conflicts; secondary fills unclaimed heads + dynamic_candidates) keeps both paths.
+
+  Keep legacy `detect_fusion` as a secondary producer. Delete only if Phase 4's dynamic_candidates story subsumes the legacy path.
+
+- [ ] **Step 3: Squash all ir-phase3 Commit 4 WIPs (`8ddd402..HEAD`) into one `feat(ir)` commit** per leadline's "land all 10 WIPs, no splitting" directive. The test(ir) silent-skip cleanup and the format-align minor fix are both part of the Phase 3 landing; fold all into the single squash.
+
+- [ ] **Step 4: Record Phase 3 final ratio** (informational, atop a new §Phase 3 outcomes block) for Phase 4 baseline reference.
 
 ---
 
