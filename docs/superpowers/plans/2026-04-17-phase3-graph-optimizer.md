@@ -1900,6 +1900,8 @@ EOF
 
 ## Commit 4: General `elementwise_fusion` + DCE after
 
+**Previous-commit baseline (Commit 3, landed `8ddd402`):** attempt-1 median 3.967, Q1 3.757, Q3 4.202. Commit 3 landed WIP under the stacked gate per spec §Hardware-calibrated thresholds (retrospectively extended). Commit 4 takes a per-pass Δratio gate because elementwise fusion's expected 15–25 ms direct benefit exceeds the 3× noise-floor threshold on this hardware.
+
 **Commit goal:** Adds `elementwise_fusion` pass that detects chains of elementwise ops and emits `FusedPattern` variants. Preserves all 8 hand-coded variants (option (a) lock); new `GeneralChain` variant + its GPU dispatcher cover non-matching chains. Δratio gate.
 
 ### Task 4.1: Add `FusedPattern::GeneralChain` variant
