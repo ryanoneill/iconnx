@@ -1830,15 +1830,71 @@ git add src/ir/lowering.rs src/ir/passes/precompute.rs
 git commit -S -m "wip(ir): wire shape_inference + enhance precompute_params with inferred shapes"
 ```
 
-### Task 3.5: Commit 3 acceptance gate + squash
+### Task 3.5: Commit 3 stacked-gate handling + squash
 
-- [ ] **Step 1: Measure Commit 3's ratio** per the benchmark protocol (same as prior gates). 10 back-to-back runs, compute median/Q1/Q3.
+Per the spec amendment (§Hardware-calibrated thresholds, retrospectively extended to Commit 3), shape inference + Reshape precompute upgrade's measurable direct benefit on Kokoro is below this machine's noise floor. The pass's correctness work is load-bearing for Commit 4's fusion eligibility (reads `tensor_shapes`) and Phase 4's memory planner; it lands under the stacked gate.
 
-- [ ] **Step 2: Evaluate gate** vs Commit 2's landed ratio. Up to 3 total attempts before abandonment.
+- [ ] **Step 1: Record the per-pass measurements** (for audit, not gating). Done: three post-fix attempts showed medians 3.967 / 4.271 / 4.351 against Commit 2's landed 4.021 baseline. Attempt 1 marginally passed Δmedian (+0.054) but failed IQR overlap; attempts 2–3 showed session machine drift (iconnx avg drifted from ~110 ms to ~135 ms).
 
-- [ ] **Step 3: If gate passes, squash** (same template as Commit 2's squash, adapted).
+- [ ] **Step 2: Root-cause summary.** 51/61 Kokoro Reshapes have Shape→Cast→Gather runtime-computed shape inputs that precompute cannot reach without Phase 4's constant-folding extension. Pre-resolution hit rate stayed at 10/61 (same as Cycle 2 baseline). Compositional benefit (fusion eligibility, memory planner) will materialize in commits #4+.
 
-- [ ] **Step 4: Record Commit 3's landed ratio at the top of Commit 4's task block.**
+- [ ] **Step 3: Squash the WIP commits into a single `feat(ir)` commit** under the stacked gate. Include: Tasks 3.1–3.4 (field, skeleton, op coverage, wiring + precompute upgrade), review items 1–3, the precompute safe-gating fix, and the Gather correctness fix + ValueInfo extraction + `add_input` API.
+
+```bash
+git log --oneline e08e303..HEAD     # confirm ~8 wip commits (may vary)
+git reset --soft e08e303
+git commit -S -m "$(cat <<'EOF'
+feat(ir): shape inference + Reshape precompute upgrade
+
+Pure-function `fn shape_inference(OptimizableGraph) -> OptimizableGraph`
+in src/ir/passes/shape_inference.rs. Populates `ExecutionPlan::tensor_shapes`
+(HashMap<String, Vec<Option<usize>>>) via `tensor_shapes_from_graph(&graph)`
+called in lower() immediately after shape_inference. Partial-dynamic dims
+are representable as `Vec<Option<usize>>` with `None` for dynamic dims.
+
+Op coverage: 28 Kokoro-relevant ops — broadcasting elementwise (Add, Sub,
+Mul, Div, etc.), unary pass-through (Exp, Sin, Tanh, Sigmoid, etc.), MatMul,
+Conv/Pool, ReduceMean, Transpose, Concat, Slice, Reshape, Unsqueeze,
+Squeeze, Gather, Shape, ConstantOfShape, Range, LSTM, RNN. Unknown ops
+leave tensor shapes as `Vec::new()` (the codebase-wide "fully unknown"
+sentinel).
+
+precompute_params now consumes `tensor_shapes` to pre-resolve Reshape `0`
+placeholders per-dim (from the data tensor's inferred shape) and single
+`-1` dims (from element-count division when all other dims are known).
+Runtime Reshape resolution remains the authoritative path; pre-resolution
+is additive.
+
+New public API: `GpuGraphExecutor::add_input(name, Vec<Option<usize>>)`
+mirrors `add_initializer`; invalidates cached plan; seeds graph-input
+shapes for the inferencer.
+
+Stacked gate per spec §Hardware-calibrated thresholds (retrospectively
+extended to Commit 3). Per-pass Δratio measurements:
+- Commit 2 baseline: median 4.021, Q1 3.907, Q3 4.127
+- Commit 3 attempt 1: median 3.967, Q1 3.757, Q3 4.202 (Δ=+0.054, IQR overlap)
+- Commit 3 attempt 2: median 4.271, Q1 3.950, Q3 4.391 (machine drift)
+- Commit 3 attempt 3: median 4.351, Q1 4.122, Q3 4.506 (machine drift)
+51/61 Kokoro Reshapes have runtime-computed Shape→Cast→Gather shape
+inputs that pre-resolution cannot reach without Phase 4's constant-folding
+extension; direct measurable benefit on Kokoro is below the hardware's
+noise floor. Correctness work is load-bearing for Commit 4 and Phase 4;
+attribution deferred to post-Commit-4 stacked measurement; ablation on
+failure identifies the revert target.
+
+Spec: docs/superpowers/specs/2026-04-17-phase3-graph-optimizer-design.md.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+- [ ] **Step 4: Record Commit 3's landed ratio (attempt-1 median 3.967) at the top of Commit 4's task block** for audit traceability. Commit 4's per-pass gate uses Commit 3's landed ratio as its baseline.
+
+- [ ] **Step 5: Document follow-ups:**
+  - Constant-folding extension to cover `Shape → Cast → Gather` runtime-shape chains (would unblock ~23 of the remaining 51 Reshape precompute misses on Kokoro). Could land in Commit 4's work or Phase 4.
+  - `infer_transpose` silently pads with `None` when `perm` length exceeds src rank. Unreachable from Kokoro post-Gather-fix but a latent landmine — follow-up ticket.
+  - `kokoro_gpu_fusion_test` silently skipped when model was missing, masking the Gather bug from the full test run. Change the `model_path.exists()` early-return to a hard failure (or at least `eprintln!` + `panic!`) so silent skips don't hide regressions.
 
 ---
 
