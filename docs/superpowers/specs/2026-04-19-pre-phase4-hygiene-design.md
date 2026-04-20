@@ -10,7 +10,7 @@ Phase 3 merged with a zero direct-per-run-benefit finding on Kokoro. Two threads
 
 1. **Silent-skip tests masked a real Gather correctness bug in Phase 3 Commit 3** until the Kokoro model was symlinked into the ir-phase3 worktree. Eight test files still use the silent-skip pattern (`if !model_path.exists() { return; }`). Phase 4's memory planner has the same failure mode — a silent-skip could hide a wrongly-sized buffer for months. Fix before Phase 4 lands.
 
-2. **Whisper (HuggingFace ONNX export) is the planned second benchmark.** An op-coverage probe (`leadline-bench/src/bin/probe_ops.rs`) found Kokoro's 52 supported ops cover 17/18 of Whisper-Tiny's encoder; `Erf` is the sole missing op. Adding it unblocks the second benchmark. `Erf`-chain GELU is the first non-trivial `FusedPattern::GeneralChain` fire we'd expect in the wild, validating Phase 3 Commit 4's generic-infrastructure frame.
+2. **Whisper (HuggingFace ONNX export) is the planned second benchmark.** An op-coverage probe (`leadline-bench/src/bin/probe_ops.rs`) found iconnx's 50-op dispatch table covers 17/18 of Whisper-Tiny encoder's unique ops; `Erf` is the sole missing op. Adding it unblocks the second benchmark. `Erf`-chain GELU is the first non-trivial `FusedPattern::GeneralChain` fire we'd expect in the wild, validating Phase 3 Commit 4's generic-infrastructure frame.
 
 Out of iconnx scope (parallel leadline-bench PR):
 - Benchmark provenance recording (ORT + CUDA driver + cuDNN versions + GPU name). Lives in `leadline-bench/src/bin/compare.rs` and a new `environment.json` sidecar; later extended into `SessionProto::EnvironmentProto` as a follow-up.
@@ -159,7 +159,11 @@ CPU tests in `src/operators/erf.rs::tests` module:
    - **Boundedness:** `erf(x).abs() <= 1.0 + 1e-6` for every grid point (tolerance absorbs polynomial error).
    - **Monotonicity:** for every adjacent pair `(x_n, x_{n+1})`, `erf(x_{n+1}) >= erf(x_n) - 1e-6`. The tolerance absorbs polynomial noise; true strict monotonicity holds mathematically.
 
-3. **A&S tolerance check:** against a hand-computed high-precision reference at ±0.5 and ±2.5, `|erf_f32(x) - reference| < 2e-7`. Locks the polynomial coefficients; any transcription drift fails loud.
+3. **A&S tolerance check:** against high-precision reference values at ±0.5 and ±2.5, `|erf_f32(x) - reference| < 2e-7`. Locks the polynomial coefficients; any transcription drift fails loud. Reference values (sourced from high-precision references; truncated to f32 in the test):
+   - `erf(0.5) ≈ 0.5204998778130465`
+   - `erf(-0.5) ≈ -0.5204998778130465`
+   - `erf(2.5) ≈ 0.9995930479825550`
+   - `erf(-2.5) ≈ -0.9995930479825550`
 
 GPU test in `src/cuda/kernels/tests.rs`:
 
@@ -167,7 +171,7 @@ GPU test in `src/cuda/kernels/tests.rs`:
 
 Fusion equivalence test in `src/ir/passes/elementwise_fusion/equivalence_tests.rs`:
 
-- `erf_chain_gelu_fuses_into_general_chain_matches_sequential`: build a graph `x → Mul(1/√2) → Erf → Add(1.0) → Mul(0.5) → Mul(x)`, lower it, verify a `FusedPattern::GeneralChain` annotation appears for the Erf-containing chain (signature includes `Erf` verbatim), run it on GPU, compare against the unfused sequential dispatch at 1e-5 tolerance.
+- `erf_chain_gelu_prefix_fuses_into_general_chain_matches_sequential`: build a GELU-via-Erf graph `x → Mul(1/√2) → Erf → Add(1.0) → Mul(0.5) → Mul(x)`. Note that the final `Mul(x)` is a two-input op (its second input is the original `x`), which breaks the single-input invariant `FusedPattern::GeneralChain` requires. The fuseable piece is therefore the 4-op prefix `Mul(1/√2) → Erf → Add(1.0) → Mul(0.5)`; the final `Mul(x)` stays separate. Lower the graph, verify a `FusedPattern::GeneralChain` annotation appears for the 4-op prefix (signature includes `Erf` verbatim), run it on GPU, compare `fused(prefix) → Mul(x)` against the fully-sequential unfused chain at 1e-5 tolerance.
 
 ## Non-goals
 
