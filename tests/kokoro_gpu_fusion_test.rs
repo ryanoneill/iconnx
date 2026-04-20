@@ -39,6 +39,17 @@ fn setup_kokoro_gpu_executor() -> Option<GpuGraphExecutor> {
 
     let mut executor = GpuGraphExecutor::new().ok()?;
 
+    // Seed graph-input shapes from the ONNX value-info block so the
+    // Phase 3 shape-inference pass starts with concrete rank instead
+    // of the "fully unknown" sentinel. Without this, the token-embedding
+    // Gather downstream of `tokens` has an unknown indices shape, which
+    // correctly propagates as unknown through the entire text_encoder
+    // chain and prevents Reshape pre-resolution from firing on any
+    // Reshape that depends on input-derived shapes.
+    for (name, shape) in model.input_shapes() {
+        executor.add_input(name, shape);
+    }
+
     for (name, tensor) in &weights {
         executor.add_initializer(name.clone(), tensor).ok()?;
     }

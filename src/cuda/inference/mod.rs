@@ -244,6 +244,28 @@ impl GpuGraphExecutor {
         })
     }
 
+    /// Register a graph input with its declared shape.
+    ///
+    /// Seeds the `OptimizableGraphBuilder`'s inputs vector with
+    /// `(name, shape)` so the Phase 3 shape-inference pass has enough
+    /// static rank at lowering time. `shape[i] == None` means the
+    /// dimension is dynamic (e.g. `seq_len`, `batch`); callers should
+    /// pass the declared rank even when every dim is `None` so
+    /// `tensor_shapes_from_graph` can distinguish "rank known, dims
+    /// unknown" from "fully unknown" — conflating the two is the
+    /// sentinel-confusion class of bug already documented for Reshape
+    /// pre-resolution.
+    ///
+    /// Loader callers should use `OnnxParser::input_shapes()` which
+    /// returns exactly this pair list.
+    ///
+    /// Like `add_initializer` / `add_node`, this invalidates the
+    /// cached plan so the next run re-lowers.
+    pub fn add_input(&mut self, name: String, shape: Vec<Option<usize>>) {
+        self.builder.borrow_mut().add_input(name, shape);
+        *self.compiled_plan.borrow_mut() = None;
+    }
+
     /// Add an initializer (weight) to the graph.
     ///
     /// Stored as a CPU tensor on the builder; uploaded to the GPU at

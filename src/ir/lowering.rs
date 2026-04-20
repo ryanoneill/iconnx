@@ -12,7 +12,8 @@ use crate::cuda::cudnn::pack_lstm_weights_for_cudnn;
 use crate::cuda::{CudaError, GpuTensor, IconnxCudaContext};
 use crate::ir::graph::OptimizableGraph;
 use crate::ir::passes::{
-    constant_folding_pass, dead_code_elimination, detect_fusion, precompute_params, topo_sort,
+    constant_folding_pass, dead_code_elimination, detect_fusion, precompute_params,
+    shape_inference, tensor_shapes_from_graph, topo_sort,
 };
 use crate::ir::plan::{
     ExecutionPlan, LstmPlanCache, LstmWeightCache, OpKind, PlannedOp,
@@ -40,22 +41,38 @@ pub fn lower(
     // 3. DCE sweep — remove ops orphaned by constant folding.
     let graph = dead_code_elimination(graph);
 
-    // 4. Precompute params (pure, no GPU).
-    let precomputed_by_name = precompute_params(&graph);
+    // 4. Shape inference — populate inferred shapes for downstream passes.
+    //
+    // The `shape_inference` call is an intentional identity pass: it exists
+    // purely to keep the pipeline uniform (every step has the
+    // `fn(OptimizableGraph) -> OptimizableGraph` signature). It is NOT a
+    // placeholder or TODO. The actual shape map is computed by
+    // `tensor_shapes_from_graph`, which returns a `HashMap<String, Shape>`
+    // that gets attached to `ExecutionPlan::tensor_shapes` below — a
+    // separate output from the graph itself. See the docs on
+    // `shape_inference` for the full rationale.
+    let graph = shape_inference(graph);
+    let tensor_shapes = tensor_shapes_from_graph(&graph);
+    // Keep the DCE invariant — cheap, and paves the way for future passes.
+    let graph = dead_code_elimination(graph);
 
-    // 5. Detect fusion (pure, no GPU).
+    // 5. Precompute params (pure, no GPU) — now uses inferred shapes to
+    // resolve Reshape `0`/`-1` placeholders when possible.
+    let precomputed_by_name = precompute_params(&graph, &tensor_shapes);
+
+    // 6. Detect fusion (pure, no GPU).
     let fusion = detect_fusion(&graph);
 
-    // 6. Upload initializers to GPU.
+    // 7. Upload initializers to GPU.
     let weights = upload_initializers(&graph, ctx)?;
 
-    // 7. Build static_i64 for fast lookup at runtime.
+    // 8. Build static_i64 for fast lookup at runtime.
     let static_i64 = collect_static_i64(&graph);
 
-    // 8. Pack LSTM weights eagerly.
+    // 9. Pack LSTM weights eagerly.
     let lstm_weights = pack_lstm_weights_eagerly(&graph, &weights, ctx)?;
 
-    // 9. Build PlannedOp sequence from sorted nodes + fusion + precomputed.
+    // 10. Build PlannedOp sequence from sorted nodes + fusion + precomputed.
     let ops: Vec<PlannedOp> = graph
         .nodes
         .iter()
@@ -79,7 +96,7 @@ pub fn lower(
         })
         .collect();
 
-    // 10. Compute tensor_last_use for memory-pool return timing.
+    // 11. Compute tensor_last_use for memory-pool return timing.
     let tensor_last_use = compute_tensor_last_use(&ops, &graph.outputs, &weights);
 
     Ok(ExecutionPlan {
@@ -92,6 +109,7 @@ pub fn lower(
         tensor_last_use,
         graph_inputs: graph.inputs,
         graph_outputs: graph.outputs,
+        tensor_shapes,
     })
 }
 
