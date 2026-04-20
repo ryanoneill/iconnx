@@ -74,6 +74,7 @@ const KERNEL_NAMES: &[&str] = &[
     "leaky_relu_kernel",
     // Math ops
     "exp_kernel",
+    "erf_kernel",
     "log_kernel",
     "sqrt_kernel",
     "pow_kernel",
@@ -197,6 +198,13 @@ extern "C" __global__ void exp_kernel(float* out, const float* x, size_t n) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = expf(x[i]);
+    }
+}
+
+extern "C" __global__ void erf_kernel(float* out, const float* x, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = erff(x[i]);
     }
 }
 
@@ -832,6 +840,26 @@ pub fn gpu_exp(
         ctx,
         kernels,
         "exp_kernel",
+        out.data_f32_mut()?,
+        input.data_f32()?,
+        n,
+    )?;
+    Ok(out)
+}
+
+/// GPU Erf: out = erf(x). Wraps CUDA's `erff()` intrinsic.
+pub fn gpu_erf(
+    ctx: &IconnxCudaContext,
+    kernels: &KernelCache,
+    pool: &mut GpuMemoryPool,
+    input: &GpuTensor,
+) -> Result<GpuTensor, CudaError> {
+    let n = input.len();
+    let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
+    launch_unary_f32(
+        ctx,
+        kernels,
+        "erf_kernel",
         out.data_f32_mut()?,
         input.data_f32()?,
         n,

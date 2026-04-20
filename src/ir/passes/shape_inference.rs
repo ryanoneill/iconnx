@@ -104,7 +104,7 @@ fn infer_node_output_shapes(
         }
 
         // Unary pass-through.
-        "Sqrt" | "Exp" | "Sin" | "Cos" | "Tanh" | "Sigmoid" | "LeakyRelu" | "Atan"
+        "Sqrt" | "Exp" | "Erf" | "Sin" | "Cos" | "Tanh" | "Sigmoid" | "LeakyRelu" | "Atan"
         | "Floor" | "Clip" | "Round" | "Cast" | "Softmax" | "LayerNormalization" | "Not" => {
             let s = input_shapes.first().cloned().unwrap_or_default();
             vec![s]
@@ -566,6 +566,22 @@ mod tests {
         b.add_node("sq", "Sqrt", vec!["x".into()], vec!["y".into()], NodeAttributes::new());
         let shapes = tensor_shapes_from_graph(&b.build());
         assert_eq!(shapes.get("y").unwrap(), &vec![Some(2), None, Some(8)]);
+    }
+
+    #[test]
+    fn erf_propagates_shape() {
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("x".into(), vec![Some(4), Some(8)]);
+        b.add_node(
+            "erf_node",
+            "Erf",
+            vec!["x".into()],
+            vec!["y".into()],
+            NodeAttributes::new(),
+        );
+        let graph = b.build();
+        let shapes = tensor_shapes_from_graph(&graph);
+        assert_eq!(shapes.get("y").unwrap(), &vec![Some(4), Some(8)]);
     }
 
     #[test]

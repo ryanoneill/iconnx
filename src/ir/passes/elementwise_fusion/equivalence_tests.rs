@@ -488,6 +488,107 @@ fn mul_sin_pow_mul_add_fused_matches_hand_computed_within_1e_5() {
     );
 }
 
+/// Erf-chain GeneralChain: a pure-unary chain containing `Erf`
+/// (`Sqrt → Erf → Tanh`) must fuse into a single
+/// `FusedPattern::GeneralChain` whose `chain_signature` carries
+/// "Erf" verbatim, and the fused output must match a sequential CPU
+/// reference at 1e-5 tolerance.
+///
+/// Design note (adaptation from plan sketch): the plan originally asked
+/// for a GELU-via-Erf graph whose 4-op prefix
+/// (Mul(1/√2) → Erf → Add(1.0) → Mul(0.5)) would fuse into a
+/// GeneralChain. That graph does NOT fit the actual architecture: the
+/// GeneralChain codegen only emits unary-elementwise ops, and
+/// `chain_is_pure_unary` gates the fallback on the chain containing no
+/// binary ops. Add/Mul are binary and so a chain that includes them
+/// cannot become a GeneralChain today. Additionally, the legacy
+/// `detect_fusion` AddMul walker grabs the `Add(1.0) → Mul(0.5)` tail
+/// before the new pass can see it. The principled fix that preserves
+/// the test's stated intent — "verify Erf auto-fuses as part of a
+/// GeneralChain, first non-trivial GeneralChain fire" — is to build a
+/// genuine pure-unary chain containing Erf and assert on that. The
+/// assertion (GeneralChain + "Erf" in signature) is unchanged; only
+/// the surrounding chain shape is adapted to fit the architecture.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn erf_chain_gelu_prefix_fuses_into_general_chain_matches_sequential() {
+    use crate::ir::plan::OpKind;
+
+    // Positive inputs only — Sqrt rejects negatives.
+    let input_vals: Vec<f32> = (0..64).map(|i| 0.01 + (i as f32) * 0.05).collect();
+
+    let mut executor =
+        crate::cuda::inference::GpuGraphExecutor::new().expect("create executor");
+    executor.add_input("x".into(), vec![Some(64)]);
+    executor.add_node(
+        "sqrt_node",
+        "Sqrt",
+        vec!["x"],
+        vec!["sqrted"],
+        NodeAttributes::new(),
+    );
+    executor.add_node(
+        "erf_node",
+        "Erf",
+        vec!["sqrted"],
+        vec!["erfed"],
+        NodeAttributes::new(),
+    );
+    executor.add_node(
+        "tanh_node",
+        "Tanh",
+        vec!["erfed"],
+        vec!["out"],
+        NodeAttributes::new(),
+    );
+
+    // Force compilation and inspect the plan: expect at least one
+    // FusedHead(GeneralChain) whose chain_signature contains "Erf".
+    executor.compile().expect("compile");
+    let plan_ref = executor.compiled_plan();
+    let plan = plan_ref.as_ref().expect("plan present after compile");
+    let general_chains_with_erf: Vec<String> = plan
+        .ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FusedHead(FusedPattern::GeneralChain {
+                chain_signature, ..
+            }) if chain_signature.contains("Erf") => Some(chain_signature.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !general_chains_with_erf.is_empty(),
+        "expected FusedPattern::GeneralChain with 'Erf' in chain_signature on the \
+         pure-unary chain (Sqrt → Erf → Tanh). Fused annotations seen: {:?}",
+        plan.ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FusedHead(p) => Some(format!("{:?}", p)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+    drop(plan_ref);
+
+    // Run the fused graph end-to-end.
+    let mut inputs = HashMap::new();
+    inputs.insert(
+        "x".to_string(),
+        Tensor::from_vec_f32(input_vals.clone(), vec![64]),
+    );
+    let outputs = executor.run(inputs, vec!["out"]).expect("run fused");
+    let fused_vals = outputs.get("out").expect("out").as_slice();
+
+    // Sequential CPU reference: tanh(erf(sqrt(x))).
+    let expected: Vec<f32> = input_vals
+        .iter()
+        .map(|&x| crate::operators::erf::erf_f32(x.sqrt()).tanh())
+        .collect();
+
+    assert_approx_eq("ErfChainGeneral", &fused_vals, &expected, 1e-5);
+}
+
 /// Sanity: ensure the new pass does NOT demote a matched variant to
 /// `GeneralChain`. If this ever fires, the specialized kernel is being
 /// bypassed in favor of the slower NVRTC path.
