@@ -184,6 +184,7 @@ pub struct PatternCount {
     pub add_mul: usize,
     pub sub_mul: usize,
     pub div_mul: usize,
+    pub general_chain: usize,
 }
 
 /// Count how many of each fused-pattern variant the detection walker
@@ -225,5 +226,6 @@ fn increment(count: &mut PatternCount, pattern: &FusedPattern) {
         FusedPattern::AddMul { .. } => count.add_mul += 1,
         FusedPattern::SubMul { .. } => count.sub_mul += 1,
         FusedPattern::DivMul { .. } => count.div_mul += 1,
+        FusedPattern::GeneralChain { .. } => count.general_chain += 1,
     }
 }

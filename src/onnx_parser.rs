@@ -70,6 +70,57 @@ impl OnnxModel {
             .unwrap_or_default()
     }
 
+    /// Get declared shapes for all graph inputs.
+    ///
+    /// Returns a vector of `(name, shape)` pairs in the order the
+    /// inputs appear in the ONNX graph. Each dim is `Some(n)` if the
+    /// ONNX value-info records a numeric `dim_value`, or `None` when
+    /// the dim is symbolic (a `dim_param` such as `seq_len` or
+    /// unspecified). A missing `type_proto` or a non-tensor input
+    /// yields an empty `Vec` — the codebase's "fully unknown"
+    /// sentinel per `shape_inference::tensor_shapes_from_graph`.
+    ///
+    /// Callers use this to seed `OptimizableGraphBuilder::add_input`
+    /// at loader time so the Phase 3 shape-inference pass has enough
+    /// static rank to propagate into downstream ops (Gather, Transpose,
+    /// Conv, LSTM …) and, ultimately, to pre-resolve Reshape
+    /// `0`/`-1` placeholders.
+    pub fn input_shapes(&self) -> Vec<(String, Vec<Option<usize>>)> {
+        let Some(graph) = self.proto.graph.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(graph.input.len());
+        for info in &graph.input {
+            let name = info.name.clone().unwrap_or_default();
+            let shape: Vec<Option<usize>> = info
+                .r#type
+                .as_ref()
+                .and_then(|t| t.value.as_ref())
+                .and_then(|v| match v {
+                    onnx_proto::type_proto::Value::TensorType(t) => t.shape.as_ref(),
+                    _ => None,
+                })
+                .map(|shape_proto| {
+                    shape_proto
+                        .dim
+                        .iter()
+                        .map(|d| match &d.value {
+                            Some(onnx_proto::tensor_shape_proto::dimension::Value::DimValue(
+                                v,
+                            )) if *v >= 0 => Some(*v as usize),
+                            // dim_param ("seq_len", "batch", …) or an
+                            // unset/negative dim_value is dynamic — use
+                            // `None`, which means "runtime decides."
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push((name, shape));
+        }
+        out
+    }
+
     /// Get model outputs
     ///
     /// Returns the names of all graph outputs

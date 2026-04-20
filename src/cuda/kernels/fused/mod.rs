@@ -17,15 +17,38 @@
 //! - `wrappers.rs`: the `gpu_fused_*` host wrapper functions, re-exported
 //!   through `pub use wrappers::*` so external callers see a flat namespace.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use garboard::{LaunchConfig, Module, Program};
 
+pub(super) mod general_chain;
 pub(super) mod wrappers;
+pub use general_chain::gpu_fused_general_chain;
 pub use wrappers::*;
 
-/// Compiled fused kernels loaded as a garboard `Module`.
+/// One compiled `GeneralChain` kernel: the garboard module that owns the
+/// PTX image + the `extern "C"` entry name that [`general_chain_kernel`]
+/// looks up on each launch.
+///
+/// Caching the module (not the typed kernel) because `TypedKernel<'d,
+/// Args>` bakes concrete reference lifetimes into `Args`, which makes
+/// re-launching with fresh local borrows impossible. The ~200ns
+/// re-resolution cost is negligible vs. kernel execution.
+pub struct GeneralChainKernel {
+    pub module: Module<'static>,
+    pub entry_name: String,
+}
+
+/// Compiled fused kernels loaded as a garboard `Module`, plus a
+/// per-signature cache of runtime-compiled `GeneralChain` kernels.
 pub struct FusedKernelCache {
     module: Module<'static>,
+    /// Cache of NVRTC-compiled `GeneralChain` kernels keyed by
+    /// `chain_signature`. Filled lazily on first dispatch of each unique
+    /// signature so compile cost amortizes across runs.
+    general_chain: RefCell<HashMap<String, GeneralChainKernel>>,
 }
 
 impl FusedKernelCache {
@@ -47,12 +70,22 @@ impl FusedKernelCache {
             })?;
         }
 
-        Ok(Self { module })
+        Ok(Self {
+            module,
+            general_chain: RefCell::new(HashMap::new()),
+        })
     }
 
     /// Access to the underlying module for launch sites.
     pub(super) fn module(&self) -> &Module<'static> {
         &self.module
+    }
+
+    /// Access to the `GeneralChain` per-signature cache. Used by
+    /// [`crate::cuda::fused::general_chain`] to look up / insert compiled
+    /// chain kernels.
+    pub(crate) fn general_chain_cache(&self) -> &RefCell<HashMap<String, GeneralChainKernel>> {
+        &self.general_chain
     }
 }
 

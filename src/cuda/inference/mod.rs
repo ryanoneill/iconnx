@@ -244,6 +244,28 @@ impl GpuGraphExecutor {
         })
     }
 
+    /// Register a graph input with its declared shape.
+    ///
+    /// Seeds the `OptimizableGraphBuilder`'s inputs vector with
+    /// `(name, shape)` so the Phase 3 shape-inference pass has enough
+    /// static rank at lowering time. `shape[i] == None` means the
+    /// dimension is dynamic (e.g. `seq_len`, `batch`); callers should
+    /// pass the declared rank even when every dim is `None` so
+    /// `tensor_shapes_from_graph` can distinguish "rank known, dims
+    /// unknown" from "fully unknown" — conflating the two is the
+    /// sentinel-confusion class of bug already documented for Reshape
+    /// pre-resolution.
+    ///
+    /// Loader callers should use `OnnxParser::input_shapes()` which
+    /// returns exactly this pair list.
+    ///
+    /// Like `add_initializer` / `add_node`, this invalidates the
+    /// cached plan so the next run re-lowers.
+    pub fn add_input(&mut self, name: String, shape: Vec<Option<usize>>) {
+        self.builder.borrow_mut().add_input(name, shape);
+        *self.compiled_plan.borrow_mut() = None;
+    }
+
     /// Add an initializer (weight) to the graph.
     ///
     /// Stored as a CPU tensor on the builder; uploaded to the GPU at
@@ -366,7 +388,7 @@ impl GpuGraphExecutor {
         inputs: HashMap<String, Tensor>,
         output_names: Vec<&str>,
     ) -> Result<HashMap<String, Tensor>, CudaError> {
-        self.ensure_compiled()?;
+        self.ensure_compiled_with_outputs(&output_names)?;
         let plan = self.compiled_plan.borrow();
         self.executor
             .run(plan.as_ref().unwrap(), inputs, &output_names)
@@ -379,15 +401,66 @@ impl GpuGraphExecutor {
     /// [`testing`] can force compilation and then inspect plan state
     /// without triggering a full `run()`. Production callers should just
     /// call `run*` directly; the plan is compiled implicitly.
+    ///
+    /// With no explicit output names supplied, the shim auto-detects
+    /// "sink" tensors — op outputs that no other op consumes — and seeds
+    /// `graph.outputs` with them. That keeps the DCE pass from
+    /// over-pruning during test-only introspection calls like
+    /// `get_node_precomputed`. A later `run*` call with explicit output
+    /// names invalidates and rebuilds the plan.
     pub fn compile(&self) -> Result<(), CudaError> {
-        self.ensure_compiled()
+        self.ensure_compiled_with_outputs(&[])
     }
 
-    fn ensure_compiled(&self) -> Result<(), CudaError> {
-        if self.compiled_plan.borrow().is_some() {
+    fn ensure_compiled_with_outputs(&self, output_names: &[&str]) -> Result<(), CudaError> {
+        // If we already have a plan whose `graph_outputs` covers the
+        // caller's request, reuse it. Otherwise rebuild.
+        let needs_rebuild = match self.compiled_plan.borrow().as_ref() {
+            None => true,
+            Some(plan) => {
+                let existing: std::collections::HashSet<&str> =
+                    plan.graph_outputs.iter().map(String::as_str).collect();
+                output_names.iter().any(|n| !existing.contains(n))
+            }
+        };
+        if !needs_rebuild {
             return Ok(());
         }
-        let graph = self.builder.borrow().clone().build();
+
+        let mut builder = self.builder.borrow().clone();
+        let derived_outputs: Vec<String> = {
+            let nodes = builder.nodes_snapshot();
+            if output_names.is_empty() {
+                // No explicit outputs — auto-detect sinks so DCE has a
+                // liveness anchor. Sinks are op outputs not consumed by
+                // any other op's input.
+                let consumed: std::collections::HashSet<&str> = nodes
+                    .iter()
+                    .flat_map(|node| node.inputs.iter().map(String::as_str))
+                    .collect();
+                nodes
+                    .iter()
+                    .flat_map(|node| node.outputs.iter())
+                    .filter(|out| !out.is_empty() && !consumed.contains(out.as_str()))
+                    .cloned()
+                    .collect()
+            } else {
+                let known: std::collections::HashSet<String> = nodes
+                    .iter()
+                    .flat_map(|node| node.outputs.iter().cloned())
+                    .collect();
+                output_names
+                    .iter()
+                    .filter(|name| known.contains(**name))
+                    .map(|name| (*name).to_string())
+                    .collect()
+            }
+        };
+        for name in derived_outputs {
+            builder.add_output(name);
+        }
+
+        let graph = builder.build();
         let plan = ir::lower(graph, &self.executor.ctx)?;
         *self.compiled_plan.borrow_mut() = Some(plan);
         Ok(())
@@ -461,7 +534,8 @@ impl GpuGraphExecutor {
     > {
         use super::validation::ValidationError;
 
-        self.ensure_compiled().map_err(ValidationError::from)?;
+        self.ensure_compiled_with_outputs(&output_names)
+            .map_err(ValidationError::from)?;
         let plan = self.compiled_plan.borrow();
         self.executor
             .run_with_validation(plan.as_ref().unwrap(), inputs, &output_names, mode)
@@ -484,7 +558,7 @@ impl GpuGraphExecutor {
         ),
         CudaError,
     > {
-        self.ensure_compiled()?;
+        self.ensure_compiled_with_outputs(&output_names)?;
         let plan = self.compiled_plan.borrow();
         self.executor
             .run_with_checkpoints(plan.as_ref().unwrap(), inputs, &output_names, config)
@@ -496,7 +570,7 @@ impl GpuGraphExecutor {
         inputs: HashMap<String, Tensor>,
         output_names: Vec<&str>,
     ) -> Result<(HashMap<String, Tensor>, Vec<NodeExecutionLog>), CudaError> {
-        self.ensure_compiled()?;
+        self.ensure_compiled_with_outputs(&output_names)?;
         let plan = self.compiled_plan.borrow();
         self.executor
             .run_with_logging(plan.as_ref().unwrap(), inputs, &output_names)
@@ -508,7 +582,7 @@ impl GpuGraphExecutor {
         inputs: HashMap<String, Tensor>,
         output_names: Vec<&str>,
     ) -> Result<(HashMap<String, Tensor>, ProfileData), CudaError> {
-        self.ensure_compiled()?;
+        self.ensure_compiled_with_outputs(&output_names)?;
         let plan = self.compiled_plan.borrow();
         self.executor
             .run_with_profiling(plan.as_ref().unwrap(), inputs, &output_names)

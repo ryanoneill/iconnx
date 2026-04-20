@@ -81,6 +81,13 @@ pub struct ExecutionPlan {
     pub tensor_last_use: HashMap<String, usize>,
     pub graph_inputs: Vec<GraphInput>,
     pub graph_outputs: Vec<String>,
+    /// Per-tensor inferred shapes keyed by tensor name. Populated by
+    /// `shape_inference` pass; consumed by `precompute_params` (for
+    /// Reshape `0`/`-1` resolution) and available for Phase 4's memory
+    /// planner. `Vec<Option<usize>>` per tensor — `Some(n)` is a statically
+    /// inferred dim, `None` is dynamic. Empty Vec means the tensor's shape
+    /// is completely unknown.
+    pub tensor_shapes: HashMap<String, Vec<Option<usize>>>,
 }
 
 #[cfg(test)]

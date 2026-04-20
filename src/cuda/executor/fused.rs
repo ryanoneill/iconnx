@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use crate::cuda::inference::fusion::FusedPattern;
 use crate::cuda::kernels::fused::{
     gpu_fused_add_mul, gpu_fused_add_mul_add, gpu_fused_div_mul, gpu_fused_div_rsqrt,
-    gpu_fused_gelu, gpu_fused_mul_add, gpu_fused_mul_sin_pow_mul_add, gpu_fused_sub_mul,
+    gpu_fused_gelu, gpu_fused_general_chain, gpu_fused_mul_add,
+    gpu_fused_mul_sin_pow_mul_add, gpu_fused_sub_mul,
 };
 use crate::cuda::{CudaError, GpuTensor};
 use crate::ir::{OpKind, PlannedOp};
@@ -264,6 +265,30 @@ impl Executor {
                     w1,
                     b,
                     p,
+                )
+            }
+            FusedPattern::GeneralChain {
+                chain_signature,
+                ops,
+                input_name,
+                output_name: _,
+            } => {
+                let x = values
+                    .get(input_name)
+                    .or_else(|| weights.get(input_name))
+                    .ok_or_else(|| {
+                        CudaError::Kernel(format!(
+                            "Fused GeneralChain '{}': input '{}' not found",
+                            chain_signature, input_name
+                        ))
+                    })?;
+                gpu_fused_general_chain(
+                    &self.ctx,
+                    &self.fused_kernels,
+                    &mut pool,
+                    chain_signature,
+                    ops,
+                    x,
                 )
             }
         }

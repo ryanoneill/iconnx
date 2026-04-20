@@ -84,6 +84,24 @@ pub enum FusedPattern {
         p_input: String,
         output_name: String,
     },
+    /// General single-input elementwise chain emitted by the
+    /// `elementwise_fusion` pass when no specialized variant matches.
+    ///
+    /// The chain is driven by a single input tensor (same shape through
+    /// every op) and ends with a single output tensor. Each kernel is
+    /// compiled once per unique `chain_signature` via NVRTC at the
+    /// executor level.
+    GeneralChain {
+        /// Canonical string form of the op sequence + attrs — keys the
+        /// kernel cache. Example: "Sqrt|Exp" or "LeakyRelu_alpha_0.2".
+        chain_signature: String,
+        /// Op sequence in chain order: (op_type, attributes).
+        ops: Vec<(String, crate::attributes::NodeAttributes)>,
+        /// Chain's single driving input tensor name.
+        input_name: String,
+        /// Head's output tensor name (the last op's output).
+        output_name: String,
+    },
 }
 
 /// Information about a detected fused pattern
