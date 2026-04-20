@@ -1608,6 +1608,16 @@ Expected: two commits, both GPG-signed:
 
 ---
 
+## Follow-ups logged during C PR (for post-merge tracking)
+
+These surfaced during Commit 2's implementation and leadline's review. Not blockers for C; track for appropriate future PRs.
+
+1. **Extend `FusedPattern::GeneralChain` codegen to embed scalar constants** — Phase 3's codegen supports `single-input` pure-unary chains with attribute-only side inputs. Binary ops whose second input is a constant initializer (not an attribute) — e.g., `Mul(x, 0.5)` where `0.5` is a `Constant` node — do NOT currently fuse through GeneralChain. The emit_op function would need to embed scalar constants into the kernel source for this to work. Implication: Whisper's GELU-via-Erf chain (`Mul(c)→Erf→Add(c)→Mul(c)→Mul(x)`) will fuse only the Erf standalone; the surrounding Mul/Add steps stay unfused. Whisper's measured perf may show less benefit than Phase 3's generic-infrastructure framing implied. This is a scope limit to document, not a bug. **Schedule:** defer until Whisper's measured perf says whether the work is worth it. Validation of GELU-via-Erf as a fusible chain is therefore deferred from this PR's unit test to Whisper's actual run in leadline-bench.
+
+2. **Refactor `src/cuda/kernels/mod.rs` into per-category sub-modules** — pre-existing violation of CLAUDE.md's <1000-line rule (1123 lines before this PR; 1151 after adding `gpu_erf`). Not introduced by C; preserved because coupling a hygiene PR to a kernels-module refactor is scope creep. Same pattern as Phase 2's `cuda/executor/` split would apply (group by category: elementwise, reduce, matmul/conv, memory, etc.). **Schedule:** its own small PR before Phase 4's memory planner lands (the memory planner will add more kernel-cache code and push the file further over).
+
+---
+
 ## Task 3: Merge to main
 
 ### Task 3.1: Final pre-merge verification
