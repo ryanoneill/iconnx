@@ -304,7 +304,8 @@ pub(super) fn store_outputs(
             | FusedPattern::AddMul { output_name, .. }
             | FusedPattern::SubMul { output_name, .. }
             | FusedPattern::DivMul { output_name, .. }
-            | FusedPattern::MulSinPowMulAdd { output_name, .. } => output_name,
+            | FusedPattern::MulSinPowMulAdd { output_name, .. }
+            | FusedPattern::GeneralChain { output_name, .. } => output_name,
         };
         values.insert(fused_output_name.clone(), output);
         return;

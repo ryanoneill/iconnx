@@ -12,8 +12,9 @@ use crate::cuda::cudnn::pack_lstm_weights_for_cudnn;
 use crate::cuda::{CudaError, GpuTensor, IconnxCudaContext};
 use crate::ir::graph::OptimizableGraph;
 use crate::ir::passes::{
-    constant_folding_pass, dead_code_elimination, detect_fusion, precompute_params,
-    shape_inference, tensor_shapes_from_graph, topo_sort,
+    constant_folding_pass, dead_code_elimination, detect_fusion,
+    elementwise_fusion_pass, fusion_annotations_from_graph, precompute_params,
+    shape_inference, tensor_shapes_from_graph, topo_sort, FusionAnnotations,
 };
 use crate::ir::plan::{
     ExecutionPlan, LstmPlanCache, LstmWeightCache, OpKind, PlannedOp,
@@ -56,12 +57,28 @@ pub fn lower(
     // Keep the DCE invariant — cheap, and paves the way for future passes.
     let graph = dead_code_elimination(graph);
 
-    // 5. Precompute params (pure, no GPU) — now uses inferred shapes to
+    // 5. General elementwise fusion — detects arbitrary chains and
+    // emits `FusedPattern::GeneralChain` for ones that don't match the
+    // 8 specialized variants. Pure-CPU, no GPU state touched.
+    let graph = elementwise_fusion_pass(graph);
+    let fusion_annotations = fusion_annotations_from_graph(&graph);
+
+    // 6. DCE again in case elementwise_fusion exposed dead ops (it's a
+    // no-op today since the pass is annotation-only, but keeping the
+    // sweep here future-proofs the pipeline: any later change that
+    // actually rewrites nodes will benefit without a separate touch).
+    let graph = dead_code_elimination(graph);
+
+    // 7. Precompute params (pure, no GPU) — now uses inferred shapes to
     // resolve Reshape `0`/`-1` placeholders when possible.
     let precomputed_by_name = precompute_params(&graph, &tensor_shapes);
 
-    // 6. Detect fusion (pure, no GPU).
-    let fusion = detect_fusion(&graph);
+    // 8. Detect fusion (pure, no GPU) using the legacy detector, then
+    // merge with the new elementwise_fusion annotations. Primary wins
+    // on head-name conflict; the legacy pass fills in dynamic
+    // candidates and any head not claimed by the new pass.
+    let legacy_fusion = detect_fusion(&graph);
+    let fusion = merge_fusion_annotations(fusion_annotations, legacy_fusion);
 
     // 7. Upload initializers to GPU.
     let weights = upload_initializers(&graph, ctx)?;
@@ -111,6 +128,30 @@ pub fn lower(
         graph_outputs: graph.outputs,
         tensor_shapes,
     })
+}
+
+/// Merge two `FusionAnnotations` instances. The primary (from the new
+/// `elementwise_fusion` pass) takes precedence on head-name conflict;
+/// the secondary (from the legacy `detect_fusion`) fills in any head
+/// the primary didn't claim, plus contributes all dynamic candidates.
+///
+/// Skipped-node sets are unioned (safe: if a node is skipped by either
+/// pass, its execution is redundant under the other's head). Dynamic
+/// candidates are unioned with primary wins — primary currently emits
+/// no dynamic candidates, so this is a simple merge today.
+fn merge_fusion_annotations(
+    primary: FusionAnnotations,
+    secondary: FusionAnnotations,
+) -> FusionAnnotations {
+    let mut merged = primary;
+    for (head, info) in secondary.heads {
+        merged.heads.entry(head).or_insert(info);
+    }
+    merged.skipped.extend(secondary.skipped);
+    for (name, info) in secondary.dynamic_candidates {
+        merged.dynamic_candidates.entry(name).or_insert(info);
+    }
+    merged
 }
 
 /// Upload every initializer tensor to the GPU, mirroring today's

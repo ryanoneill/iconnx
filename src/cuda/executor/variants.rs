@@ -37,14 +37,17 @@ fn op_label(op: &PlannedOp) -> String {
         OpKind::FusedHead(pattern) => {
             use crate::cuda::inference::fusion::FusedPattern::*;
             let suffix = match pattern {
-                DivRsqrt { .. } => "DivRsqrt",
-                AddMulAdd { .. } => "AddMulAdd",
-                Gelu { .. } => "Gelu",
-                MulAdd { .. } => "MulAdd",
-                AddMul { .. } => "AddMul",
-                SubMul { .. } => "SubMul",
-                DivMul { .. } => "DivMul",
-                MulSinPowMulAdd { .. } => "MulSinPowMulAdd",
+                DivRsqrt { .. } => "DivRsqrt".to_string(),
+                AddMulAdd { .. } => "AddMulAdd".to_string(),
+                Gelu { .. } => "Gelu".to_string(),
+                MulAdd { .. } => "MulAdd".to_string(),
+                AddMul { .. } => "AddMul".to_string(),
+                SubMul { .. } => "SubMul".to_string(),
+                DivMul { .. } => "DivMul".to_string(),
+                MulSinPowMulAdd { .. } => "MulSinPowMulAdd".to_string(),
+                GeneralChain { chain_signature, .. } => {
+                    format!("GeneralChain[{}]", chain_signature)
+                }
             };
             format!("Fused_{}", suffix)
         }

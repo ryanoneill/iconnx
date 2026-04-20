@@ -37,12 +37,15 @@ use iconnx::ir::passes::{
 use iconnx::ir::OptimizableGraphBuilder;
 use iconnx::onnx_parser::OnnxParser;
 
-fn build_kokoro_graph_same_as_executor() -> Option<iconnx::ir::OptimizableGraph> {
+fn build_kokoro_graph_same_as_executor() -> iconnx::ir::OptimizableGraph {
     let model_path = Path::new("kokoro-v1.0.onnx");
-    if !model_path.exists() {
-        return None;
-    }
-    let model = OnnxParser::parse_file(model_path).ok()?;
+    assert!(
+        model_path.exists(),
+        "kokoro-v1.0.onnx must be reachable from the working directory \
+         (symlink or copy it in). A silent skip here would hide real \
+         shape-inference regressions — see Phase 3 Commit 3's Gather bug."
+    );
+    let model = OnnxParser::parse_file(model_path).expect("parse kokoro-v1.0.onnx");
     let weights = model.extract_weights();
     let graph = model.computation_graph();
     let nodes = graph.nodes();
@@ -72,16 +75,13 @@ fn build_kokoro_graph_same_as_executor() -> Option<iconnx::ir::OptimizableGraph>
         b.add_input(name, shape);
     }
     b.add_output("audio".into());
-    Some(b.build())
+    b.build()
 }
 
 #[test]
 #[ignore]
 fn text_encoder_transpose_shape_matches_runtime_truth() {
-    let graph = match build_kokoro_graph_same_as_executor() {
-        Some(g) => g,
-        None => return, // Kokoro not present; nothing to assert against.
-    };
+    let graph = build_kokoro_graph_same_as_executor();
     let graph = topo_sort(graph).expect("topo");
     let graph = constant_folding(graph);
     let graph = dead_code_elimination(graph);

@@ -25,19 +25,25 @@ use iconnx::onnx_parser::OnnxParser;
 use iconnx::tensor::Tensor;
 
 /// Build the same GPU executor used by the other validation tests, loaded
-/// with the full Kokoro graph if the model file is reachable.
-fn setup_kokoro_gpu_executor() -> Option<GpuGraphExecutor> {
+/// with the full Kokoro graph. Panics loudly if the model file is missing
+/// — a silent-skip would mask real regressions (as it did with the Gather
+/// shape-inference correctness bug diagnosed in Phase 3 Commit 3).
+fn setup_kokoro_gpu_executor() -> GpuGraphExecutor {
     let model_path = Path::new("kokoro-v1.0.onnx");
-    if !model_path.exists() {
-        return None;
-    }
+    assert!(
+        model_path.exists(),
+        "kokoro-v1.0.onnx must be reachable from the working directory \
+         (symlink or copy it in). A silent skip here would hide real GPU \
+         regressions — see Phase 3 Commit 3's Gather bug for an example \
+         of what silent-skipping this test can mask."
+    );
 
-    let model = OnnxParser::parse_file(model_path).ok()?;
+    let model = OnnxParser::parse_file(model_path).expect("parse kokoro-v1.0.onnx");
     let weights = model.extract_weights();
     let graph = model.computation_graph();
     let nodes = graph.nodes();
 
-    let mut executor = GpuGraphExecutor::new().ok()?;
+    let mut executor = GpuGraphExecutor::new().expect("create CUDA executor");
 
     // Seed graph-input shapes from the ONNX value-info block so the
     // Phase 3 shape-inference pass starts with concrete rank instead
@@ -51,7 +57,9 @@ fn setup_kokoro_gpu_executor() -> Option<GpuGraphExecutor> {
     }
 
     for (name, tensor) in &weights {
-        executor.add_initializer(name.clone(), tensor).ok()?;
+        executor
+            .add_initializer(name.clone(), tensor)
+            .expect("add initializer");
     }
 
     for (idx, node) in nodes.iter().enumerate() {
@@ -72,7 +80,7 @@ fn setup_kokoro_gpu_executor() -> Option<GpuGraphExecutor> {
         );
     }
 
-    Some(executor)
+    executor
 }
 
 /// Dummy inputs that match the Kokoro input schema: short token sequence,
@@ -104,13 +112,7 @@ fn kokoro_inputs(seq_len: usize) -> HashMap<String, Tensor> {
 #[test]
 #[ignore] // Requires full Kokoro model + CUDA device; several minutes runtime
 fn fusion_fires_on_full_kokoro_at_seq_len_5() {
-    let executor = match setup_kokoro_gpu_executor() {
-        Some(e) => e,
-        None => {
-            println!("⚠️  Kokoro model not found at ./kokoro-v1.0.onnx — skipping");
-            return;
-        }
-    };
+    let executor = setup_kokoro_gpu_executor();
 
     let inputs = kokoro_inputs(5);
     let (_outputs, profile) = executor
