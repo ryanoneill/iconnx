@@ -1,161 +1,23 @@
-//! Constant folding — evaluate ops whose inputs are all static on CPU,
-//! replacing them with new initializers. Unlocks downstream DCE.
-//!
-//! Only folds ops that have a `crate::operators::<op>::forward`
-//! implementation (today's CPU operator set). Unknown op → unchanged.
-//! Only folds when every non-empty input is in `graph.initializers`
-//! — partial constant propagation is out of scope.
+//! Constant-folding pass — promotes initializer-rooted fold chains into
+//! synthesized initializers. The fold loop itself is in
+//! `folding_core`; this module is the initializer-only configuration.
 
-use std::collections::HashMap;
+use crate::ir::graph::OptimizableGraph;
+use crate::ir::passes::folding_core;
 
-use crate::ir::graph::{GraphNode, OptimizableGraph};
-use crate::tensor::Tensor;
-
-/// Output-size cap per folded op. Folding a 1M-element Conv on CPU is not a win.
-const FOLD_OUTPUT_ELEMENT_BUDGET: usize = 1_000_000;
-
-/// Evaluate every op whose non-empty inputs are all in `graph.initializers`
-/// (or in an earlier-folded output within this pass) on the CPU, promote the
-/// result to a new initializer, and drop the op. Ops with any dynamic input,
-/// unknown op types, multi-output ops, and ops whose output exceeds the
-/// element budget are preserved verbatim.
-pub fn constant_folding(mut graph: OptimizableGraph) -> OptimizableGraph {
-    // Accumulated folded outputs — reused within this pass so chains of
-    // const-ops fold transitively without requiring a second pass.
-    let mut folded: HashMap<String, Tensor> = HashMap::new();
-
-    let mut kept_nodes: Vec<GraphNode> = Vec::with_capacity(graph.nodes.len());
-
-    for node in graph.nodes.into_iter() {
-        if let Some(outputs) = try_fold(&node, &graph.initializers, &folded) {
-            // Every output tensor is now folded — record into `folded` and
-            // drop the op.
-            for (name, tensor) in node.outputs.iter().zip(outputs.into_iter()) {
-                if !name.is_empty() {
-                    folded.insert(name.clone(), tensor);
-                }
-            }
-            // Do NOT push `node` — it's been folded away.
-        } else {
-            kept_nodes.push(node);
-        }
-    }
-
-    // Promote folded tensors into initializers so later passes (shape
-    // inference, precompute, fusion) treat them as first-class constants.
-    for (name, tensor) in folded {
-        graph.initializers.insert(name, tensor);
-    }
-
-    graph.nodes = kept_nodes;
-    graph
-}
-
-/// Attempt to fold one node. Returns `Some(outputs)` iff every non-empty
-/// input is already constant (initializer or earlier folded) AND the op
-/// has a CPU `forward` implementation AND the computed output size is
-/// within the element budget.
+/// Pure function: consumes one OptimizableGraph, produces another with
+/// every foldable chain collapsed to initializers. Foldable means:
+/// - every non-empty input is in `graph.initializers` (or was folded
+///   earlier in this pass), AND
+/// - the op has a CPU `forward` implementation, AND
+/// - the computed output size is within the element budget.
 ///
-/// Multi-output ops (e.g., LSTM producing Y / Y_h / Y_c) are not folded
-/// by this pass — their multi-output forward signature is out of scope.
-fn try_fold(
-    node: &GraphNode,
-    initializers: &HashMap<String, Tensor>,
-    folded: &HashMap<String, Tensor>,
-) -> Option<Vec<Tensor>> {
-    // Gather input tensors in order. Empty-named inputs are valid "absent
-    // optional" markers per ONNX — skip them.
-    let mut input_tensors: Vec<Tensor> = Vec::with_capacity(node.inputs.len());
-    for name in &node.inputs {
-        if name.is_empty() {
-            continue;
-        }
-        let t = initializers
-            .get(name)
-            .or_else(|| folded.get(name))?
-            .clone();
-        input_tensors.push(t);
-    }
-
-    // Dispatch the CPU operator. Unknown op → bail out.
-    let output = dispatch_cpu_forward(&node.op_type, &input_tensors, &node.attributes)?;
-
-    // Enforce output-size cap. `Tensor::len()` is dtype-agnostic (works for
-    // Float32 / Int64 / Int32 / Bool outputs); `as_slice()` would panic for
-    // non-Float32, so we deliberately use `len()` here.
-    if output.len() > FOLD_OUTPUT_ELEMENT_BUDGET {
-        return None;
-    }
-
-    // Single-output ops only for now — every op in the dispatch table below
-    // has exactly one output. Future extension: return Vec<Tensor> from
-    // `dispatch_cpu_forward` to cover multi-output ops like LSTM.
-    Some(vec![output])
-}
-
-/// Route a node to its CPU forward implementation. Returns `None` for
-/// any op we don't support yet.
-///
-/// Mirrors the authoritative CPU dispatch in
-/// `src/graph_executor.rs::execute_operator`, but single-op (not
-/// whole-graph) so the constant-folding pass can call it in isolation.
-fn dispatch_cpu_forward(
-    op_type: &str,
-    inputs: &[Tensor],
-    attributes: &crate::attributes::NodeAttributes,
-) -> Option<Tensor> {
-    use crate::operators::*;
-    Some(match op_type {
-        // Binary elementwise arithmetic.
-        "Add" => add::Add::forward(inputs, attributes),
-        "Sub" => sub::Sub::forward(inputs, attributes),
-        "Mul" => mul::Mul::forward(inputs, attributes),
-        "Div" => div::Div::forward(inputs, attributes),
-        "Pow" => pow::Pow::forward(inputs, attributes),
-
-        // Unary elementwise.
-        "Sqrt" => sqrt::Sqrt::forward(inputs, attributes),
-        "Exp" => exp::Exp::forward(inputs, attributes),
-        "Sin" => sin::Sin::forward(inputs, attributes),
-        "Cos" => cos::Cos::forward(inputs, attributes),
-        "Tanh" => tanh::Tanh::forward(inputs, attributes),
-        "Erf" => erf::Erf::forward(inputs, attributes),
-        "Sigmoid" => sigmoid::Sigmoid::forward(inputs, attributes),
-        "Atan" => atan::Atan::forward(inputs, attributes),
-        "Clip" => clip::Clip::forward(inputs, attributes),
-        "Floor" => floor::Floor::forward(inputs, attributes),
-        "Round" => round::Round::forward(inputs, attributes),
-        "Cast" => cast::Cast::forward(inputs, attributes),
-
-        // Shape / layout.
-        "Reshape" => reshape::Reshape::forward(inputs, attributes),
-        "Unsqueeze" => unsqueeze::Unsqueeze::forward(inputs, attributes),
-        "Squeeze" => squeeze::Squeeze::forward(inputs, attributes),
-        "Transpose" => transpose::Transpose::forward(inputs, attributes),
-        "Shape" => shape::Shape::forward(inputs, attributes),
-        "ConstantOfShape" => constant_of_shape::ConstantOfShape::forward(inputs, attributes),
-        "Gather" => gather::Gather::forward(inputs, attributes),
-        "Concat" => concat::Concat::forward(inputs, attributes),
-        "Slice" => slice::Slice::forward(inputs, attributes),
-        "Range" => range::Range::forward(inputs, attributes),
-
-        // Comparisons — today's CPU operators internally dispatch on input
-        // dtype, so calling the single entry-point handles Float32 / Int64 /
-        // Int32 correctly without a sub-match here.
-        "Equal" => equal::Equal::forward(inputs, attributes),
-        "Less" => less::Less::forward(inputs, attributes),
-        "Greater" => greater::Greater::forward(inputs, attributes),
-        "GreaterOrEqual" => greater_or_equal::GreaterOrEqual::forward(inputs, attributes),
-
-        // Everything else (Conv, ConvTranspose, MatMul, Gemm, LSTM, STFT,
-        // LayerNormalization, ReduceMean, ReduceSum, ScatterND, NonZero,
-        // Softmax, LeakyRelu, Pad, Resize, Where, CumSum, And, Or, Not,
-        // Expand, Constant) is intentionally excluded. Either they rarely
-        // have all-constant inputs in real ONNX graphs, or their CPU
-        // forward is prohibitively expensive at fold time, or their
-        // signature is multi-output.
-        _ => return None,
-    })
+/// Unknown op types, multi-output ops, and ops whose output exceeds the
+/// element budget are preserved verbatim. Delegates the fold loop to
+/// `folding_core::fold_with_predicate` with a default (always-None)
+/// predicate, since this pass only folds initializer-rooted chains.
+pub fn constant_folding(graph: OptimizableGraph) -> OptimizableGraph {
+    folding_core::fold_with_predicate(graph, |_node, _folded| None)
 }
 
 #[cfg(test)]
@@ -163,6 +25,7 @@ mod tests {
     use super::*;
     use crate::attributes::NodeAttributes;
     use crate::ir::OptimizableGraphBuilder;
+    use crate::tensor::Tensor;
 
     #[test]
     fn mul_of_two_initializers_folds() {

@@ -4,6 +4,7 @@ pub mod constant_folding;
 pub mod dce;
 pub mod elementwise_fusion;
 pub mod elementwise_fusion_codegen;
+pub mod folding_core;
 pub mod fusion;
 pub mod precompute;
 pub mod shape_inference;
