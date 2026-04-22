@@ -1526,22 +1526,47 @@ git add src/ir/lowering.rs
 git commit -S -m "wip(ir): wire shape_extraction_folding into lower() post-shape_inference"
 ```
 
-### Task 2.7: Structural-gate validation in kokoro_gpu_fusion_test
+### Task 2.7: Structural-gate validation in kokoro_gpu_fusion_test [REFRAMED 2026-04-22]
 
 **Files:**
 - Modify: `tests/kokoro_gpu_fusion_test.rs`
 
-- [ ] **Step 1: Add the primary + secondary gate assertions**
+Per spec §Amendment history > "2026-04-22 (second refinement)": attempt #1's gate measurement found 0/124 extraction chains fold under the ONNX-symbolic calling contract because all of Kokoro's extractions target `seq_len` (always `None`) and `batch` (always `None`), never `hidden_dim` (always `Some(768)`). The reframe: change the test loader to pass concrete shapes via `add_input` matching the test's actual inference inputs; gate becomes deterministic `fold_counts.total == 124`. Counter stays at attempt 1/3 — this is a calling-contract fix within the same attempt, not a new attempt.
 
-Find the existing Reshape hit-rate assertion in the integration test. Replace with the two-part block from spec §Per-pass design > Commit #2 > Integration test updates:
+- [ ] **Step 1: Update `setup_kokoro_gpu_executor` to pass concrete input shapes**
+
+Find the loader helper in `tests/kokoro_gpu_fusion_test.rs` (the function that calls `executor.add_input(...)` for each graph input via `model.input_shapes()`). Replace the ONNX-symbolic seeding loop with explicit concrete shapes matching `kokoro_inputs(5)`:
+
+Before (ONNX-symbolic — mechanism inert):
+```rust
+for (name, shape) in model.input_shapes() {
+    executor.add_input(name, shape);
+}
+```
+
+After (concrete — mechanism fires):
+```rust
+// Phase 4 B operates on concrete dims only. Test uses seq_len=5
+// (matches kokoro_inputs(5)) so we pass [Some(1), Some(5)] for
+// tokens. Style and speed are fully concrete regardless.
+executor.add_input("tokens".to_string(), vec![Some(1), Some(5)]);
+executor.add_input("style".to_string(), vec![Some(1), Some(256)]);
+executor.add_input("speed".to_string(), vec![Some(1)]);
+```
+
+If the existing loader's API signature doesn't match exactly (e.g., `add_input` takes `&str` instead of `String`), adapt to what iconnx's actual `GpuGraphExecutor::add_input` signature is. DO NOT change iconnx's API — only adapt the call-site syntax.
+
+- [ ] **Step 2: Replace any prior Reshape-hit assertion with the deterministic gate**
+
+Find the existing Reshape hit-rate assertion block (pre-Phase-4 asserts `>= 8`; there may or may not be a prior-attempt assertion if the test was edited during the earlier failed attempt — Task 2.0's reset should have left it at the pre-Phase-4 baseline). Replace with:
 
 ```rust
 // Reset counters before the lower() call that triggers the pass.
 iconnx::cuda::inference::testing::reset_shape_extraction_folding_counters();
 
-// ... existing lower()-triggering setup ...
+// ... existing lower()-triggering setup (run_with_profiling, etc.) ...
 
-// ---- Primary gate: direct extraction-fold count ----
+// ---- Deterministic primary gate: fold_counts.total == 124 ----
 let fold_counts = iconnx::cuda::inference::testing::shape_extraction_folding_counts();
 eprintln!(
     "shape_extraction_folding counts — Gather: {}, Cast→Gather: {}, Slice: {}, total: {}",
@@ -1550,56 +1575,51 @@ eprintln!(
     fold_counts.shape_slice,
     fold_counts.total,
 );
-assert!(
-    fold_counts.total >= 38,
-    "Phase 4 B primary structural gate failed: {} extraction chains \
-     folded (need ≥ 38 for Green, or ≥ 27 for Amber with per-pattern \
-     investigation). See spec §Gating protocol B. Per-pattern \
-     breakdown: Gather={}, Cast→Gather={}, Slice={}.",
+assert_eq!(
+    fold_counts.total, 124,
+    "Phase 4 B deterministic gate failed: {} extraction chains folded \
+     (expected exactly 124 under concrete-shape calling contract). \
+     Per-pattern breakdown: Gather={}, Cast→Gather={}, Slice={}. \
+     Deviation < 124 → mechanism missed supported chains; deviation > 124 \
+     → mechanism over-matched. See spec §Gating protocol B.",
     fold_counts.total,
     fold_counts.shape_gather,
     fold_counts.shape_cast_gather,
     fold_counts.shape_slice,
 );
 
-// ---- Secondary gate: Reshape-hit proxy sanity check ----
-if precompute_stats.reshape_hits < 48 {
-    eprintln!(
-        "NOTE: reshape_hits = {}/61 but fold_counts.total = {}. \
-         {} extraction unlocks didn't bump Reshape precompute — \
-         likely went to non-Reshape consumers (dim arithmetic, \
-         Conv-weight-shape work). Not a gate failure; primary gate \
-         is on fold_counts.total.",
-        precompute_stats.reshape_hits,
-        fold_counts.total,
-        fold_counts.total.saturating_sub(precompute_stats.reshape_hits.saturating_sub(10)),
-    );
-}
+// Informational only — not a gate signal.
+eprintln!(
+    "Informational: reshape_hits = {}/{} (pre-Phase-4 baseline 10/61; \
+     not asserted — see spec §Gating protocol B).",
+    precompute_stats.reshape_hits,
+    precompute_stats.reshape_total,
+);
 ```
 
-**Substitute the exact prior-assertion location and surrounding variable names** — read the test before editing to find the right spot. The reset call goes near the top of the test function, before the first `lower()`-triggering executor interaction.
+The reset call goes near the top of the test function, BEFORE the first `lower()`-triggering executor interaction (typically before `setup_kokoro_gpu_executor()` or the `.run_with_profiling(...)` call — whichever comes first). The fold_counts check goes after `run_with_profiling` completes (`precompute_stats` must already be in scope from earlier in the test — if not, get it via the existing test-introspection helpers).
 
-- [ ] **Step 2: Run the Kokoro integration test**
+- [ ] **Step 3: Run the Kokoro integration test**
 
 ```bash
-cargo test --features cuda --release --test kokoro_gpu_fusion_test -- --ignored --nocapture 2>&1 | grep -E "shape_extraction_folding counts|^test result|FAILED|panicked|NOTE:" | head -20
+cargo test --features cuda --release --test kokoro_gpu_fusion_test -- --ignored --nocapture 2>&1 | grep -E "shape_extraction_folding counts|^test result|FAILED|panicked|Informational" | head -20
 ```
 
 Record the `fold_counts.total` value and the per-pattern breakdown.
 
-**Evaluate the three-tier structural gate:**
+**Evaluate the deterministic gate:**
 
-- **Green (`total ≥ 38`):** proceed to Task 2.8 squash.
-- **Amber (`27 ≤ total ≤ 37`):** STOP and report. Include the per-pattern breakdown and a preliminary analysis of which extraction patterns missed.
-- **Red (`total < 27`):** STOP and report BLOCKED. The mechanism needs reassessment.
+- **Pass (`total == 124`):** proceed to Task 2.8 squash.
+- **Undershoot (`total < 124`):** STOP and report. The mechanism missed supported chains. Use the per-pattern breakdown to identify which pattern dropped. Likely causes: Cast-transparency edge case, negative-index wrap, axis-attribute handling. This counts as continued debugging of attempt #1 (per spec "attempt disambiguation"), not a new attempt.
+- **Overshoot (`total > 124`):** STOP and report. Mechanism over-matched — accepted a chain it shouldn't have. Investigate the per-pattern breakdown for which count exceeded expected. Attempt counter preserved.
 
-Under the **three-attempt abandonment clause** (spec §Gating protocol B): if this is the third pattern-implementation attempt (each attempt being a new pattern variant or fresh predicate design), do not commit another attempt — escalate per the abandonment protocol.
+Under the **three-attempt abandonment clause** (spec §Gating protocol B): if attempt #1 cannot be made to converge on exactly 124 via bug-fixing within the three implemented patterns, escalate before declaring a new attempt.
 
-- [ ] **Step 3: Commit WIP** (only if Green)
+- [ ] **Step 4: Commit WIP** (only if `total == 124`)
 
 ```bash
 git add tests/kokoro_gpu_fusion_test.rs
-git commit -S -m "wip(ir): structural gate — shape_extraction_folding fold_counts.total ≥ 38"
+git commit -S -m "wip(ir): structural gate — shape_extraction_folding deterministic 124/124"
 ```
 
 ### Task 2.8: Squash into final `feat(ir)` commit
