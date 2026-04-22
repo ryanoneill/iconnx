@@ -48,13 +48,19 @@ Direct Kokoro ratio benefit for B is estimated well below the 0.05 ratio floor. 
 
 The 53-case denominator is the revised target. The 20 empty-sentinel cases are explicit non-goals for Phase 4 B.
 
-**Structural gate** — measured via `count_precomputed_shape_ops::reshape_hits` in `tests/kokoro_gpu_fusion_test.rs` plus per-pattern attribution in the pass's own Kokoro instrumentation test. Three tiers:
+**Structural gate (primary metric + secondary sanity check).**
 
-- **Green (land without investigation):** unlock ≥ 38 of the 53 partial cases (≥ 72% — matches Phase 3's original projection ratio applied to the correct denominator).
-- **Amber (investigate before landing):** unlock 27–37 of 53 (≥ 50% but < 72%). List which extraction patterns weren't caught and why. Proceed if the gap is "unsupported pattern shape we're deliberately not covering" (update the spec's pattern list and re-gate). Block if the gap is "the mechanism has a bug — a supported pattern didn't fold." Scope creep protection: do NOT bolt on additional pattern variants just to push the number up — each new pattern is an explicit spec amendment.
-- **Red (reassess):** unlock < 27 of 53 (< 50%). Mechanism is off; reassess Option 1 vs Option 2 with leadline.
+The PRIMARY gate is the direct count of extraction chains actually folded by the pass, exposed via a per-pattern attribution helper: `testing::shape_extraction_folding_counts() -> ShapeExtractionFoldingCounts { shape_gather, shape_cast_gather, shape_slice, total }`. Populated by the pass at runtime into a thread-local counter; read by the Kokoro integration test after one `lower()` call. Three tiers on `total`:
 
-**Three-attempt abandonment clause.** If three pattern-implementation attempts (each implementing a distinct extraction pattern or refining the predicate) fail to land a Green gate against the 53-case denominator, the Phase-3-style "try 3 times then abandon" discipline applies: abandon B, cherry-pick the `8350f67` correctness bugfix (below) onto main as its own signed commit, mark Phase 3's stacked-gate verdict as deferred to a future phase with a different mechanism, proceed to Commit 3 A only. The abandonment protocol exists so we don't keep bolting on patterns indefinitely; each attempt must be a coherent predicate extension, not a one-chain special case.
+- **Green (land without investigation):** `total ≥ 38` of the 53 partial cases (≥ 72% — matches Phase 3's original projection ratio applied to the correct denominator).
+- **Amber (investigate before landing):** `27 ≤ total ≤ 37`. List which extraction patterns didn't fire and why via the per-pattern breakdown. Proceed if the gap is "unsupported pattern shape we're deliberately not covering" (update the spec's pattern list and re-gate). Block if the gap is "the mechanism has a bug — a supported pattern didn't fold."
+- **Red (reassess):** `total < 27`. Mechanism is off; reassess Option 1 vs Option 2 with leadline.
+
+The SECONDARY (proxy) gate is `count_precomputed_shape_ops::reshape_hits ≥ 48/61`. This is a sanity check that most unlocks land in Reshape precompute as projected; pre-Phase-4 baseline is 10/61, and a direct `total=38` unlock would push `reshape_hits` to 48 under a 1:1 extraction-chain-to-Reshape-consumer correspondence. **Diverging behavior between the two signals is a finding, not a failure**: e.g., `total=40, reshape_hits=30` means ~10 unlocks went to non-Reshape consumers (dim arithmetic, Conv-weight-shape work, etc.) — worth investigating via the per-pattern breakdown but does not block landing if `total ≥ 38`. The primary gate is `total`, not `reshape_hits`.
+
+**Three-attempt abandonment clause.** If three pattern-implementation attempts fail to land a Green gate (`total ≥ 38`), the Phase-3-style "try 3 times then abandon" discipline applies: abandon B, cherry-pick the `8350f67` correctness bugfix (below) onto main as its own signed commit, mark Phase 3's stacked-gate verdict as deferred to a future phase with a different mechanism, proceed to Commit 3 A only.
+
+**What counts as an "attempt" (disambiguation):** an attempt is a fresh predicate design OR a distinct new pattern variant added to the pass. Tweaking parameters on an in-progress pattern implementation — fixing a bug in an existing match arm, refining index-bounds checks, correcting a Cast-transparency edge case — is part of the SAME attempt, not a new one. The three-attempt budget exists to bound the search for a working mechanism, not to bound the debugging of a working one.
 
 **Mandatory correctness keeper (lands regardless of B's path).** During real-graph instrumentation the original `shape_aware_folding` predicate surfaced a latent bug: folding Shape on the empty-Vec unknown sentinel synthesized an `Int64[0]` tensor, which panicked downstream `Gather::forward` at `src/operators/gather.rs:144` (`index_axis(Axis(0), idx)` on a zero-length axis). The bugfix adds a guard + regression test and is orthogonal to B's predicate design. Commit SHA `8350f67` on branch `ir-phase4`. If B proceeds: included in B's squash. If B is abandoned: cherry-picked onto main as its own `fix(ops): gather rank-0-indices guard` commit.
 
@@ -193,34 +199,60 @@ Unit tests cover each supported pattern's success case, each pattern's rejection
 
 Plus the existing `8350f67` regression test: `gather_on_empty_int64_initializer_does_not_panic` (added as part of the surfaced bugfix; stays regardless).
 
-**Integration test update in `tests/kokoro_gpu_fusion_test.rs`:**
+**Integration test updates in `tests/kokoro_gpu_fusion_test.rs`:**
+
+Per §Gating protocol B, two assertions: a primary gate on the direct extraction-fold count, and a secondary proxy-sanity check on Reshape hits.
 
 ```rust
+// ---- Primary gate: direct extraction-fold count ----
 // Phase 4 B (amended 2026-04-22) projects unlocking extraction chains
 // on partially-dynamic Shape inputs. Real-graph instrumentation found
 // 53 of Kokoro's 73 Shape nodes have the extraction-chain structure
-// this pass targets; structural gate is ≥ 38/53 of those chains fold.
-//
+// this pass targets. Green gate: unlock ≥ 38 of those 53 (72% — matches
+// Phase 3's original projection ratio applied to the correct
+// denominator).
+let fold_counts = iconnx::cuda::inference::testing::shape_extraction_folding_counts();
+eprintln!(
+    "shape_extraction_folding counts — Gather: {}, Cast→Gather: {}, Slice: {}, total: {}",
+    fold_counts.shape_gather,
+    fold_counts.shape_cast_gather,
+    fold_counts.shape_slice,
+    fold_counts.total,
+);
+assert!(
+    fold_counts.total >= 38,
+    "Phase 4 B primary structural gate failed: {} extraction chains \
+     folded (need ≥ 38 for Green, or ≥ 27 for Amber with per-pattern \
+     investigation). See spec §Gating protocol B. Per-pattern \
+     breakdown: Gather={}, Cast→Gather={}, Slice={}.",
+    fold_counts.total,
+    fold_counts.shape_gather,
+    fold_counts.shape_cast_gather,
+    fold_counts.shape_slice,
+);
+
+// ---- Secondary gate: Reshape-hit proxy sanity check ----
 // Pre-Phase-4 baseline Reshape hit rate was 10/61. Each folded
 // extraction chain that terminates at a Reshape.shape input bumps
-// the hit rate by 1 (Reshape precompute picks the synthesized
-// initializer). Green gate projection: 10 + 38 = 48/61 reshape hits
-// at minimum. Amber: 10 + 27 = 37 ≤ hits < 48. Red: < 37.
-assert!(
-    precompute_stats.reshape_hits >= 48,
-    "Phase 4 B structural gate failed: Kokoro Reshape precompute hit \
-     rate is {}/{} (need ≥ 48/61 for Green). Projection: 10 existing \
-     + ≥38 unlocked extraction chains via shape_extraction_folding. \
-     If in [37, 48), you're in Amber — investigate which extraction \
-     patterns didn't fire via `shape_extraction_folding_counts()` \
-     (see spec §Gating protocol). If < 37, Red — reassess the \
-     mechanism.",
-    precompute_stats.reshape_hits,
-    precompute_stats.reshape_total,
-);
+// the hit rate by 1. Under a 1:1 correspondence projection:
+// 10 + ≥38 = ≥48/61. Divergence from this proxy is a finding
+// (some unlocks went to non-Reshape consumers) but NOT a gate
+// failure — primary gate is fold_counts.total.
+if precompute_stats.reshape_hits < 48 {
+    eprintln!(
+        "NOTE: reshape_hits = {}/61 but fold_counts.total = {}. \
+         {} extraction unlocks didn't bump Reshape precompute — \
+         likely went to non-Reshape consumers (dim arithmetic, \
+         Conv-weight-shape work). Not a gate failure; primary gate \
+         is on fold_counts.total.",
+        precompute_stats.reshape_hits,
+        fold_counts.total,
+        fold_counts.total - (precompute_stats.reshape_hits.saturating_sub(10)),
+    );
+}
 ```
 
-The assertion threshold derivation: 53 partial cases × 72% Green ratio = 38 unlocks minimum; 53 × 50% = 27 Amber floor; added to the existing 10 hits from the pre-Phase-4 baseline gives 48 Green / 37 Amber-floor on the reshape_hits metric.
+The primary threshold (`fold_counts.total ≥ 38`) derivation: 53 partial cases × 72% Green ratio. The secondary proxy threshold (`reshape_hits ≥ 48`) assumes 1:1 extraction-chain-to-Reshape-consumer correspondence; divergence is informational, not a gate signal.
 
 ### Commit #3: `memory_planner` (A)
 
