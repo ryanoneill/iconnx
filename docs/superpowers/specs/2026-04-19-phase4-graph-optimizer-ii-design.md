@@ -1,6 +1,6 @@
-# Phase 4 Graph Optimizer II: shape-aware folding + memory planner
+# Phase 4 Graph Optimizer II: shape-extraction folding + memory planner
 
-**Status:** finalized 2026-04-19 after brainstorming dialogue with leadline.
+**Status:** amended 2026-04-22 after real-graph instrumentation revealed Phase 4 Commit 2's original predicate was too narrow. Original spec finalized 2026-04-19; see §Amendment history for the change record.
 **Scope label:** Phase 4 (per the Phase 3 outcomes decomposition).
 **Landing:** one PR with three signed commits on branch `ir-phase4` (refactor, B, A — no internal squashing across the three).
 **Baseline:** Kokoro ratio median 3.954 (iconnx 110.6 ms / ORT 28.6 ms) on current machine + driver state. Phase 3's stacked-gate target was retired; Phase 4 sets its own frames per below.
@@ -22,7 +22,7 @@ Three signed commits on branch `ir-phase4`:
 | # | Commit | Files | Gate |
 |---|---|---|---|
 | 1 | `refactor(ir): extract fold loop into folding_core` | new `src/ir/passes/folding_core.rs`; `src/ir/passes/constant_folding.rs` (becomes a thin caller); `src/ir/passes/mod.rs` (re-exports) | Pure refactor. All existing `constant_folding` tests still pass. Zero behavioral change; zero new warnings. |
-| 2 | `feat(ir): shape_aware_folding pass` (B) | new `src/ir/passes/shape_aware_folding.rs`; `src/ir/lowering.rs` (pipeline wiring); `src/ir/passes/mod.rs` (re-export) | **Structural gate.** Kokoro Reshape precompute hit rate (via `count_precomputed_shape_ops`) moves from 10/61 (pre-B) to ≥ 33/61 (10 existing + 23 projected unlocks), with a 3-tier protocol for the investigation zone — see §Gating protocol. |
+| 2 | `feat(ir): shape_extraction_folding pass` (B) | new `src/ir/passes/shape_extraction_folding.rs`; `src/ir/lowering.rs` (pipeline wiring); `src/ir/passes/mod.rs` (re-export); plus `src/operators/gather.rs` rank-0-indices correctness fix (cherry-pick from `8350f67`) | **Structural gate** against the 53-partial-case denominator identified by real-graph instrumentation: unlock ≥ 38/53 chains (Green), 27–37/53 (Amber — investigate), < 27/53 (Red — reassess). See §Gating protocol. Three-attempt abandonment clause applies. |
 | 3 | `feat(ir): static memory planner + arena allocation path` (A) | new `src/ir/passes/memory_planner.rs`; `src/ir/plan.rs` (adds `memory_plan` field + `arena_offset` on `PlannedOp`); `src/ir/lowering.rs` (pipeline wiring); `src/cuda/executor/*` (arena allocation at run start, per-op branching); `src/ir/passes/mod.rs` (re-export) | **Generic-infrastructure frame.** Acceptance by correctness + classification coverage + cross-model follow-up. See §Gating protocol. |
 
 **Out of scope (tracked separately):**
@@ -39,13 +39,24 @@ Two frames in Phase 4, each deliberate:
 
 ### B — structural gate (not ratio-based)
 
-Direct Kokoro ratio benefit for B is estimated at ~0.7 ms / 110 ms ≈ 0.006 ratio points — below the 0.05 floor. Gating on a ratio measurement we already predict will fail is ceremonial, not a check. Phase 3's stacked-gate commitment was not "B must measurably improve the Kokoro ratio" but "Phase 4 resolves whether the Shape→Cast→Gather unlock mechanism works" — a structural question, noise-independent.
+Direct Kokoro ratio benefit for B is estimated well below the 0.05 ratio floor. Gating on a ratio measurement we already predict will fail is ceremonial, not a check. Phase 3's stacked-gate commitment was "Phase 4 resolves whether the Shape-rooted chain unlock mechanism works on Kokoro" — a structural question, noise-independent.
 
-**Structural gate.** Measured via `count_precomputed_shape_ops::reshape_hits` in `tests/kokoro_gpu_fusion_test.rs`. Three tiers:
+**Denominator revised.** Real-graph instrumentation (2026-04-22) measured Kokoro's 73 Shape nodes. Every downstream tensor inherits `None` on at least one dim via `seq_len` propagation from the `tokens` graph input, so 0 Shape nodes have fully-concrete input shapes — the original all-or-nothing predicate would never fire. The actual structural ceiling:
 
-- **Green (land without investigation):** hit rate ≥ 33/61 — matches or exceeds Phase 3's projection (10 existing + 23 unlocks).
-- **Amber (investigate before landing):** 28/61 ≤ hit rate < 33/61. List which Reshape chains didn't unlock and why. Proceed if the gap is "projection was optimistic — the mechanism works on every chain it can reach." Block if the gap is "the unlock mechanism has a bug — some reachable chains didn't fold." The diagnostic script: for each of the 51 runtime-shape-chain Reshapes, walk back through `shape_inference`'s output; count how many have a terminating `Shape(x)` where `tensor_shapes[x]` is fully `Some(_)` (these SHOULD unlock). Compare to actual hit count post-B. Discrepancy > 2 = bug.
-- **Red (block):** hit rate < 28/61. Mechanism clearly broken.
+- **53 Shape ops** feed from a tensor with at least one concrete dim AND at least one `None` dim, and are consumed by extraction ops (`Gather` / `Slice` / optionally chained through `Cast`) that extract specific indices from the Shape vector. A predicate that folds *chains terminating at extraction ops whose extracted indices hit only concrete dims* can reach these.
+- **20 Shape ops** feed from a tensor whose shape inferencer returned the empty-`Vec` "fully unknown" sentinel. Not reachable by this mechanism — would require shape-inference improvements upstream.
+
+The 53-case denominator is the revised target. The 20 empty-sentinel cases are explicit non-goals for Phase 4 B.
+
+**Structural gate** — measured via `count_precomputed_shape_ops::reshape_hits` in `tests/kokoro_gpu_fusion_test.rs` plus per-pattern attribution in the pass's own Kokoro instrumentation test. Three tiers:
+
+- **Green (land without investigation):** unlock ≥ 38 of the 53 partial cases (≥ 72% — matches Phase 3's original projection ratio applied to the correct denominator).
+- **Amber (investigate before landing):** unlock 27–37 of 53 (≥ 50% but < 72%). List which extraction patterns weren't caught and why. Proceed if the gap is "unsupported pattern shape we're deliberately not covering" (update the spec's pattern list and re-gate). Block if the gap is "the mechanism has a bug — a supported pattern didn't fold." Scope creep protection: do NOT bolt on additional pattern variants just to push the number up — each new pattern is an explicit spec amendment.
+- **Red (reassess):** unlock < 27 of 53 (< 50%). Mechanism is off; reassess Option 1 vs Option 2 with leadline.
+
+**Three-attempt abandonment clause.** If three pattern-implementation attempts (each implementing a distinct extraction pattern or refining the predicate) fail to land a Green gate against the 53-case denominator, the Phase-3-style "try 3 times then abandon" discipline applies: abandon B, cherry-pick the `8350f67` correctness bugfix (below) onto main as its own signed commit, mark Phase 3's stacked-gate verdict as deferred to a future phase with a different mechanism, proceed to Commit 3 A only. The abandonment protocol exists so we don't keep bolting on patterns indefinitely; each attempt must be a coherent predicate extension, not a one-chain special case.
+
+**Mandatory correctness keeper (lands regardless of B's path).** During real-graph instrumentation the original `shape_aware_folding` predicate surfaced a latent bug: folding Shape on the empty-Vec unknown sentinel synthesized an `Int64[0]` tensor, which panicked downstream `Gather::forward` at `src/operators/gather.rs:144` (`index_axis(Axis(0), idx)` on a zero-length axis). The bugfix adds a guard + regression test and is orthogonal to B's predicate design. Commit SHA `8350f67` on branch `ir-phase4`. If B proceeds: included in B's squash. If B is abandoned: cherry-picked onto main as its own `fix(ops): gather rank-0-indices guard` commit.
 
 ### A — generic-infrastructure frame
 
@@ -94,77 +105,122 @@ pub fn constant_folding(graph: OptimizableGraph) -> OptimizableGraph {
 
 **No behavioral change.** Every existing `constant_folding` test passes unchanged.
 
-### Commit #2: `shape_aware_folding` (B)
+### Commit #2: `shape_extraction_folding` (B)
 
 ```rust
-// src/ir/passes/shape_aware_folding.rs
-pub fn shape_aware_folding(
+// src/ir/passes/shape_extraction_folding.rs
+pub fn shape_extraction_folding(
     graph: OptimizableGraph,
     tensor_shapes: &HashMap<String, Vec<Option<usize>>>,
 ) -> OptimizableGraph;
 ```
 
-**Algorithm.**
+**Design rationale.** Real-graph instrumentation measured 0 Kokoro Shape nodes with fully-concrete input shapes (every downstream tensor inherits `seq_len = None` from the `tokens` graph input), but 53 Shape nodes with at least one concrete dim AND at least one `None` dim consumed by an extraction op that asks for specific indices. The predicate therefore targets *Shape-rooted chains terminating at an extraction op whose extracted indices are all concrete dims of the Shape input*, not the narrower "Shape when all-inputs-known" originally projected. See §Amendment history for the measurement that drove the rename + redesign.
+
+**Supported extraction patterns (exactly these; anything else is scope creep per spec §Amendment history):**
+
+1. **`Shape(x) → Gather(indices=I)`** where `I` is a literal initializer (`Int64[k]` tensor of `k` indices). Fires iff every index in `I` is a non-negative integer less than `rank(x)` AND `tensor_shapes[x][I[j]]` is `Some(_)` for every `j`.
+2. **`Shape(x) → Cast(to=Int64) → Gather(indices=I)`** — identical eligibility to pattern 1. Cast is transparent; folds through to produce the same synthesized initializer type.
+3. **`Shape(x) → Slice(start=s, end=e[, axis=0])`** where `s` and `e` are concrete indices into the Shape vector (and axis is 0 or absent — Shape's output is rank-1). Fires iff every position `[s, e)` has `tensor_shapes[x][pos]` as `Some(_)`.
+
+For each firing pattern, the entire chain collapses to a single synthesized initializer carrying the extracted Int64 values. Intermediate op nodes are dropped; the extraction op's consumer now sees a static initializer. DCE runs after to clean orphans.
+
+**Algorithm sketch.**
+
+The predicate is structural: it needs to see the extraction op PLUS its Shape-rooted chain. `folding_core::fold_with_predicate`'s per-node closure receives only one node at a time, so the predicate for `shape_extraction_folding` inspects the consumer ops (not the Shape op itself):
 
 ```rust
-pub fn shape_aware_folding(graph, tensor_shapes) -> OptimizableGraph {
-    folding_core::fold_with_predicate(graph, |node, _folded| {
-        if node.op_type != "Shape" {
-            return None;
+pub fn shape_extraction_folding(
+    graph: OptimizableGraph,
+    tensor_shapes: &HashMap<String, Vec<Option<usize>>>,
+) -> OptimizableGraph {
+    // Pre-compute a producer-name → GraphNode index so the predicate
+    // can walk back from an extraction op to its Shape source without
+    // re-traversing the node list on every call.
+    let producers = build_producer_map(&graph);
+
+    folding_core::fold_with_predicate(graph, |node, folded| {
+        match node.op_type.as_str() {
+            "Gather" => try_fold_shape_gather(node, &graph, &producers, tensor_shapes),
+            "Slice"  => try_fold_shape_slice(node, &graph, &producers, tensor_shapes),
+            _ => None,
         }
-        let input_name = node.inputs.first()?;
-        let inferred = tensor_shapes.get(input_name)?;
-        let fully_known: Vec<i64> = inferred
-            .iter()
-            .map(|d| d.map(|n| n as i64))
-            .collect::<Option<Vec<_>>>()?;  // None if any dim is None
-        Some(Tensor::from_vec_i64(fully_known, vec![inferred.len()]))
     })
 }
+
+// try_fold_shape_gather: walks node.inputs[0]'s producer chain,
+// skipping a single Cast(to=Int64) if present, terminating at Shape(x);
+// reads node.inputs[1] as the indices initializer; checks every index
+// j against tensor_shapes[x][j].is_some(); on success synthesizes the
+// extracted Int64 tensor.
 ```
 
-**Pipeline position.** Inserted into `lower()` immediately after `shape_inference` + `tensor_shapes_from_graph`:
+**Implementation notes.**
+
+- The predicate must handle intermediate Cast ops transparently: a `Shape → Cast(Int64) → Gather` chain should fold exactly like `Shape → Gather`, because `Shape`'s native output is already Int64 and a Cast to Int64 is a no-op preserving values.
+- The predicate does NOT fold Shape standalone. The `8350f67` bugfix (which added a guard against folding Shape on the unknown-sentinel case) stays — under the revised design, Shape is never folded by this pass; only the extraction-consuming chain is.
+- The `folded` param in the fold-loop closure is still unused by this pass (it inherits from the fold-loop contract but the predicate consults `graph` + `tensor_shapes` + `producers` only). This is fine per `folding_core`'s documented contract.
+- Per-pattern attribution counters (internal instrumentation, not public API) track how many times each pattern fires. Exposed via a `testing::shape_extraction_folding_counts()` helper for the Kokoro gate diagnostic. Used to distinguish "pattern X didn't fire" from "pattern X fired but wrongly" during Amber-tier investigation.
+
+**Pipeline position.** Unchanged from the original design — inserted into `lower()` immediately after `shape_inference` + `tensor_shapes_from_graph`:
 
 ```rust
-// src/ir/lowering.rs (revised)
 let graph = topo_sort(graph)?;
 let graph = constant_folding(graph);
 let graph = dead_code_elimination(graph);
 let graph = shape_inference(graph);
 let tensor_shapes = tensor_shapes_from_graph(&graph);
-let graph = shape_aware_folding(graph, &tensor_shapes);  // NEW
+let graph = shape_extraction_folding(graph, &tensor_shapes);  // RENAMED
 let graph = dead_code_elimination(graph);
 let precomputed = precompute_params(&graph, &tensor_shapes);
 let fusion_primary = elementwise_fusion_pass(&graph, &tensor_shapes);
 // ... rest unchanged
 ```
 
-**Why Shape-only predicate.** Shape is the sole op whose correctness is determined by its input's shape rather than value. Once `Shape(x)` folds into an initializer, downstream Cast/Gather/etc. become all-inputs-initializer and fold via `folding_core`'s existing dispatch in the same pass. No second const-folding pass is needed; the fixpoint loop handles the chain.
+**Tests (in `src/ir/passes/shape_extraction_folding.rs::tests`):**
 
-**Tests (in `src/ir/passes/shape_aware_folding.rs::tests`):**
+Unit tests cover each supported pattern's success case, each pattern's rejection case, and the cross-pattern invariants:
 
-- `shape_of_known_shape_tensor_folds`: graph with a runtime node producing a tensor `x` whose `tensor_shapes[x] = [Some(2), Some(3), Some(4)]`. Insert `Shape(x) → out`. Assert post-pass: `graph.initializers["out"] == [2, 3, 4]`, node removed.
-- `shape_of_partially_dynamic_tensor_does_not_fold`: same setup but `tensor_shapes[x] = [None, Some(3), Some(4)]`. Assert post-pass: Shape node still present, no initializer added.
-- `shape_cast_gather_chain_folds_to_single_initializer`: chain `Shape(x) → Cast(to=Int64) → Gather(indices=[0]) → out`. Post-pass: `out` initializer present with the expected gathered element.
-- `shape_of_dynamic_graph_input_does_not_fold`: `x` is a graph input with shape `[None, Some(512)]`. Assert Shape node stays.
-- `shape_aware_folding_is_idempotent`: two consecutive calls produce identical graphs.
+- `gather_of_shape_with_all_concrete_indices_folds`: `Shape(x) → Gather([0, 2])` where `tensor_shapes[x] = [Some(1), None, Some(512)]`. Extracted indices 0 and 2 are both concrete. Post-fold: `initializers["out"] == [1, 512]`, chain removed.
+- `gather_of_shape_with_none_at_extracted_index_does_not_fold`: same shape; `Gather([1])` where index 1 is `None`. Chain preserved.
+- `cast_in_between_shape_and_gather_is_transparent`: `Shape → Cast(Int64) → Gather([0])`; Cast is optional no-op. Post-fold: chain removed, single initializer synthesized.
+- `slice_of_shape_with_all_concrete_range_folds`: `Shape(x) → Slice(start=0, end=2)` where dims 0 and 1 are both `Some`. Post-fold: collapses to initializer `[x_shape[0], x_shape[1]]`.
+- `slice_of_shape_with_none_in_range_does_not_fold`: similar but range hits a `None` dim. Chain preserved.
+- `standalone_shape_without_extraction_consumer_does_not_fold`: a Shape op whose output feeds no supported extraction pattern stays. Explicit test that the revised design NEVER folds Shape alone.
+- `gather_on_non_shape_input_does_not_fold`: Gather whose input[0] isn't a Shape output (e.g., an initializer Int64 tensor) — must be left untouched because the fold rationale only applies to Shape-rooted chains. Guard against over-matching.
+- `out_of_bounds_gather_index_does_not_fold`: indices that exceed `rank(x)` must not panic and must not fold. Guard against undefined behavior on malformed inputs.
+- `shape_extraction_folding_is_idempotent`: two consecutive calls produce identical graphs.
+
+Plus the existing `8350f67` regression test: `gather_on_empty_int64_initializer_does_not_panic` (added as part of the surfaced bugfix; stays regardless).
 
 **Integration test update in `tests/kokoro_gpu_fusion_test.rs`:**
 
 ```rust
-// Pre-Phase-4 baseline was 10/61. Phase 4 B projects 23 additional
-// unlocks via Shape-chain resolution, for a target of ≥ 33/61.
+// Phase 4 B (amended 2026-04-22) projects unlocking extraction chains
+// on partially-dynamic Shape inputs. Real-graph instrumentation found
+// 53 of Kokoro's 73 Shape nodes have the extraction-chain structure
+// this pass targets; structural gate is ≥ 38/53 of those chains fold.
+//
+// Pre-Phase-4 baseline Reshape hit rate was 10/61. Each folded
+// extraction chain that terminates at a Reshape.shape input bumps
+// the hit rate by 1 (Reshape precompute picks the synthesized
+// initializer). Green gate projection: 10 + 38 = 48/61 reshape hits
+// at minimum. Amber: 10 + 27 = 37 ≤ hits < 48. Red: < 37.
 assert!(
-    precompute_stats.reshape_hits >= 33,
-    "Phase 4 B Reshape precompute hit rate regressed: got {}/{} hits \
-     (expected at least 33 after Shape-chain unlock). Phase 3's \
-     baseline was 10; shape_aware_folding should unlock ~23 more. \
-     If in [28, 33), investigate which Reshape chains didn't unlock \
-     and why — see spec §Gating protocol 'Amber' tier.",
+    precompute_stats.reshape_hits >= 48,
+    "Phase 4 B structural gate failed: Kokoro Reshape precompute hit \
+     rate is {}/{} (need ≥ 48/61 for Green). Projection: 10 existing \
+     + ≥38 unlocked extraction chains via shape_extraction_folding. \
+     If in [37, 48), you're in Amber — investigate which extraction \
+     patterns didn't fire via `shape_extraction_folding_counts()` \
+     (see spec §Gating protocol). If < 37, Red — reassess the \
+     mechanism.",
     precompute_stats.reshape_hits,
     precompute_stats.reshape_total,
 );
 ```
+
+The assertion threshold derivation: 53 partial cases × 72% Green ratio = 38 unlocks minimum; 53 × 50% = 27 Amber floor; added to the existing 10 hits from the pre-Phase-4 baseline gives 48 Green / 37 Amber-floor on the reshape_hits metric.
 
 ### Commit #3: `memory_planner` (A)
 
@@ -425,4 +481,26 @@ let planned_ops = build_planned_ops(&graph, &precomputed, &fusion, &memory_plan)
 
 ## Open questions
 
-None remaining. All architectural choices made in brainstorming dialogue with leadline on 2026-04-19.
+None remaining. All architectural choices made in brainstorming dialogue with leadline on 2026-04-19 + amendment dialogue on 2026-04-22.
+
+## Amendment history
+
+### 2026-04-22 — Commit 2 redesign: shape_aware_folding → shape_extraction_folding
+
+**Trigger.** Implementer wired the original `shape_aware_folding` pass into `lower()` and ran the structural gate against Kokoro. Hit rate landed at 10/61 — identical to Phase 3's baseline. Zero unlocks. Red tier on the original 33/61 gate. Implementer escalated per Phase 1 learning rather than weakening the gate.
+
+**Diagnosis (real-graph instrumentation).** Kokoro has 73 Shape nodes at lowering time. 0 have fully-concrete input shapes: `OnnxParser::input_shapes()` preserves the ONNX-declared `dim_param` symbolic `seq_len` as `None` on the `tokens` input, and that `None` propagates through every downstream tensor. The original all-or-nothing predicate (fold Shape(x) iff every dim of x is `Some(_)`) was architecturally unable to fire on Kokoro's graph. Of the 73 Shape nodes: 20 have fully-unknown inputs (empty-sentinel, not reachable); **53 have partially-known inputs feeding into extraction ops (`Gather` / `Slice`, optionally through `Cast`) that ask for specific indices** — this 53-case set is what the mechanism can actually unlock.
+
+**Scope guardrails chosen by leadline to prevent indefinite pattern bolt-on:**
+
+1. Pass renamed to `shape_extraction_folding` — semantics shifted from "fold Shape when all-static" to "fold Shape-rooted chains terminating at extraction ops whose extracted indices hit static dims."
+2. Pattern support limited to the three variants measured in the 53 partial cases: `Shape → Gather`, `Shape → Cast → Gather`, `Shape → Slice`. Additional patterns are explicit spec amendments, not ad-hoc extensions.
+3. Structural gate denominator changed from 61 (total Reshape chains) to 53 (reachable partial cases). Thresholds calibrated to match Phase 3's original projection ratio: Green ≥ 72% = 38/53 unlocks, Amber 50–72% = 27–37/53, Red < 50% = < 27/53. Expressed against the `reshape_hits` metric: Green ≥ 48/61, Amber 37–47/61, Red < 37/61.
+4. Three-attempt abandonment clause: if three pattern-implementation attempts fail to reach Green, B is abandoned, the `8350f67` bugfix is cherry-picked onto main as a standalone `fix(ops)` commit, Commit 3 (A) proceeds as the phase-only deliverable, and Phase 3's stacked-gate verdict is formally deferred to a future phase with a different mechanism (candidates: runtime seq_len specialization, upstream shape_inference improvements to eliminate the empty-sentinel category).
+5. `8350f67` correctness bugfix lands regardless of B's path — orthogonal to the predicate design, fixes a real bug (rank-0 unknown sentinel → `Int64[0]` tensor panicking downstream Gather).
+
+**Rationale for amending rather than retrying with a tweaked threshold.** The original predicate is architecturally wrong for Kokoro, not just numerically off. Lowering the gate to match the 10/61 floor would land a pass that does nothing, preserving the appearance of progress while leaving Phase 3's stacked-gate verdict permanently open. The amended design targets the structural form the data actually shows (extraction chains on partially-dynamic tensors) and sets a gate that requires the mechanism to demonstrably unlock the cases it's designed for.
+
+### 2026-04-19 — Original spec
+
+Initial finalization after brainstorming. Three commits on `ir-phase4`: refactor `folding_core`, `shape_aware_folding` (B) with all-or-nothing predicate and 33/61 gate, `memory_planner` (A) unchanged from amendment.
