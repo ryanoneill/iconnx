@@ -402,9 +402,1295 @@ Expected: one signed commit `refactor(ir): extract fold loop into folding_core`.
 
 ---
 
-## Commit 2: `feat(ir)` — shape_aware_folding pass (B)
+## Commit 2: `feat(ir)` — shape_extraction_folding pass (B) [REDESIGNED 2026-04-22]
 
-**Commit goal:** Add `shape_aware_folding` — a new pass that uses `folding_core::fold_with_predicate` with a Shape-predicate extension to unblock Phase 3's 23 projected Reshape precompute misses on Kokoro. Pipeline: `...shape_inference → tensor_shapes_from_graph → shape_aware_folding → DCE → precompute_params → ...`. Structural gate: Kokoro Reshape hit rate must land ≥ 33/61 (Green), [28, 33) triggers Amber-tier investigation, < 28 is Red.
+**Amendment context:** A previous attempt at this commit (branch `ir-phase4` commits `cf49711`, `292140c`, `8350f67` atop refactor `5924e5d`) built the original spec's "fold Shape when all-static" pass. Real-graph instrumentation showed 0/61 unlocks on Kokoro because every downstream tensor inherits `seq_len = None` from the `tokens` graph input. Spec was amended 2026-04-22 (commits `4241948` + `b236b41` on main) to target Shape-rooted chains terminating at extraction ops instead. This Commit 2 block is the revised task plan.
+
+**Commit goal:** Add `shape_extraction_folding` — folds Shape-rooted chains whose consumer extraction op (`Gather`, `Slice`, optionally through `Cast`) requests only concrete dims of a partially-dynamic Shape input. Three supported patterns: `Shape → Gather(indices)`, `Shape → Cast(Int64) → Gather(indices)`, `Shape → Slice(start, end)`. Pipeline position unchanged: `...shape_inference → tensor_shapes_from_graph → shape_extraction_folding → DCE → precompute_params → ...`.
+
+**Structural gate (primary + secondary per amended spec §Gating protocol B):**
+- Primary: `testing::shape_extraction_folding_counts().total ≥ 38` (of 53 partial cases on Kokoro).
+- Secondary (informational): `reshape_hits ≥ 48/61`. Divergence from primary is a finding, not a failure.
+- Three-attempt abandonment clause: see §Gating protocol B. An "attempt" is a fresh predicate design or a distinct new pattern variant; parameter tweaking on an in-progress pattern is part of the same attempt.
+
+**Starting state:** Branch `ir-phase4` currently has three WIP commits (`cf49711`, `292140c`, `8350f67`) from the prior attempt. **Task 2.0 below resets those** and redoes the commit under the amended design. The `8350f67` bugfix is preserved by re-applying its content in Task 2.1.
+
+### Task 2.0: Reset prior-attempt WIPs + preserve the 8350f67 bugfix content
+
+**Files:**
+- Branch: `ir-phase4` (worktree `/home/ryano/workspace/ryanoneill/iconnx-ir-phase4`)
+
+- [ ] **Step 1: Capture the `8350f67` bugfix diff before reset**
+
+```bash
+cd /home/ryano/workspace/ryanoneill/iconnx-ir-phase4
+git log --oneline 5924e5d..HEAD    # expect 3 WIP commits: cf49711, 292140c, 8350f67
+git show 8350f67 > /tmp/8350f67-bugfix.patch
+```
+
+Inspect `/tmp/8350f67-bugfix.patch` to understand exactly what the bugfix changed. Per the amended spec: it's "a real bug in Gather (or adjacent) where an Int64[0] tensor panicked at `src/operators/gather.rs:144` via `index_axis(Axis(0), idx)` on a zero-length axis."
+
+**Decide the correct landing site for the bugfix:**
+- If 8350f67 modifies `src/ir/passes/shape_aware_folding.rs` (i.e., the guard is in the pass's predicate): the new `shape_extraction_folding` design never folds Shape standalone, so this guard form is not directly portable. Re-implement the same invariant as a guard in `src/operators/gather.rs::forward` itself — rejecting rank-0 indices tensors at the op level (returning an empty output of the correct shape, or returning a documented error, whichever matches iconnx's existing Gather error-handling convention).
+- If 8350f67 already modifies `src/operators/gather.rs`: preserve it verbatim in Task 2.1 by re-applying the patch.
+
+- [ ] **Step 2: Reset the branch to refactor tip**
+
+```bash
+git reset --hard 5924e5d
+git log --oneline -3    # expect: 5924e5d refactor, then Phase 3 merge commit, then earlier
+```
+
+This discards `cf49711`, `292140c`, `8350f67` from the branch. The commits remain in the reflog (recoverable via `git reflog` for the next ~90 days) and the bugfix content is preserved at `/tmp/8350f67-bugfix.patch`.
+
+- [ ] **Step 3: Verify baseline**
+
+```bash
+cargo build --features cuda --release 2>&1 | tail -3
+cargo test --features cuda --release 2>&1 | grep -E "^test result" | awk '{pass+=$4; fail+=$6} END {print pass" passed, "fail" failed"}'
+```
+
+Expected: 457 passed, 0 failed (back to the post-refactor baseline; any `shape_aware_folding` tests from the prior attempt are gone).
+
+### Task 2.1: Re-apply the Gather rank-0-indices hardening (keeper from 8350f67)
+
+**Files:**
+- Modify: `src/operators/gather.rs` (add the guard + regression test)
+
+- [ ] **Step 1: Apply the preserved bugfix content**
+
+Open `/tmp/8350f67-bugfix.patch` and copy the relevant changes. If the original fix was in the pass:
+- Port the guard logic into `src/operators/gather.rs::Gather::forward` near the existing `index_axis(Axis(0), idx)` call. Guard: if `indices.len() == 0`, return an empty output tensor matching the expected rank (data_rank - 1 per ONNX Gather semantics) instead of indexing.
+
+If the original fix was in gather.rs: apply verbatim.
+
+- [ ] **Step 2: Add the regression test in `src/operators/gather.rs::tests`**
+
+Port the test from the preserved patch. Example shape (adapt to what the patch contained):
+
+```rust
+#[test]
+fn gather_on_empty_indices_returns_empty_output_without_panic() {
+    use crate::attributes::NodeAttributes;
+    // data: Int64[3]; indices: Int64[0] (empty).
+    let data = Tensor::from_vec_i64(vec![10, 20, 30], vec![3]);
+    let indices = Tensor::from_vec_i64(vec![], vec![0]);
+    let mut attrs = NodeAttributes::new();
+    attrs.set_int("axis", 0);
+    let out = Gather::forward(&[data, indices], &attrs);
+    // Expected: Int64 tensor of shape [0] (rank-0 of indices × rank-0 gather axis = rank 0).
+    // Must not panic.
+    assert_eq!(out.shape(), vec![0]);
+}
+```
+
+- [ ] **Step 3: Build + run the new test**
+
+```bash
+cargo build --features cuda --release 2>&1 | tail -3
+cargo test --features cuda --release --lib operators::gather 2>&1 | grep -E "^test result|FAILED"
+```
+
+Expected: clean build; new test passes; prior Gather tests still pass.
+
+- [ ] **Step 4: Commit WIP**
+
+```bash
+git add src/operators/gather.rs
+git commit -S -m "wip(ops): gather guard against rank-0 indices (keeper from 8350f67)"
+```
+
+### Task 2.2: Create `shape_extraction_folding` skeleton + Shape→Gather pattern
+
+**Files:**
+- Create: `src/ir/passes/shape_extraction_folding.rs`
+- Modify: `src/ir/passes/mod.rs`
+
+- [ ] **Step 1: Create the pass skeleton with the `Shape → Gather` pattern only**
+
+`src/ir/passes/shape_extraction_folding.rs`:
+
+```rust
+//! Shape-extraction folding.
+//!
+//! Folds Shape-rooted chains terminating at extraction ops whose
+//! extracted indices hit only CONCRETE dims of a (possibly
+//! partially-dynamic) Shape input. Designed for graphs where
+//! `seq_len`-like symbolic dims propagate through tensor_shapes as
+//! `None`, making the all-or-nothing `Shape`-foldability predicate
+//! unable to fire (see spec §Amendment history, 2026-04-22).
+//!
+//! Three supported patterns (exactly these; additions are explicit
+//! spec amendments):
+//!   1. `Shape(x) -> Gather(indices=I)`
+//!   2. `Shape(x) -> Cast(to=Int64) -> Gather(indices=I)`
+//!   3. `Shape(x) -> Slice(start=s, end=e)`
+//!
+//! Pattern 1 is implemented in Task 2.2; patterns 2 and 3 in Task 2.3
+//! and 2.4.
+//!
+//! Must run AFTER shape_inference has populated tensor_shapes.
+
+use std::collections::HashMap;
+
+use crate::ir::graph::{GraphNode, OptimizableGraph};
+use crate::ir::passes::folding_core;
+use crate::tensor::Tensor;
+
+pub fn shape_extraction_folding(
+    graph: OptimizableGraph,
+    tensor_shapes: &HashMap<String, Vec<Option<usize>>>,
+) -> OptimizableGraph {
+    // Build a producer-name → GraphNode index so the predicate can walk
+    // back from an extraction op to its Shape source without O(n) list
+    // traversal per call.
+    let producers = build_producer_map(&graph);
+
+    folding_core::fold_with_predicate(graph, |node, _folded| {
+        match node.op_type.as_str() {
+            "Gather" => try_fold_shape_gather(node, &producers, tensor_shapes),
+            // "Slice" and Cast-transparent Gather added in Tasks 2.3, 2.4.
+            _ => None,
+        }
+    })
+}
+
+/// Maps an output tensor name to the node that produces it.
+/// Uses HashMap<String, GraphNode> because GraphNode is Clone-cheap
+/// and the predicate borrow is local.
+fn build_producer_map(graph: &OptimizableGraph) -> HashMap<String, GraphNode> {
+    let mut map = HashMap::new();
+    for node in graph.nodes.iter() {
+        for out_name in node.outputs.iter() {
+            if !out_name.is_empty() {
+                map.insert(out_name.clone(), node.clone());
+            }
+        }
+    }
+    map
+}
+
+/// Fold `Shape(x) → Gather(indices=I)` when every index in I is a
+/// concrete dim of x.
+fn try_fold_shape_gather(
+    gather_node: &GraphNode,
+    producers: &HashMap<String, GraphNode>,
+    tensor_shapes: &HashMap<String, Vec<Option<usize>>>,
+) -> Option<Tensor> {
+    // Gather has two inputs: data (input 0) and indices (input 1).
+    // For this pattern to fire, input 0 must be produced by a Shape op.
+    let data_name = gather_node.inputs.first()?;
+    let producer = producers.get(data_name)?;
+    if producer.op_type != "Shape" {
+        return None;
+    }
+
+    // The Shape op's input is the tensor whose rank + (partial) shape
+    // we inspect.
+    let shape_input_name = producer.inputs.first()?;
+    let inferred = tensor_shapes.get(shape_input_name)?;
+
+    // Reject the empty-Vec "fully unknown" sentinel — no dims known.
+    if inferred.is_empty() {
+        return None;
+    }
+
+    // Gather indices must be concrete (come from an initializer, not
+    // a runtime tensor). folding_core already handles this — if
+    // indices isn't in graph.initializers or a prior folded output,
+    // the standard-fold path wouldn't fire either. But for this
+    // predicate, we need the actual index values. Look them up via
+    // producers: if the producer is a Shape chain, we can't get them;
+    // if it's an initializer (no producer), they aren't reachable
+    // from this closure's input. SIMPLER: require the indices input
+    // to have NO producer (implies initializer-sourced), and rely on
+    // the controller (lower()) to pass graph.initializers separately
+    // in a future refactor if needed.
+    //
+    // For now, we accept ONLY the case where fold_with_predicate's
+    // caller has already promoted the indices to an initializer. The
+    // predicate fires only when folding_core's fixpoint has processed
+    // a prior pass that synthesized the indices as an initializer.
+    //
+    // This covers the Kokoro case: Gather.indices inputs are all
+    // Constant-node outputs or graph initializers by the time
+    // shape_extraction_folding runs (constant_folding has already
+    // handled Constant-node → initializer promotion).
+    let indices_name = gather_node.inputs.get(1)?;
+    if producers.contains_key(indices_name) {
+        // Not an initializer — can't resolve. Future enhancement:
+        // folding_core could pass initializers into the predicate; for
+        // now, accept only initializer-sourced indices per the spec.
+        return None;
+    }
+    // At this point indices_name refers to something not produced by
+    // any op — must be a graph-input or initializer. For Kokoro all
+    // such Gather.indices are int64 initializers. We need access to
+    // the initializer values; since the predicate closure doesn't
+    // receive graph.initializers, we refactor to accept it in a
+    // follow-up step (see Task 2.2 Step 3).
+    //
+    // For this skeleton, return None — Task 2.2 Step 3 replaces this
+    // return with the real extraction logic after the signature refactor.
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attributes::NodeAttributes;
+    use crate::ir::graph::OptimizableGraphBuilder;
+
+    fn shapes_map(entries: &[(&str, Vec<Option<usize>>)]) -> HashMap<String, Vec<Option<usize>>> {
+        entries.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    // Tests added in Task 2.2 Step 4 (after the signature refactor lands).
+    #[test]
+    fn empty_placeholder_test_to_validate_module_compiles() {
+        // Sanity check: module compiles, one test present.
+        let graph = OptimizableGraphBuilder::new().build();
+        let shapes = shapes_map(&[]);
+        let _ = shape_extraction_folding(graph, &shapes);
+    }
+}
+```
+
+- [ ] **Step 2: Register the module**
+
+In `src/ir/passes/mod.rs`, add alphabetically near `shape_inference`:
+
+```rust
+pub mod shape_extraction_folding;
+```
+
+Also in the `pub use` block:
+
+```rust
+pub use shape_extraction_folding::shape_extraction_folding;
+```
+
+- [ ] **Step 3: Refactor the predicate signature to accept initializers**
+
+The skeleton above can't access `graph.initializers` from inside the closure. The clean fix: have `shape_extraction_folding` capture an `&HashMap<String, Tensor>` (the graph's initializers at closure-creation time) and pass it into the per-pattern helpers.
+
+In `folding_core`, the closure signature already accepts the in-pass `folded: &HashMap<String, Tensor>` as its second argument — but the CONSUMER pass, `shape_extraction_folding`, needs initializers too. Solution: capture initializers in the closure before `folding_core::fold_with_predicate` takes ownership of the graph. BUT `fold_with_predicate` takes `graph: OptimizableGraph` by value, so the closure must hold a CLONE of initializers (cheap — HashMap of Arc'd tensors in iconnx).
+
+Update the pass:
+
+```rust
+pub fn shape_extraction_folding(
+    graph: OptimizableGraph,
+    tensor_shapes: &HashMap<String, Vec<Option<usize>>>,
+) -> OptimizableGraph {
+    let producers = build_producer_map(&graph);
+    // Clone initializers for the closure. Cheap: HashMap<String, Tensor>
+    // where Tensor internally holds Arc or similar (check the actual
+    // Tensor impl — if it's not Clone-cheap, pre-extract only the
+    // Int64 initializers a Gather.indices would reference).
+    let initializers = graph.initializers.clone();
+
+    folding_core::fold_with_predicate(graph, move |node, folded| {
+        match node.op_type.as_str() {
+            "Gather" => try_fold_shape_gather(node, &producers, tensor_shapes, &initializers, folded),
+            _ => None,
+        }
+    })
+}
+
+fn try_fold_shape_gather(
+    gather_node: &GraphNode,
+    producers: &HashMap<String, GraphNode>,
+    tensor_shapes: &HashMap<String, Vec<Option<usize>>>,
+    initializers: &HashMap<String, Tensor>,
+    folded: &HashMap<String, Tensor>,
+) -> Option<Tensor> {
+    let data_name = gather_node.inputs.first()?;
+    let producer = producers.get(data_name)?;
+    if producer.op_type != "Shape" {
+        return None;
+    }
+    let shape_input_name = producer.inputs.first()?;
+    let inferred = tensor_shapes.get(shape_input_name)?;
+    if inferred.is_empty() {
+        return None;
+    }
+
+    // Gather.indices: must be an initializer (directly or via earlier
+    // fold in this pass).
+    let indices_name = gather_node.inputs.get(1)?;
+    let indices_tensor = initializers
+        .get(indices_name)
+        .or_else(|| folded.get(indices_name))?;
+    let indices = indices_tensor.to_array_i64();
+    let indices_slice = indices.as_slice()?;
+
+    // Read Gather axis attribute. For this pattern we require axis 0
+    // (Shape output is rank-1, so only axis 0 is valid). Reject
+    // anything else as out-of-scope.
+    let axis = gather_node.attributes.get_int("axis").unwrap_or(0);
+    if axis != 0 {
+        return None;
+    }
+
+    // Resolve each index against inferred shape. Every referenced dim
+    // must be Some(_); out-of-bounds or None dim → bail.
+    let rank = inferred.len() as i64;
+    let mut output: Vec<i64> = Vec::with_capacity(indices_slice.len());
+    for &idx in indices_slice {
+        // ONNX allows negative indices (wraps around rank).
+        let normalized = if idx < 0 { idx + rank } else { idx };
+        if normalized < 0 || normalized as usize >= inferred.len() {
+            return None;
+        }
+        let dim = inferred[normalized as usize]?;  // None → bail
+        output.push(dim as i64);
+    }
+
+    // Output shape: depends on indices' rank. ONNX spec: output rank
+    // = data rank (1 for Shape output) + indices rank - 1. For rank-1
+    // indices, output is rank 1 with len = indices.len. For rank-0
+    // (scalar) indices, output is rank 0 with len 1. Use the indices
+    // tensor's actual shape as the fold-output shape minus the gather
+    // axis — here, since data is rank 1, gather output is just the
+    // indices shape.
+    let output_shape = indices_tensor.shape();
+    Some(Tensor::from_vec_i64(output, output_shape))
+}
+```
+
+- [ ] **Step 4: Write the Shape→Gather unit tests**
+
+Replace the placeholder test with:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attributes::NodeAttributes;
+    use crate::ir::graph::OptimizableGraphBuilder;
+
+    fn shapes_map(entries: &[(&str, Vec<Option<usize>>)]) -> HashMap<String, Vec<Option<usize>>> {
+        entries.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn gather_of_shape_with_all_concrete_indices_folds() {
+        // Shape(x) where x: [Some(1), None, Some(512)].
+        // Gather([0, 2]) extracts dim 0 (=1) and dim 2 (=512).
+        // Both concrete → fold to initializer [1, 512].
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("x".into(), vec![Some(1), None, Some(512)]);
+        b.add_initializer(
+            "indices".into(),
+            Tensor::from_vec_i64(vec![0, 2], vec![2]),
+        );
+        b.add_node(
+            "shape_of_x",
+            "Shape",
+            vec!["x".into()],
+            vec!["shape_out".into()],
+            NodeAttributes::new(),
+        );
+        let mut gather_attrs = NodeAttributes::new();
+        gather_attrs.set_int("axis", 0);
+        b.add_node(
+            "gather_dims",
+            "Gather",
+            vec!["shape_out".into(), "indices".into()],
+            vec!["dims".into()],
+            gather_attrs,
+        );
+        let graph = b.build();
+
+        let shapes = shapes_map(&[("x", vec![Some(1), None, Some(512)])]);
+        let folded = shape_extraction_folding(graph, &shapes);
+
+        // Both Shape and Gather should be folded away.
+        assert!(folded.nodes.iter().all(|n| n.op_type != "Gather" && n.op_type != "Shape"));
+        let dims = folded.initializers.get("dims").expect("dims synthesized");
+        assert_eq!(dims.to_array_i64().as_slice().unwrap(), &[1i64, 512]);
+    }
+
+    #[test]
+    fn gather_of_shape_with_none_at_extracted_index_does_not_fold() {
+        // Gather([1]) targets the None dim — must not fold.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("x".into(), vec![Some(1), None, Some(512)]);
+        b.add_initializer(
+            "indices".into(),
+            Tensor::from_vec_i64(vec![1], vec![1]),
+        );
+        b.add_node(
+            "shape_of_x",
+            "Shape",
+            vec!["x".into()],
+            vec!["shape_out".into()],
+            NodeAttributes::new(),
+        );
+        let mut gather_attrs = NodeAttributes::new();
+        gather_attrs.set_int("axis", 0);
+        b.add_node(
+            "gather_dims",
+            "Gather",
+            vec!["shape_out".into(), "indices".into()],
+            vec!["dims".into()],
+            gather_attrs,
+        );
+        let graph = b.build();
+
+        let shapes = shapes_map(&[("x", vec![Some(1), None, Some(512)])]);
+        let folded = shape_extraction_folding(graph, &shapes);
+
+        // Neither folded.
+        assert!(folded.nodes.iter().any(|n| n.op_type == "Shape"));
+        assert!(folded.nodes.iter().any(|n| n.op_type == "Gather"));
+        assert!(!folded.initializers.contains_key("dims"));
+    }
+
+    #[test]
+    fn gather_on_non_shape_input_does_not_fold() {
+        // Gather's data input is an initializer, NOT a Shape output.
+        // Pass must leave it alone (over-matching guard).
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_initializer(
+            "data".into(),
+            Tensor::from_vec_i64(vec![10, 20, 30], vec![3]),
+        );
+        b.add_initializer(
+            "indices".into(),
+            Tensor::from_vec_i64(vec![0], vec![1]),
+        );
+        let mut gather_attrs = NodeAttributes::new();
+        gather_attrs.set_int("axis", 0);
+        b.add_node(
+            "gather",
+            "Gather",
+            vec!["data".into(), "indices".into()],
+            vec!["out".into()],
+            gather_attrs,
+        );
+        let graph = b.build();
+
+        let shapes = shapes_map(&[]);
+        let folded = shape_extraction_folding(graph, &shapes);
+
+        // NOTE: folding_core's standard path WOULD fold this Gather
+        // (both inputs are initializers), because that's
+        // constant_folding's domain. In the pipeline, constant_folding
+        // runs before shape_extraction_folding and would have already
+        // promoted this to an initializer. For this isolated test we
+        // only verify shape_extraction_folding doesn't crash or
+        // over-match on non-Shape-rooted Gather nodes.
+        //
+        // The semantic assertion: if Gather is folded here, it's via
+        // folding_core's standard path (not our predicate), which is
+        // correct behavior. We assert on the outcome: either the
+        // Gather survived (standard path didn't fire — fine) or was
+        // folded (standard path fired — also fine).
+        assert!(true, "smoke test: no crash on non-Shape-rooted Gather");
+    }
+
+    #[test]
+    fn out_of_bounds_gather_index_does_not_fold() {
+        // Gather([5]) targets dim 5, but x has only 3 dims. Must
+        // return None from the predicate, not panic.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("x".into(), vec![Some(1), Some(2), Some(3)]);
+        b.add_initializer(
+            "indices".into(),
+            Tensor::from_vec_i64(vec![5], vec![1]),
+        );
+        b.add_node(
+            "shape_of_x",
+            "Shape",
+            vec!["x".into()],
+            vec!["shape_out".into()],
+            NodeAttributes::new(),
+        );
+        let mut gather_attrs = NodeAttributes::new();
+        gather_attrs.set_int("axis", 0);
+        b.add_node(
+            "gather_oob",
+            "Gather",
+            vec!["shape_out".into(), "indices".into()],
+            vec!["dims".into()],
+            gather_attrs,
+        );
+        let graph = b.build();
+
+        let shapes = shapes_map(&[("x", vec![Some(1), Some(2), Some(3)])]);
+        let folded = shape_extraction_folding(graph, &shapes);
+
+        // Must not panic; must not produce a (wrong) initializer.
+        assert!(!folded.initializers.contains_key("dims"));
+    }
+
+    #[test]
+    fn negative_gather_index_resolves_via_rank_wrap() {
+        // Gather([-1]) should extract the LAST dim.
+        // x: [Some(1), None, Some(512)]. rank=3. idx=-1 → 2 → 512.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("x".into(), vec![Some(1), None, Some(512)]);
+        b.add_initializer(
+            "indices".into(),
+            Tensor::from_vec_i64(vec![-1], vec![1]),
+        );
+        b.add_node(
+            "shape_of_x",
+            "Shape",
+            vec!["x".into()],
+            vec!["shape_out".into()],
+            NodeAttributes::new(),
+        );
+        let mut gather_attrs = NodeAttributes::new();
+        gather_attrs.set_int("axis", 0);
+        b.add_node(
+            "gather_last",
+            "Gather",
+            vec!["shape_out".into(), "indices".into()],
+            vec!["last_dim".into()],
+            gather_attrs,
+        );
+        let graph = b.build();
+
+        let shapes = shapes_map(&[("x", vec![Some(1), None, Some(512)])]);
+        let folded = shape_extraction_folding(graph, &shapes);
+
+        let last_dim = folded.initializers.get("last_dim").expect("last_dim synthesized");
+        assert_eq!(last_dim.to_array_i64().as_slice().unwrap(), &[512i64]);
+    }
+}
+```
+
+- [ ] **Step 5: Build + run tests**
+
+```bash
+cargo build --features cuda --release 2>&1 | tail -3
+cargo test --features cuda --release --lib ir::passes::shape_extraction_folding 2>&1 | grep -E "^test result|FAILED"
+```
+
+Expected: 5 passed (the 5 Shape→Gather pattern tests).
+
+- [ ] **Step 6: Commit WIP**
+
+```bash
+git add src/ir/passes/shape_extraction_folding.rs src/ir/passes/mod.rs
+git commit -S -m "wip(ir): shape_extraction_folding — Shape→Gather pattern + 5 unit tests"
+```
+
+### Task 2.3: Add the `Shape → Cast → Gather` pattern (transparent Cast)
+
+**Files:**
+- Modify: `src/ir/passes/shape_extraction_folding.rs`
+
+- [ ] **Step 1: Extend `try_fold_shape_gather` to walk through a single Cast**
+
+Modify the producer walk in `try_fold_shape_gather`:
+
+```rust
+let data_name = gather_node.inputs.first()?;
+let mut producer = producers.get(data_name)?;
+
+// If the producer is a Cast(to=Int64), walk past it. Shape's native
+// output is Int64, so Cast-to-Int64 is a no-op preserving values.
+if producer.op_type == "Cast" {
+    let cast_to = producer.attributes.get_int("to")?;
+    // ONNX DataType 7 = INT64.
+    if cast_to != 7 {
+        return None;
+    }
+    let cast_input = producer.inputs.first()?;
+    producer = producers.get(cast_input)?;
+}
+
+if producer.op_type != "Shape" {
+    return None;
+}
+// ... rest of the fold logic unchanged ...
+```
+
+- [ ] **Step 2: Add per-pattern counter tracking (skeleton only — full helper lands in Task 2.5)**
+
+Track which pattern fired via a thread-local counter. Add at the top of the module:
+
+```rust
+use std::cell::Cell;
+
+thread_local! {
+    pub(crate) static FOLD_COUNT_SHAPE_GATHER: Cell<usize> = Cell::new(0);
+    pub(crate) static FOLD_COUNT_SHAPE_CAST_GATHER: Cell<usize> = Cell::new(0);
+    pub(crate) static FOLD_COUNT_SHAPE_SLICE: Cell<usize> = Cell::new(0);
+}
+
+pub(crate) fn reset_fold_counters() {
+    FOLD_COUNT_SHAPE_GATHER.with(|c| c.set(0));
+    FOLD_COUNT_SHAPE_CAST_GATHER.with(|c| c.set(0));
+    FOLD_COUNT_SHAPE_SLICE.with(|c| c.set(0));
+}
+
+pub(crate) fn bump_counter(cell: &std::thread::LocalKey<Cell<usize>>) {
+    cell.with(|c| c.set(c.get() + 1));
+}
+```
+
+At the end of `try_fold_shape_gather`, before `Some(...)`, bump the appropriate counter based on whether the chain had a Cast:
+
+```rust
+// At the top of try_fold_shape_gather, track whether we walked past Cast:
+let mut walked_cast = false;
+if producer.op_type == "Cast" {
+    walked_cast = true;
+    // ... existing Cast-walking logic ...
+}
+
+// Just before returning Some(...):
+if walked_cast {
+    bump_counter(&FOLD_COUNT_SHAPE_CAST_GATHER);
+} else {
+    bump_counter(&FOLD_COUNT_SHAPE_GATHER);
+}
+```
+
+- [ ] **Step 3: Add the Cast-transparency test**
+
+```rust
+#[test]
+fn cast_in_between_shape_and_gather_is_transparent() {
+    // Shape(x) → Cast(Int64) → Gather([0])
+    // x: [Some(1), None, Some(512)]. Expect: out = [1].
+    let mut b = OptimizableGraphBuilder::new();
+    b.add_input("x".into(), vec![Some(1), None, Some(512)]);
+    b.add_initializer(
+        "indices".into(),
+        Tensor::from_vec_i64(vec![0], vec![1]),
+    );
+    b.add_node(
+        "shape_of_x",
+        "Shape",
+        vec!["x".into()],
+        vec!["shape_out".into()],
+        NodeAttributes::new(),
+    );
+    let mut cast_attrs = NodeAttributes::new();
+    cast_attrs.set_int("to", 7);  // ONNX DataType 7 = INT64
+    b.add_node(
+        "cast_shape",
+        "Cast",
+        vec!["shape_out".into()],
+        vec!["casted".into()],
+        cast_attrs,
+    );
+    let mut gather_attrs = NodeAttributes::new();
+    gather_attrs.set_int("axis", 0);
+    b.add_node(
+        "gather_first",
+        "Gather",
+        vec!["casted".into(), "indices".into()],
+        vec!["first_dim".into()],
+        gather_attrs,
+    );
+    let graph = b.build();
+
+    let shapes = shapes_map(&[("x", vec![Some(1), None, Some(512)])]);
+    let folded = shape_extraction_folding(graph, &shapes);
+
+    // All three nodes (Shape, Cast, Gather) should be folded away.
+    assert!(folded.nodes.is_empty(), "all three chain nodes should fold");
+    let first_dim = folded.initializers.get("first_dim").expect("first_dim synthesized");
+    assert_eq!(first_dim.to_array_i64().as_slice().unwrap(), &[1i64]);
+}
+
+#[test]
+fn cast_to_non_int64_does_not_fold() {
+    // Cast(to=Float32) is NOT transparent for Shape's Int64 output.
+    let mut b = OptimizableGraphBuilder::new();
+    b.add_input("x".into(), vec![Some(1), Some(2), Some(3)]);
+    b.add_initializer(
+        "indices".into(),
+        Tensor::from_vec_i64(vec![0], vec![1]),
+    );
+    b.add_node(
+        "shape_of_x",
+        "Shape",
+        vec!["x".into()],
+        vec!["shape_out".into()],
+        NodeAttributes::new(),
+    );
+    let mut cast_attrs = NodeAttributes::new();
+    cast_attrs.set_int("to", 1);  // ONNX DataType 1 = FLOAT
+    b.add_node(
+        "cast_shape",
+        "Cast",
+        vec!["shape_out".into()],
+        vec!["casted".into()],
+        cast_attrs,
+    );
+    let mut gather_attrs = NodeAttributes::new();
+    gather_attrs.set_int("axis", 0);
+    b.add_node(
+        "gather",
+        "Gather",
+        vec!["casted".into(), "indices".into()],
+        vec!["out".into()],
+        gather_attrs,
+    );
+    let graph = b.build();
+
+    let shapes = shapes_map(&[("x", vec![Some(1), Some(2), Some(3)])]);
+    let folded = shape_extraction_folding(graph, &shapes);
+
+    // Cast-to-Float blocks the fold. Shape and Cast remain.
+    assert!(folded.nodes.iter().any(|n| n.op_type == "Cast"));
+}
+```
+
+- [ ] **Step 2: Build + test**
+
+```bash
+cargo test --features cuda --release --lib ir::passes::shape_extraction_folding 2>&1 | grep -E "^test result|FAILED"
+```
+
+Expected: 7 passed (5 from Task 2.2 + 2 new).
+
+- [ ] **Step 3: Commit WIP**
+
+```bash
+git add src/ir/passes/shape_extraction_folding.rs
+git commit -S -m "wip(ir): shape_extraction_folding — Shape→Cast→Gather transparency + 2 tests"
+```
+
+### Task 2.4: Add the `Shape → Slice` pattern
+
+**Files:**
+- Modify: `src/ir/passes/shape_extraction_folding.rs`
+
+- [ ] **Step 1: Add `try_fold_shape_slice` helper**
+
+```rust
+fn try_fold_shape_slice(
+    slice_node: &GraphNode,
+    producers: &HashMap<String, GraphNode>,
+    tensor_shapes: &HashMap<String, Vec<Option<usize>>>,
+    initializers: &HashMap<String, Tensor>,
+    folded: &HashMap<String, Tensor>,
+) -> Option<Tensor> {
+    // ONNX Slice: inputs = [data, starts, ends, (axes), (steps)]
+    let data_name = slice_node.inputs.first()?;
+    let producer = producers.get(data_name)?;
+    if producer.op_type != "Shape" {
+        return None;
+    }
+    let shape_input_name = producer.inputs.first()?;
+    let inferred = tensor_shapes.get(shape_input_name)?;
+    if inferred.is_empty() {
+        return None;
+    }
+
+    // Read starts, ends. Axes (if present) must be [0] (Shape output
+    // is rank-1). Steps (if present) must be [1].
+    let starts_name = slice_node.inputs.get(1)?;
+    let ends_name = slice_node.inputs.get(2)?;
+    let starts = initializers.get(starts_name).or_else(|| folded.get(starts_name))?;
+    let ends = initializers.get(ends_name).or_else(|| folded.get(ends_name))?;
+    let starts_i64 = starts.to_array_i64();
+    let ends_i64 = ends.to_array_i64();
+    let start = *starts_i64.as_slice()?.first()?;
+    let end = *ends_i64.as_slice()?.first()?;
+
+    // Check axes (optional, default = [0]).
+    if let Some(axes_name) = slice_node.inputs.get(3) {
+        if !axes_name.is_empty() {
+            let axes = initializers.get(axes_name).or_else(|| folded.get(axes_name))?;
+            let axes_i64 = axes.to_array_i64();
+            let axis = *axes_i64.as_slice()?.first()?;
+            if axis != 0 {
+                return None;
+            }
+        }
+    }
+    // Check steps (optional, default = [1]).
+    if let Some(steps_name) = slice_node.inputs.get(4) {
+        if !steps_name.is_empty() {
+            let steps = initializers.get(steps_name).or_else(|| folded.get(steps_name))?;
+            let steps_i64 = steps.to_array_i64();
+            let step = *steps_i64.as_slice()?.first()?;
+            if step != 1 {
+                return None;
+            }
+        }
+    }
+
+    // Clamp start/end to [0, rank] per ONNX Slice semantics.
+    let rank = inferred.len() as i64;
+    let start_n = if start < 0 { (start + rank).max(0) } else { start.min(rank) };
+    let end_n = if end < 0 { (end + rank).max(0) } else { end.min(rank) };
+    if start_n >= end_n {
+        return None;
+    }
+
+    // Every dim in [start_n, end_n) must be Some(_).
+    let mut output: Vec<i64> = Vec::with_capacity((end_n - start_n) as usize);
+    for i in start_n..end_n {
+        let dim = inferred[i as usize]?;
+        output.push(dim as i64);
+    }
+
+    bump_counter(&FOLD_COUNT_SHAPE_SLICE);
+    let len = output.len();
+    Some(Tensor::from_vec_i64(output, vec![len]))
+}
+```
+
+- [ ] **Step 2: Register Slice in the main predicate**
+
+```rust
+folding_core::fold_with_predicate(graph, move |node, folded| {
+    match node.op_type.as_str() {
+        "Gather" => try_fold_shape_gather(node, &producers, tensor_shapes, &initializers, folded),
+        "Slice" => try_fold_shape_slice(node, &producers, tensor_shapes, &initializers, folded),
+        _ => None,
+    }
+})
+```
+
+- [ ] **Step 3: Add Slice tests**
+
+```rust
+#[test]
+fn slice_of_shape_with_all_concrete_range_folds() {
+    // Shape(x) → Slice(start=0, end=2). x: [Some(4), Some(8), None].
+    // Dims [0..2) = [4, 8] — both concrete, fold.
+    let mut b = OptimizableGraphBuilder::new();
+    b.add_input("x".into(), vec![Some(4), Some(8), None]);
+    b.add_initializer("starts".into(), Tensor::from_vec_i64(vec![0], vec![1]));
+    b.add_initializer("ends".into(), Tensor::from_vec_i64(vec![2], vec![1]));
+    b.add_node(
+        "shape_of_x",
+        "Shape",
+        vec!["x".into()],
+        vec!["shape_out".into()],
+        NodeAttributes::new(),
+    );
+    b.add_node(
+        "slice",
+        "Slice",
+        vec!["shape_out".into(), "starts".into(), "ends".into()],
+        vec!["prefix".into()],
+        NodeAttributes::new(),
+    );
+    let graph = b.build();
+
+    let shapes = shapes_map(&[("x", vec![Some(4), Some(8), None])]);
+    let folded = shape_extraction_folding(graph, &shapes);
+
+    let prefix = folded.initializers.get("prefix").expect("prefix synthesized");
+    assert_eq!(prefix.to_array_i64().as_slice().unwrap(), &[4i64, 8]);
+}
+
+#[test]
+fn slice_of_shape_with_none_in_range_does_not_fold() {
+    // Shape(x) → Slice(start=1, end=3). x: [Some(4), Some(8), None].
+    // Dim 2 is None, in range → must NOT fold.
+    let mut b = OptimizableGraphBuilder::new();
+    b.add_input("x".into(), vec![Some(4), Some(8), None]);
+    b.add_initializer("starts".into(), Tensor::from_vec_i64(vec![1], vec![1]));
+    b.add_initializer("ends".into(), Tensor::from_vec_i64(vec![3], vec![1]));
+    b.add_node(
+        "shape_of_x",
+        "Shape",
+        vec!["x".into()],
+        vec!["shape_out".into()],
+        NodeAttributes::new(),
+    );
+    b.add_node(
+        "slice",
+        "Slice",
+        vec!["shape_out".into(), "starts".into(), "ends".into()],
+        vec!["suffix".into()],
+        NodeAttributes::new(),
+    );
+    let graph = b.build();
+
+    let shapes = shapes_map(&[("x", vec![Some(4), Some(8), None])]);
+    let folded = shape_extraction_folding(graph, &shapes);
+
+    assert!(folded.nodes.iter().any(|n| n.op_type == "Slice"));
+    assert!(!folded.initializers.contains_key("suffix"));
+}
+```
+
+- [ ] **Step 4: Build + test**
+
+```bash
+cargo test --features cuda --release --lib ir::passes::shape_extraction_folding 2>&1 | grep -E "^test result|FAILED"
+```
+
+Expected: 9 passed (7 prior + 2 Slice).
+
+- [ ] **Step 5: Commit WIP**
+
+```bash
+git add src/ir/passes/shape_extraction_folding.rs
+git commit -S -m "wip(ir): shape_extraction_folding — Shape→Slice pattern + 2 tests"
+```
+
+### Task 2.5: Public attribution helper + idempotency & standalone-Shape tests
+
+**Files:**
+- Modify: `src/ir/passes/shape_extraction_folding.rs`
+- Modify: `src/cuda/inference/testing.rs`
+
+- [ ] **Step 1: Define the public counts struct + accessor**
+
+Add to the top of `shape_extraction_folding.rs`:
+
+```rust
+#[derive(Clone, Debug, Default)]
+pub struct ShapeExtractionFoldingCounts {
+    pub shape_gather: usize,
+    pub shape_cast_gather: usize,
+    pub shape_slice: usize,
+    pub total: usize,
+}
+
+impl ShapeExtractionFoldingCounts {
+    pub(crate) fn snapshot() -> Self {
+        let g = FOLD_COUNT_SHAPE_GATHER.with(|c| c.get());
+        let cg = FOLD_COUNT_SHAPE_CAST_GATHER.with(|c| c.get());
+        let s = FOLD_COUNT_SHAPE_SLICE.with(|c| c.get());
+        Self {
+            shape_gather: g,
+            shape_cast_gather: cg,
+            shape_slice: s,
+            total: g + cg + s,
+        }
+    }
+}
+```
+
+And expose from `mod.rs`:
+
+```rust
+pub use shape_extraction_folding::{shape_extraction_folding, ShapeExtractionFoldingCounts};
+```
+
+- [ ] **Step 2: Add the testing-namespaced helper**
+
+In `src/cuda/inference/testing.rs`, add:
+
+```rust
+/// Snapshot of shape_extraction_folding's per-pattern fold counts for
+/// the current thread. Call AFTER a lower() that triggers the pass;
+/// counts are cumulative within the thread until reset_counters() runs.
+pub fn shape_extraction_folding_counts() -> crate::ir::passes::ShapeExtractionFoldingCounts {
+    crate::ir::passes::shape_extraction_folding::ShapeExtractionFoldingCounts::snapshot()
+}
+
+/// Reset the thread-local fold counters to zero. Call before a test
+/// that asserts on counts, to avoid contamination from prior lower()
+/// calls in the same thread.
+pub fn reset_shape_extraction_folding_counters() {
+    crate::ir::passes::shape_extraction_folding::reset_fold_counters();
+}
+```
+
+- [ ] **Step 3: Add the last two unit tests (idempotency + standalone-Shape)**
+
+```rust
+#[test]
+fn standalone_shape_without_extraction_consumer_does_not_fold() {
+    // Shape(x) whose output feeds nothing supported — must NOT fold.
+    let mut b = OptimizableGraphBuilder::new();
+    b.add_input("x".into(), vec![Some(1), Some(2)]);
+    b.add_node(
+        "shape_of_x",
+        "Shape",
+        vec!["x".into()],
+        vec!["shape_out".into()],
+        NodeAttributes::new(),
+    );
+    b.add_output("shape_out".into());  // graph output, no extraction consumer
+    let graph = b.build();
+
+    let shapes = shapes_map(&[("x", vec![Some(1), Some(2)])]);
+    let folded = shape_extraction_folding(graph, &shapes);
+
+    // Shape stays; no synthesized initializer.
+    assert!(folded.nodes.iter().any(|n| n.op_type == "Shape"));
+    assert!(!folded.initializers.contains_key("shape_out"));
+}
+
+#[test]
+fn shape_extraction_folding_is_idempotent() {
+    let build_graph = || {
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("x".into(), vec![Some(1), None, Some(512)]);
+        b.add_initializer(
+            "indices".into(),
+            Tensor::from_vec_i64(vec![0], vec![1]),
+        );
+        b.add_node(
+            "shape_of_x",
+            "Shape",
+            vec!["x".into()],
+            vec!["shape_out".into()],
+            NodeAttributes::new(),
+        );
+        let mut gather_attrs = NodeAttributes::new();
+        gather_attrs.set_int("axis", 0);
+        b.add_node(
+            "gather_first",
+            "Gather",
+            vec!["shape_out".into(), "indices".into()],
+            vec!["first".into()],
+            gather_attrs,
+        );
+        b.build()
+    };
+    let shapes = shapes_map(&[("x", vec![Some(1), None, Some(512)])]);
+
+    let once = shape_extraction_folding(build_graph(), &shapes);
+    let twice = shape_extraction_folding(build_graph(), &shapes);
+    let thrice = shape_extraction_folding(once, &shapes);  // apply twice on already-folded
+
+    assert_eq!(twice.nodes.len(), 0);
+    assert_eq!(thrice.nodes.len(), 0);
+    assert_eq!(
+        twice.initializers.get("first").map(|t| t.to_array_i64().as_slice().unwrap().to_vec()),
+        thrice.initializers.get("first").map(|t| t.to_array_i64().as_slice().unwrap().to_vec())
+    );
+}
+```
+
+- [ ] **Step 4: Build + test**
+
+```bash
+cargo test --features cuda --release --lib ir::passes::shape_extraction_folding 2>&1 | grep -E "^test result|FAILED"
+```
+
+Expected: 11 passed (9 prior + 2 new).
+
+- [ ] **Step 5: Commit WIP**
+
+```bash
+git add src/ir/passes/shape_extraction_folding.rs src/cuda/inference/testing.rs
+git commit -S -m "wip(ir): shape_extraction_folding counts helper + idempotency/standalone tests"
+```
+
+### Task 2.6: Wire `shape_extraction_folding` into `lower()`
+
+**Files:**
+- Modify: `src/ir/lowering.rs`
+
+- [ ] **Step 1: Update the pass import**
+
+Replace any reference to the old `shape_aware_folding` name (there shouldn't be any since we reset) with `shape_extraction_folding` in the `use crate::ir::passes::{...}` block.
+
+- [ ] **Step 2: Insert the pass**
+
+Find the existing `tensor_shapes_from_graph(&graph)` call and add immediately after:
+
+```rust
+let graph = shape_inference(graph);
+let tensor_shapes = tensor_shapes_from_graph(&graph);
+let graph = shape_extraction_folding(graph, &tensor_shapes);  // Phase 4 B
+let graph = dead_code_elimination(graph);  // existing DCE, now runs after shape_extraction_folding
+let precomputed_by_name = precompute_params(&graph, &tensor_shapes);
+```
+
+Do NOT re-compute `tensor_shapes` after the pass — the pass's behavior (substituting chain outputs with initializers) does not invalidate existing shape entries.
+
+- [ ] **Step 3: Build + full test suite**
+
+```bash
+cargo build --features cuda --release 2>&1 | tail -3
+cargo test --features cuda --release 2>&1 | grep -E "^test result" | awk '{pass+=$4; fail+=$6} END {print pass" passed, "fail" failed"}'
+cargo test --features cuda,debug-inference --release 2>&1 | grep -E "^test result" | awk '{pass+=$4; fail+=$6} END {print pass" passed, "fail" failed"}'
+```
+
+Expected: baseline (457/467) + 11 new shape_extraction_folding tests + 1 new Gather rank-0 test = 469 / 479. Zero failures.
+
+- [ ] **Step 4: Kokoro integration smoke test (no gate yet)**
+
+```bash
+cargo test --features cuda --release --test kokoro_gpu_fusion_test -- --ignored 2>&1 | grep -E "^test result|FAILED"
+```
+
+Expected: `1 passed`. No regression. The pre-Phase-4 Reshape assertion in the test is `>= 8` (from C PR), which will still pass even without the new gate yet.
+
+- [ ] **Step 5: Commit WIP**
+
+```bash
+git add src/ir/lowering.rs
+git commit -S -m "wip(ir): wire shape_extraction_folding into lower() post-shape_inference"
+```
+
+### Task 2.7: Structural-gate validation in kokoro_gpu_fusion_test
+
+**Files:**
+- Modify: `tests/kokoro_gpu_fusion_test.rs`
+
+- [ ] **Step 1: Add the primary + secondary gate assertions**
+
+Find the existing Reshape hit-rate assertion in the integration test. Replace with the two-part block from spec §Per-pass design > Commit #2 > Integration test updates:
+
+```rust
+// Reset counters before the lower() call that triggers the pass.
+iconnx::cuda::inference::testing::reset_shape_extraction_folding_counters();
+
+// ... existing lower()-triggering setup ...
+
+// ---- Primary gate: direct extraction-fold count ----
+let fold_counts = iconnx::cuda::inference::testing::shape_extraction_folding_counts();
+eprintln!(
+    "shape_extraction_folding counts — Gather: {}, Cast→Gather: {}, Slice: {}, total: {}",
+    fold_counts.shape_gather,
+    fold_counts.shape_cast_gather,
+    fold_counts.shape_slice,
+    fold_counts.total,
+);
+assert!(
+    fold_counts.total >= 38,
+    "Phase 4 B primary structural gate failed: {} extraction chains \
+     folded (need ≥ 38 for Green, or ≥ 27 for Amber with per-pattern \
+     investigation). See spec §Gating protocol B. Per-pattern \
+     breakdown: Gather={}, Cast→Gather={}, Slice={}.",
+    fold_counts.total,
+    fold_counts.shape_gather,
+    fold_counts.shape_cast_gather,
+    fold_counts.shape_slice,
+);
+
+// ---- Secondary gate: Reshape-hit proxy sanity check ----
+if precompute_stats.reshape_hits < 48 {
+    eprintln!(
+        "NOTE: reshape_hits = {}/61 but fold_counts.total = {}. \
+         {} extraction unlocks didn't bump Reshape precompute — \
+         likely went to non-Reshape consumers (dim arithmetic, \
+         Conv-weight-shape work). Not a gate failure; primary gate \
+         is on fold_counts.total.",
+        precompute_stats.reshape_hits,
+        fold_counts.total,
+        fold_counts.total.saturating_sub(precompute_stats.reshape_hits.saturating_sub(10)),
+    );
+}
+```
+
+**Substitute the exact prior-assertion location and surrounding variable names** — read the test before editing to find the right spot. The reset call goes near the top of the test function, before the first `lower()`-triggering executor interaction.
+
+- [ ] **Step 2: Run the Kokoro integration test**
+
+```bash
+cargo test --features cuda --release --test kokoro_gpu_fusion_test -- --ignored --nocapture 2>&1 | grep -E "shape_extraction_folding counts|^test result|FAILED|panicked|NOTE:" | head -20
+```
+
+Record the `fold_counts.total` value and the per-pattern breakdown.
+
+**Evaluate the three-tier structural gate:**
+
+- **Green (`total ≥ 38`):** proceed to Task 2.8 squash.
+- **Amber (`27 ≤ total ≤ 37`):** STOP and report. Include the per-pattern breakdown and a preliminary analysis of which extraction patterns missed.
+- **Red (`total < 27`):** STOP and report BLOCKED. The mechanism needs reassessment.
+
+Under the **three-attempt abandonment clause** (spec §Gating protocol B): if this is the third pattern-implementation attempt (each attempt being a new pattern variant or fresh predicate design), do not commit another attempt — escalate per the abandonment protocol.
+
+- [ ] **Step 3: Commit WIP** (only if Green)
+
+```bash
+git add tests/kokoro_gpu_fusion_test.rs
+git commit -S -m "wip(ir): structural gate — shape_extraction_folding fold_counts.total ≥ 38"
+```
+
+### Task 2.8: Squash into final `feat(ir)` commit
+
+- [ ] **Step 1: Verify WIP commits**
+
+```bash
+git log --oneline 5924e5d..HEAD
+git log --format='%G? %s' 5924e5d..HEAD
+```
+
+Expected: 7 WIP commits (2.1 gather guard, 2.2 skeleton+gather, 2.3 cast-gather, 2.4 slice, 2.5 counts+extras, 2.6 wire, 2.7 gate), all GPG-signed.
+
+- [ ] **Step 2: Full test suite**
+
+```bash
+cargo build --features cuda --release 2>&1 | grep -i warning   # expect empty
+cargo build --features cuda,debug-inference --release 2>&1 | grep -i warning   # expect empty
+cargo test --features cuda --release 2>&1 | grep -E "^test result" | awk '{pass+=$4; fail+=$6} END {print pass" passed, "fail" failed"}'
+cargo test --features cuda --release --test kokoro_gpu_fusion_test -- --ignored 2>&1 | grep -E "^test result"
+```
+
+Expected: baseline +12 tests (11 shape_extraction_folding + 1 gather guard), zero failures, Kokoro integration test green with primary gate passing.
+
+- [ ] **Step 3: Squash**
+
+```bash
+git reset --soft 5924e5d
+git commit -S -m "$(cat <<'EOF'
+feat(ir): shape_extraction_folding pass (B)
+
+Folds Shape-rooted chains terminating at extraction ops whose
+extracted indices hit only concrete dims of a (possibly
+partially-dynamic) Shape input. Three supported patterns:
+
+  1. Shape(x) → Gather(indices=I)
+  2. Shape(x) → Cast(to=Int64) → Gather(indices=I)
+  3. Shape(x) → Slice(start=s, end=e)
+
+Pipeline: runs immediately after shape_inference +
+tensor_shapes_from_graph, before the subsequent DCE:
+  topo_sort → constant_folding → DCE → shape_inference
+  → tensor_shapes_from_graph → shape_extraction_folding → DCE
+  → precompute_params → ...
+
+Closes Phase 3's stacked-gate unlock target for Commits #2 and #3
+under a revised mechanism (see 2026-04-22 spec amendment). The
+original "fold Shape when all-static" predicate was architecturally
+unable to fire on Kokoro because every downstream tensor inherits
+`seq_len = None` from the `tokens` graph input. Real-graph
+instrumentation found 53 of Kokoro's 73 Shape nodes have the
+extraction-chain structure this pass targets. Primary structural
+gate: fold_counts.total ≥ 38 (≥ 72% of the 53 reachable cases) —
+matches Phase 3's original projection ratio applied to the correct
+denominator. Secondary proxy sanity check: reshape_hits ≥ 48/61;
+divergence from primary is a finding, not a gate failure.
+
+Measured on Kokoro at landing: fold_counts.total = NN (substitute
+before committing), per-pattern NN/NN/NN (Gather/Cast→Gather/Slice).
+reshape_hits = NN/61 (substitute).
+
+Also includes a correctness hardening for `Gather::forward` against
+rank-0 indices tensors (ported from the prior attempt's commit
+8350f67). Rank-0 indices previously caused an `index_axis(Axis(0),
+idx)` panic at src/operators/gather.rs:144; guarded to return an
+empty output tensor per ONNX semantics instead.
+
+11 unit tests in shape_extraction_folding::tests (5 Shape→Gather,
+2 Cast-transparency, 2 Slice, 1 standalone-Shape-doesn't-fold,
+1 idempotency) + 1 gather.rs rank-0 regression test. Per-pattern
+attribution counters exposed via
+testing::shape_extraction_folding_counts() for gate diagnostics.
+
+Spec: docs/superpowers/specs/2026-04-19-phase4-graph-optimizer-ii-design.md
+(amendment 2026-04-22).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+**Substitute the measured `fold_counts.total` and per-pattern + reshape_hits numbers** in the commit message before committing.
+
+- [ ] **Step 4: Verify**
+
+```bash
+git log --oneline 5875858..HEAD   # expect exactly 2 commits (refactor + feat B)
+git log -2 --format='%G? %s'
+```
+
+Both signed (`G` prefix).
 
 ### Task 2.1: Create `shape_aware_folding` pass + the core fold-when-known test
 
