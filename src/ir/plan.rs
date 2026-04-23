@@ -7,7 +7,7 @@
 //! known at plan-construction time.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::cuda::cudnn::PackedLstmWeights;
 use crate::cuda::inference::fusion::{FusedPattern, FusedPatternInfo};
@@ -56,6 +56,112 @@ pub struct PlannedOp {
     pub node: GraphNode,
     pub kind: OpKind,
     pub precomputed: NodePrecomputed,
+    /// Arena slot byte offset for this op's primary output tensor.
+    /// `Some(offset)` → arena-backed allocation at `arena_base + offset`
+    /// (A2 runtime path, not yet wired).
+    /// `None` → fall back to `GpuMemoryPool::get_tensor_*` at runtime.
+    ///
+    /// Stamped at plan time by `memory_planner`; no runtime HashMap
+    /// lookup per op. Under Phase 4 A1 this field is populated but the
+    /// runtime does not yet consume it — the dispatch-model refactor
+    /// that bridges arena slices to `GpuTensor` is deferred to Phase 5
+    /// A2. Having the interface contract in place now lets A2 wire the
+    /// runtime without re-plumbing `lower()`.
+    pub arena_offset: Option<usize>,
+}
+
+/// Per-run classification summary of `memory_planner`'s decisions.
+/// Stored on [`MemoryPlan`] at construction time so the accessor is
+/// parameter-less (see [`MemoryPlan::classification_counts`]).
+#[derive(Clone, Debug, Default)]
+pub struct PlannerClassification {
+    /// Tensors passing both `is_planner_eligible` AND the
+    /// fusion-skipped filter.
+    pub arena_eligible: usize,
+    /// Subset of `arena_eligible` actually assigned to an arena slot.
+    /// Under the current greedy allocator this always equals
+    /// `arena_eligible`; tracked separately so a future algorithm
+    /// that might decline an eligible tensor (e.g., fragmentation
+    /// cap) surfaces the decision rather than hiding it.
+    pub arena_assigned: usize,
+    /// Tensors that did NOT pass eligibility OR were fusion-skipped.
+    /// Take the pool path at runtime.
+    pub pool_classified: usize,
+}
+
+/// Static memory plan — assigns eligible tensors to arena slots.
+/// Produced by `memory_planner` after fusion annotation; frozen part
+/// of [`ExecutionPlan`].
+///
+/// Phase 4 A1 lands this as pure data. Runtime consumption (Executor
+/// allocating an arena buffer, ops reading slot byte offsets) is
+/// deferred to Phase 5 A2.
+#[derive(Clone, Debug)]
+pub struct MemoryPlan {
+    /// Total bytes required for the arena. Allocated as a single
+    /// contiguous device buffer at `run()` start (under A2; currently
+    /// not consumed).
+    pub arena_bytes: usize,
+    /// Number of slots in the arena. Each slot is one size-class
+    /// bucket that may host one or more tensors with disjoint
+    /// lifetimes.
+    pub slot_count: usize,
+    /// `tensor_name → slot_idx`. Callers typically use the
+    /// [`MemoryPlan::arena_offset`] accessor instead of this directly.
+    /// `BTreeMap` so the `Debug` representation is deterministic
+    /// across independent planner calls (required by the
+    /// determinism-snapshot test).
+    pub(crate) slot_assignments: BTreeMap<String, usize>,
+    /// `slot_idx → byte offset within the arena`.
+    pub(crate) slot_offsets_bytes: Vec<usize>,
+    /// Classification summary — see [`PlannerClassification`].
+    classification: PlannerClassification,
+}
+
+impl MemoryPlan {
+    /// Return the arena byte-offset for a tensor, or `None` if the
+    /// tensor is not arena-assigned (pool path at runtime).
+    pub fn arena_offset(&self, tensor_name: &str) -> Option<usize> {
+        let &slot_idx = self.slot_assignments.get(tensor_name)?;
+        Some(self.slot_offsets_bytes[slot_idx])
+    }
+
+    /// Parameter-less accessor for classification counts.
+    pub fn classification_counts(&self) -> &PlannerClassification {
+        &self.classification
+    }
+
+    /// Constructor used by `memory_planner`. `pub(crate)` so
+    /// `MemoryPlan` instances are only produced by the planner pass,
+    /// not by arbitrary callers.
+    pub(crate) fn new(
+        arena_bytes: usize,
+        slot_count: usize,
+        slot_assignments: BTreeMap<String, usize>,
+        slot_offsets_bytes: Vec<usize>,
+        classification: PlannerClassification,
+    ) -> Self {
+        Self {
+            arena_bytes,
+            slot_count,
+            slot_assignments,
+            slot_offsets_bytes,
+            classification,
+        }
+    }
+
+    /// Empty plan — every tensor takes the pool path. Used when
+    /// `lower()` runs on a graph with no arena-eligible tensors (or
+    /// before Task 3.6 wires the planner in place).
+    pub fn empty() -> Self {
+        Self {
+            arena_bytes: 0,
+            slot_count: 0,
+            slot_assignments: BTreeMap::new(),
+            slot_offsets_bytes: Vec::new(),
+            classification: PlannerClassification::default(),
+        }
+    }
 }
 
 /// LSTM weight cache: keyed by (W_ptr as usize, R_ptr as usize) so two
@@ -88,6 +194,11 @@ pub struct ExecutionPlan {
     /// inferred dim, `None` is dynamic. Empty Vec means the tensor's shape
     /// is completely unknown.
     pub tensor_shapes: HashMap<String, Vec<Option<usize>>>,
+    /// Static memory plan produced by `memory_planner`. Phase 4 A1
+    /// populates this; the runtime arena path that consumes it lands
+    /// in Phase 5 A2. Until then, every op takes the pool path
+    /// regardless of `memory_plan.arena_offset(...)`.
+    pub memory_plan: MemoryPlan,
 }
 
 #[cfg(test)]

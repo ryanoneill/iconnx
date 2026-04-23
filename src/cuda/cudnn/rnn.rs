@@ -28,7 +28,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use garboard::{DeviceSlice, RnnForwardConfig, RnnPlan};
+use garboard::{DeviceMemory, DeviceSlice, RnnForwardConfig, RnnPlan};
 
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::tensor::GpuTensor;
@@ -450,9 +450,14 @@ pub fn lstm_forward(
                 plan,
                 x_slice,
                 y_slice,
-                hx_slice,
+                // Garboard's rnn_forward_with_plan now takes nullable
+                // state tensors as `Option<&dyn DeviceMemory<f32>>`
+                // (was `Option<&DeviceSlice<'_, f32>>`). Rust's auto-
+                // coercion doesn't work inside `Option`, so coerce
+                // explicitly via `.map`.
+                hx_slice.map(|s| s as &dyn DeviceMemory<f32>),
                 None, // hy: final hidden state not needed
-                cx_slice,
+                cx_slice.map(|s| s as &dyn DeviceMemory<f32>),
                 None, // cy: final cell state not needed
                 packed_weights.buffer(),
             )

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use crate::attributes::NodeAttributes;
 use crate::ir::graph::{GraphNode, OptimizableGraph};
+use crate::tensor::Tensor;
 
 pub type Shape = Vec<Option<usize>>;
 
@@ -47,6 +48,7 @@ pub fn shape_inference(graph: OptimizableGraph) -> OptimizableGraph {
 /// `lower()` between DCE and the plan-assembly step.
 pub fn tensor_shapes_from_graph(graph: &OptimizableGraph) -> HashMap<String, Shape> {
     let mut shapes: HashMap<String, Shape> = HashMap::new();
+    let initializers = &graph.initializers;
 
     // Seed from graph inputs.
     for input in &graph.inputs {
@@ -54,7 +56,7 @@ pub fn tensor_shapes_from_graph(graph: &OptimizableGraph) -> HashMap<String, Sha
     }
 
     // Seed from initializers — these have known static shapes.
-    for (name, tensor) in &graph.initializers {
+    for (name, tensor) in initializers {
         shapes.insert(
             name.clone(),
             tensor.shape().iter().map(|d| Some(*d)).collect(),
@@ -64,7 +66,7 @@ pub fn tensor_shapes_from_graph(graph: &OptimizableGraph) -> HashMap<String, Sha
     // Forward-propagate through each node in order (graph is already
     // topo-sorted by the time this runs).
     for node in &graph.nodes {
-        let out_shapes = infer_node_output_shapes(node, &shapes);
+        let out_shapes = infer_node_output_shapes(node, &shapes, initializers);
         for (name, shape) in node.outputs.iter().zip(out_shapes.into_iter()) {
             if !name.is_empty() {
                 shapes.insert(name.clone(), shape);
@@ -80,6 +82,7 @@ pub fn tensor_shapes_from_graph(graph: &OptimizableGraph) -> HashMap<String, Sha
 fn infer_node_output_shapes(
     node: &GraphNode,
     shapes: &HashMap<String, Shape>,
+    initializers: &HashMap<String, Tensor>,
 ) -> Vec<Shape> {
     let input_shapes: Vec<Shape> = node
         .inputs
@@ -115,6 +118,22 @@ fn infer_node_output_shapes(
             let rank = input_shapes.first().map(|s| s.len()).unwrap_or(0);
             vec![vec![Some(rank)]]
         }
+        // Constant: output shape is the shape of the `value` attribute
+        // tensor. Phase 3 Commit #3 omitted this because Constants were
+        // assumed to be promoted to initializers by the ONNX loader;
+        // Kokoro disproves that — many Constant nodes persist in the
+        // graph, and their Int64 outputs feed Gather.indices /
+        // Unsqueeze.axes / Concat inputs that downstream Shape→Gather
+        // / Shape→Slice chains depend on. Without this case they fell
+        // through to `_ => Shape::new()`, zeroing propagation through
+        // every consumer.
+        "Constant" => {
+            let value_shape = attrs
+                .get_tensor("value")
+                .map(|t| t.shape().iter().map(|d| Some(*d)).collect::<Shape>())
+                .unwrap_or_default();
+            vec![value_shape]
+        }
         "ConstantOfShape" => {
             // Output shape is the VALUE of input[0] — only resolvable if input
             // is an initializer AND can be downcast to i64 at shape-inference time.
@@ -126,7 +145,7 @@ fn infer_node_output_shapes(
 
         // Reshape family.
         "Reshape" => {
-            vec![infer_reshape(&input_shapes, attrs, node)]
+            vec![infer_reshape(&input_shapes, node, initializers)]
         }
         "Unsqueeze" => {
             vec![infer_unsqueeze(&input_shapes, attrs)]
@@ -217,13 +236,89 @@ fn broadcast_shapes(inputs: &[Shape]) -> Shape {
     out
 }
 
-fn infer_reshape(inputs: &[Shape], _attrs: &NodeAttributes, node: &GraphNode) -> Shape {
-    // Reshape takes (data, shape). Without access to graph.initializers here,
-    // we can only preserve the total element count constraint if known.
-    // Return empty (fully unknown); constant_folding often resolves Reshape
-    // before this pass runs anyway. Phase 3 spec §Commit #3 Known limitation.
-    let _ = (inputs, node);
-    Shape::new()
+// Phase 3 §Commit #3 Known limitation — completed in Phase 4 B 2026-04-22.
+// Resolves `0` placeholders from the data tensor's shape (Phase 3 spec
+// convention: "0 = copy-from-data") and single `-1` from element-count
+// division when all other dims are known. Falls back to Shape::new()
+// when shape input isn't an initializer or when a dim can't be
+// resolved.
+fn infer_reshape(
+    inputs: &[Shape],
+    node: &GraphNode,
+    initializers: &HashMap<String, Tensor>,
+) -> Shape {
+    // ONNX Reshape: inputs = [data, shape]. The shape input is a rank-1
+    // Int64 tensor; in Kokoro it is always an initializer by the time
+    // this pass runs (constant_folding + shape_extraction_folding have
+    // already collapsed any Constant / Shape→Extract sources).
+    let shape_name = match node.inputs.get(1) {
+        Some(n) if !n.is_empty() => n,
+        _ => return Shape::new(),
+    };
+    let shape_tensor = match initializers.get(shape_name) {
+        Some(t) if t.is_int64() => t,
+        _ => return Shape::new(),
+    };
+    let raw_shape: Vec<i64> = shape_tensor.to_array_i64().iter().copied().collect();
+
+    // `Shape::new()` sentinel means "fully unknown" throughout this
+    // codebase — it is NOT a known rank-0 tensor. Mirror
+    // `precompute.rs::precompute_reshape_shape` which documents the
+    // same invariant.
+    let data_shape_opt = inputs.first().filter(|s| !s.is_empty());
+
+    let mut resolved: Vec<i64> = Vec::with_capacity(raw_shape.len());
+    for (i, &d) in raw_shape.iter().enumerate() {
+        if d == 0 {
+            // `0` at position i means "copy data_shape[i]". If the data
+            // dim at that position is unknown (None) or data shape
+            // itself is unknown, we cannot resolve this output dim.
+            match data_shape_opt.and_then(|s| s.get(i).copied().flatten()) {
+                Some(n) => resolved.push(n as i64),
+                None => return Shape::new(),
+            }
+        } else {
+            resolved.push(d);
+        }
+    }
+
+    // Resolve a single `-1` using the known element count — requires
+    // every dim of the data tensor to be known.
+    if resolved.iter().any(|&d| d == -1) {
+        let data_shape = match data_shape_opt {
+            Some(s) => s,
+            None => return Shape::new(),
+        };
+        let all_known: Option<Vec<usize>> = data_shape.iter().copied().collect();
+        let data_dims = match all_known {
+            Some(d) => d,
+            None => return Shape::new(),
+        };
+        let data_elements: i64 = data_dims.iter().map(|&n| n as i64).product();
+        let known_product: Option<i64> = resolved
+            .iter()
+            .filter(|&&d| d != -1)
+            .try_fold(1i64, |acc, &d| if d > 0 { Some(acc * d) } else { None });
+        let known_product = match known_product {
+            Some(p) if p > 0 && data_elements % p == 0 => p,
+            _ => return Shape::new(),
+        };
+        let inferred = data_elements / known_product;
+        for d in resolved.iter_mut() {
+            if *d == -1 {
+                *d = inferred;
+            }
+        }
+    }
+
+    // Every entry should now be > 0. Any residual non-positive entry
+    // (a leftover 0 or -1 the steps above couldn't resolve) means we
+    // don't have a fully concrete answer — bail to the unknown sentinel
+    // rather than emit a wrong-but-plausible shape.
+    if resolved.iter().any(|&d| d <= 0) {
+        return Shape::new();
+    }
+    resolved.into_iter().map(|d| Some(d as usize)).collect()
 }
 
 fn infer_unsqueeze(inputs: &[Shape], attrs: &NodeAttributes) -> Shape {
@@ -819,6 +914,127 @@ mod tests {
             vec!["data".into(), "idx".into()],
             vec!["y".into()],
             attrs,
+        );
+        let shapes = tensor_shapes_from_graph(&b.build());
+        assert_eq!(shapes.get("y").unwrap(), &Shape::new());
+    }
+
+    #[test]
+    fn constant_produces_value_attribute_shape() {
+        // Phase 4 B: Constant nodes that survive the ONNX loader (not
+        // all are promoted to initializers — Kokoro has dozens) carry
+        // their payload in the `value` attribute. Shape inference
+        // must read its tensor shape rather than the default empty.
+        let mut attrs = NodeAttributes::new();
+        attrs.add_tensor(
+            "value".into(),
+            crate::tensor::Tensor::from_vec_i64(vec![3, 4, 5], vec![3]),
+        );
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_node(
+            "c",
+            "Constant",
+            vec![],
+            vec!["const_out".into()],
+            attrs,
+        );
+        let shapes = tensor_shapes_from_graph(&b.build());
+        assert_eq!(shapes.get("const_out").unwrap(), &vec![Some(3)]);
+    }
+
+    #[test]
+    fn constant_without_value_attribute_falls_back_to_unknown() {
+        // Malformed Constant (no `value` attr) — fall back to empty
+        // sentinel rather than panic.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_node(
+            "c",
+            "Constant",
+            vec![],
+            vec!["const_out".into()],
+            NodeAttributes::new(),
+        );
+        let shapes = tensor_shapes_from_graph(&b.build());
+        assert_eq!(shapes.get("const_out").unwrap(), &Shape::new());
+    }
+
+    #[test]
+    fn reshape_with_concrete_initializer_shape_produces_concrete_output() {
+        // Phase 4 B: shape input is a concrete Int64 initializer
+        // without any `0`/`-1` placeholders — infer_reshape should
+        // return the shape verbatim.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("data".into(), vec![Some(1), Some(5), Some(128)]);
+        b.add_initializer(
+            "new_shape".into(),
+            crate::tensor::Tensor::from_vec_i64(vec![5, 128], vec![2]),
+        );
+        b.add_node(
+            "r",
+            "Reshape",
+            vec!["data".into(), "new_shape".into()],
+            vec!["y".into()],
+            NodeAttributes::new(),
+        );
+        let shapes = tensor_shapes_from_graph(&b.build());
+        assert_eq!(shapes.get("y").unwrap(), &vec![Some(5), Some(128)]);
+    }
+
+    #[test]
+    fn reshape_with_zero_placeholder_copies_from_data() {
+        // `0` at pos 0 copies data[0] = 1; `-1` at pos 1 resolves to
+        // 640 / 1 = 640.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("data".into(), vec![Some(1), Some(5), Some(128)]);
+        b.add_initializer(
+            "new_shape".into(),
+            crate::tensor::Tensor::from_vec_i64(vec![0, -1], vec![2]),
+        );
+        b.add_node(
+            "r",
+            "Reshape",
+            vec!["data".into(), "new_shape".into()],
+            vec!["y".into()],
+            NodeAttributes::new(),
+        );
+        let shapes = tensor_shapes_from_graph(&b.build());
+        assert_eq!(shapes.get("y").unwrap(), &vec![Some(1), Some(640)]);
+    }
+
+    #[test]
+    fn reshape_with_none_dim_in_data_when_zero_requested_falls_back() {
+        // `0` at pos 0 targets data[0] which is None → must fall back
+        // to Shape::new() (the unknown sentinel), NOT fabricate a dim.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("data".into(), vec![None, Some(5)]);
+        b.add_initializer(
+            "new_shape".into(),
+            crate::tensor::Tensor::from_vec_i64(vec![0, 5], vec![2]),
+        );
+        b.add_node(
+            "r",
+            "Reshape",
+            vec!["data".into(), "new_shape".into()],
+            vec!["y".into()],
+            NodeAttributes::new(),
+        );
+        let shapes = tensor_shapes_from_graph(&b.build());
+        assert_eq!(shapes.get("y").unwrap(), &Shape::new());
+    }
+
+    #[test]
+    fn reshape_with_runtime_shape_input_falls_back() {
+        // shape input is a graph input (runtime tensor), not an
+        // initializer → fall back to unknown sentinel.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("data".into(), vec![Some(1), Some(5), Some(128)]);
+        b.add_input("new_shape".into(), vec![Some(2)]);
+        b.add_node(
+            "r",
+            "Reshape",
+            vec!["data".into(), "new_shape".into()],
+            vec!["y".into()],
+            NodeAttributes::new(),
         );
         let shapes = tensor_shapes_from_graph(&b.build());
         assert_eq!(shapes.get("y").unwrap(), &Shape::new());

@@ -13,8 +13,9 @@ use crate::cuda::{CudaError, GpuTensor, IconnxCudaContext};
 use crate::ir::graph::OptimizableGraph;
 use crate::ir::passes::{
     constant_folding_pass, dead_code_elimination, detect_fusion,
-    elementwise_fusion_pass, fusion_annotations_from_graph, precompute_params,
-    shape_inference, tensor_shapes_from_graph, topo_sort, FusionAnnotations,
+    elementwise_fusion_pass, fusion_annotations_from_graph, memory_planner,
+    precompute_params, shape_extraction_folding, shape_inference,
+    tensor_shapes_from_graph, topo_sort, FusionAnnotations,
 };
 use crate::ir::plan::{
     ExecutionPlan, LstmPlanCache, LstmWeightCache, OpKind, PlannedOp,
@@ -52,8 +53,54 @@ pub fn lower(
     // that gets attached to `ExecutionPlan::tensor_shapes` below — a
     // separate output from the graph itself. See the docs on
     // `shape_inference` for the full rationale.
-    let graph = shape_inference(graph);
-    let tensor_shapes = tensor_shapes_from_graph(&graph);
+    //
+    // 4b. Shape-extraction folding (Phase 4 B) — collapse Shape-rooted
+    // chains terminating at Gather/Slice (and optionally through a
+    // Cast→Int64) when the requested dims are all concrete. Must run
+    // AFTER `tensor_shapes_from_graph` so the predicate sees inferred
+    // shapes. Collapsed chain outputs are promoted to initializers and
+    // orphaned Shape/Cast nodes are removed in a local sweep inside the
+    // pass; the DCE step at the end of this block picks up any downstream
+    // consumers that became unreferenced.
+    //
+    // The shape-inference <-> shape-extraction-folding interaction is
+    // iterated in a bounded fixpoint per spec §Amendment history
+    // ("2026-04-22 (fourth refinement)"): a fold that synthesizes an
+    // initializer for e.g. `Reshape.shape` can unlock further shape
+    // refinements, which in turn unlock further folds. The loop is
+    // capped at `SHAPE_FOLDING_FIXPOINT_MAX_ITERATIONS`; it exits early
+    // the first iteration that adds zero initializers AND refines zero
+    // `None` dims to `Some`. Only these two passes are iterated —
+    // constant_folding / DCE / precompute_params / elementwise_fusion
+    // stay strictly one-shot.
+    const SHAPE_FOLDING_FIXPOINT_MAX_ITERATIONS: usize = 3;
+
+    let mut graph = shape_inference(graph);
+    let mut tensor_shapes = tensor_shapes_from_graph(&graph);
+
+    for _iter in 0..SHAPE_FOLDING_FIXPOINT_MAX_ITERATIONS {
+        let initializer_count_before = graph.initializers.len();
+        let none_dim_count_before = count_none_dims(&tensor_shapes);
+
+        graph = shape_extraction_folding(graph, &tensor_shapes);
+        // Re-run shape_inference (identity today) + tensor_shapes_from_graph
+        // to pick up synthesized initializers from the fold.
+        graph = shape_inference(graph);
+        tensor_shapes = tensor_shapes_from_graph(&graph);
+
+        let initializer_count_after = graph.initializers.len();
+        let none_dim_count_after = count_none_dims(&tensor_shapes);
+
+        let added_inits = initializer_count_after.saturating_sub(initializer_count_before);
+        let resolved_dims = none_dim_count_before.saturating_sub(none_dim_count_after);
+
+        if added_inits == 0 && resolved_dims == 0 {
+            // Strict progress-assertion early-break: no new initializers AND
+            // no None->Some refinements means no further progress is possible.
+            break;
+        }
+    }
+
     // Keep the DCE invariant — cheap, and paves the way for future passes.
     let graph = dead_code_elimination(graph);
 
@@ -90,7 +137,9 @@ pub fn lower(
     let lstm_weights = pack_lstm_weights_eagerly(&graph, &weights, ctx)?;
 
     // 10. Build PlannedOp sequence from sorted nodes + fusion + precomputed.
-    let ops: Vec<PlannedOp> = graph
+    // `arena_offset` is populated in step 12 after the memory planner runs;
+    // start with `None` so ops that end up non-eligible keep the pool path.
+    let mut ops: Vec<PlannedOp> = graph
         .nodes
         .iter()
         .map(|node| {
@@ -109,12 +158,41 @@ pub fn lower(
                 node: node.clone(),
                 kind,
                 precomputed,
+                arena_offset: None,
             }
         })
         .collect();
 
-    // 11. Compute tensor_last_use for memory-pool return timing.
+    // 11. Compute tensor_last_use for memory-pool return timing; and
+    // tensor_first_use for the memory planner's lifetime analysis.
     let tensor_last_use = compute_tensor_last_use(&ops, &graph.outputs, &weights);
+    let tensor_first_use = compute_tensor_first_use(&ops);
+
+    // 12. Run the static memory planner (Phase 4 A1). Produces a
+    // `MemoryPlan` whose byte offsets are stamped onto each `PlannedOp`.
+    // The runtime arena path that consumes the stamped offsets is
+    // deferred to Phase 5 A2; today's runtime ignores `arena_offset`
+    // and every op takes the pool path.
+    let memory_plan = memory_planner(
+        &graph,
+        &tensor_shapes,
+        &tensor_last_use,
+        &tensor_first_use,
+        &fusion,
+    );
+    for op in ops.iter_mut() {
+        // An op's primary output is its first output name; any other
+        // outputs (rare — LSTM's Y_h/Y_c, etc.) stay pool-backed. This
+        // matches `PlannedOp::arena_offset`'s documented "primary
+        // output" contract (src/ir/plan.rs) and the planner's own
+        // enumeration which also only considers node.outputs.first().
+        op.arena_offset = op
+            .node
+            .outputs
+            .first()
+            .filter(|name| !name.is_empty())
+            .and_then(|name| memory_plan.arena_offset(name));
+    }
 
     Ok(ExecutionPlan {
         ops,
@@ -127,6 +205,7 @@ pub fn lower(
         graph_inputs: graph.inputs,
         graph_outputs: graph.outputs,
         tensor_shapes,
+        memory_plan,
     })
 }
 
@@ -308,10 +387,49 @@ fn compute_tensor_last_use(
     last_use
 }
 
+/// For each tensor produced by some op in `ops`, record the op-index
+/// at which it is first defined. Mirrors [`compute_tensor_last_use`]
+/// but tracks definition sites instead of consumption sites.
+///
+/// Under topological ordering each output name appears at exactly
+/// one op, so iterating `ops` and using `entry(...).or_insert(idx)`
+/// records the first (= only) definition. Used by the Phase 4 memory
+/// planner's greedy linear scan as the lower bound of each eligible
+/// tensor's lifetime.
+fn compute_tensor_first_use(ops: &[PlannedOp]) -> HashMap<String, usize> {
+    let mut first_use: HashMap<String, usize> = HashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        for out_name in op.node.outputs.iter() {
+            if !out_name.is_empty() {
+                first_use.entry(out_name.clone()).or_insert(idx);
+            }
+        }
+    }
+    first_use
+}
+
+/// Sum the number of `None` entries across every shape in the map.
+/// Used by the Phase 4 B fixpoint loop in [`lower`] to detect
+/// per-iteration progress: a `None` dim that becomes `Some` somewhere
+/// in `tensor_shapes` is one of the two progress signals (the other is
+/// a newly-synthesized initializer). The loop exits the first iteration
+/// that produces zero of both.
+fn count_none_dims(shapes: &HashMap<String, Vec<Option<usize>>>) -> usize {
+    shapes
+        .values()
+        .map(|s| s.iter().filter(|d| d.is_none()).count())
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attributes::NodeAttributes;
     use crate::ir::graph::OptimizableGraphBuilder;
+    use crate::ir::passes::shape_extraction_folding::{
+        reset_fold_counters, ShapeExtractionFoldingCounts,
+    };
+    use crate::tensor::Tensor;
 
     #[test]
     #[ignore = "requires CUDA GPU"]
@@ -324,5 +442,126 @@ mod tests {
         assert!(plan.lstm_weights.is_empty());
         assert!(plan.static_i64.is_empty());
         assert!(plan.tensor_last_use.is_empty());
+    }
+
+    #[test]
+    fn count_none_dims_counts_none_entries_only() {
+        let mut shapes: HashMap<String, Vec<Option<usize>>> = HashMap::new();
+        shapes.insert("all_concrete".into(), vec![Some(1), Some(5), Some(512)]);
+        shapes.insert("mixed".into(), vec![None, Some(5), None]);
+        shapes.insert("all_none".into(), vec![None, None]);
+        shapes.insert("empty".into(), vec![]);
+        // 0 + 2 + 2 + 0 = 4 None dims.
+        assert_eq!(count_none_dims(&shapes), 4);
+    }
+
+    /// Fixpoint termination test — a `Shape -> Gather` chain against a
+    /// concrete input must converge within the iteration cap and the
+    /// fold must fire exactly once. Exercises the fixpoint body in
+    /// [`lower`] directly (skipping the CUDA-dependent portions) so it
+    /// runs without a GPU.
+    ///
+    /// We don't chain two patterns back-to-back here because the Phase 3
+    /// inferencer today is an identity pass — `shape_inference` itself
+    /// makes no progress, so a synthetic chain-of-two would converge in
+    /// one iteration identically to a single fold. What this test
+    /// asserts is that (a) the loop drives at least one successful
+    /// iteration, (b) it early-breaks on zero progress before the cap,
+    /// and (c) the fold counter increments exactly once for a
+    /// single-chain input.
+    #[test]
+    fn shape_folding_fixpoint_terminates_within_three_iterations() {
+        use crate::ir::passes::{
+            dead_code_elimination, shape_extraction_folding, shape_inference,
+            tensor_shapes_from_graph, topo_sort,
+        };
+
+        reset_fold_counters();
+
+        // Build: Shape(x[1,5,512]) -> Gather(indices=[0,2]) -> "dims".
+        // A single extraction chain — one fold is available.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("x".to_string(), vec![Some(1), Some(5), Some(512)]);
+        b.add_initializer(
+            "indices".to_string(),
+            Tensor::from_vec_i64(vec![0, 2], vec![2]),
+        );
+        b.add_node(
+            "shape_of_x",
+            "Shape",
+            vec!["x".to_string()],
+            vec!["shape_out".to_string()],
+            NodeAttributes::new(),
+        );
+        let mut gather_attrs = NodeAttributes::new();
+        gather_attrs.add_int("axis".to_string(), 0);
+        b.add_node(
+            "gather_dims",
+            "Gather",
+            vec!["shape_out".to_string(), "indices".to_string()],
+            vec!["dims".to_string()],
+            gather_attrs,
+        );
+        b.add_output("dims".to_string());
+        let graph = b.build();
+
+        // Mirror lower()'s pre-fixpoint pipeline, minus CUDA paths.
+        let graph = topo_sort(graph).expect("topo_sort");
+        let mut graph = shape_inference(graph);
+        let mut tensor_shapes = tensor_shapes_from_graph(&graph);
+
+        // Run the same fixpoint body as lower(). Track iteration count so
+        // we can assert early-break behavior.
+        const CAP: usize = 3;
+        let mut iterations_executed = 0usize;
+        for _iter in 0..CAP {
+            let inits_before = graph.initializers.len();
+            let none_before = count_none_dims(&tensor_shapes);
+
+            graph = shape_extraction_folding(graph, &tensor_shapes);
+            graph = shape_inference(graph);
+            tensor_shapes = tensor_shapes_from_graph(&graph);
+
+            iterations_executed += 1;
+
+            let inits_after = graph.initializers.len();
+            let none_after = count_none_dims(&tensor_shapes);
+
+            let added = inits_after.saturating_sub(inits_before);
+            let resolved = none_before.saturating_sub(none_after);
+
+            if added == 0 && resolved == 0 {
+                break;
+            }
+        }
+        let _graph = dead_code_elimination(graph);
+
+        // Fold occurred.
+        let counts = ShapeExtractionFoldingCounts::snapshot();
+        assert_eq!(
+            counts.total, 1,
+            "expected exactly one Shape->Gather fold, got counts={:?}",
+            counts
+        );
+
+        // Early break — we added 1 initializer on iteration 1 and 0 on
+        // iteration 2 (no more chains left to fold), so the loop should
+        // have run either 1 or 2 times but strictly less than CAP+1.
+        // The crucial invariant is that we did NOT run the full 3
+        // iterations; if we had, it would mean the zero-progress early
+        // break never fired.
+        assert!(
+            iterations_executed < CAP + 1 && iterations_executed >= 1,
+            "iterations_executed={} outside expected range [1, {}]",
+            iterations_executed,
+            CAP,
+        );
+        // Stronger: after the first iteration folded, the second should
+        // have zero progress and break immediately.
+        assert!(
+            iterations_executed <= 2,
+            "fixpoint failed to early-break after fold exhausted; ran {} iterations",
+            iterations_executed,
+        );
     }
 }
