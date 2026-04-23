@@ -344,9 +344,11 @@ fn match_mul_sin_pow_mul_add(
 }
 
 /// MulAdd: Mul -> Add — `y = a * b + c`. Matched only when `c` is an
-/// initializer (not just any static value); the fused kernel doesn't
-/// support broadcasting and initializers are the only reliable shape-
-/// matched source.
+/// initializer (not just any static value). The fused kernel supports
+/// two shape layouts: all-same-shape, or `b` and `c` broadcast along
+/// `a`'s last dim (`[last_dim]`, `[1, last_dim]`, …). Shape compat is
+/// validated at dispatch time in `gpu_fused_mul_add`; the matcher
+/// accepts any shape and lets the wrapper reject incompatible cases.
 fn match_mul_add(
     chain: &[usize],
     nodes: &[GraphNode],

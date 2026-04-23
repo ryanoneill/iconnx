@@ -104,6 +104,8 @@ const FUSED_KERNEL_NAMES: &[&str] = &[
     "fused_gelu_kernel",
     // Mul-Add: y = a * b + c (fused multiply-add)
     "fused_mul_add_kernel",
+    // Mul-Add with b, c broadcast along last_dim (transformer scale+bias)
+    "fused_mul_add_bcast_last_dim_kernel",
     // Add-Mul: y = (a + b) * c (fused add-multiply)
     "fused_add_mul_kernel",
     // Sub-Mul: y = (a - b) * c (fused sub-multiply)
@@ -295,6 +297,26 @@ extern "C" __global__ void fused_mul_add_kernel(
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = a[i] * b[i] + c[i];
+    }
+}
+
+// Per-channel affine broadcast: b and c share shape [last_dim] (or any
+// shape whose element count equals last_dim, e.g. [1, 1, last_dim]),
+// broadcast across a's leading dims. Standard transformer pattern
+// (scale + bias per hidden dim), blocks Whisper's first baseline when
+// only the same-shape kernel exists.
+extern "C" __global__ void fused_mul_add_bcast_last_dim_kernel(
+    float* out,
+    const float* a,
+    const float* b,
+    const float* c,
+    size_t n,
+    size_t last_dim
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        size_t channel = i % last_dim;
+        out[i] = a[i] * b[channel] + c[channel];
     }
 }
 
@@ -708,6 +730,109 @@ mod tests {
         assert!((host_result[1] - 7.0).abs() < 1e-5);
         // 3.0 * 4.0 + 1.5 = 13.5
         assert!((host_result[2] - 13.5).abs() < 1e-5);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_fused_mul_add_broadcasts_1d_bc_along_last_dim() {
+        // Whisper-representative pattern: a = [batch, seq, hidden],
+        // b and c are per-channel scale+bias with shape [hidden].
+        // Each output element uses b[i % hidden] and c[i % hidden].
+        let (ctx, cache, mut pool) = setup();
+
+        let hidden = 4;
+        let batch = 2;
+        let seq = 3;
+        let n = batch * seq * hidden;
+
+        let a_data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let b_data = vec![0.5_f32, 1.0, 1.5, 2.0];
+        let c_data = vec![0.1_f32, 0.2, 0.3, 0.4];
+
+        let a = GpuTensor::from_host_f32(&ctx, &a_data, vec![batch, seq, hidden]).unwrap();
+        let b = GpuTensor::from_host_f32(&ctx, &b_data, vec![hidden]).unwrap();
+        let c = GpuTensor::from_host_f32(&ctx, &c_data, vec![hidden]).unwrap();
+
+        let out = gpu_fused_mul_add(&ctx, &cache, &mut pool, &a, &b, &c)
+            .expect("broadcast fused_mul_add");
+        let host = out.to_host_f32(&ctx).unwrap();
+
+        for i in 0..n {
+            let ch = i % hidden;
+            let expected = a_data[i] * b_data[ch] + c_data[ch];
+            assert!(
+                (host[i] - expected).abs() < 1e-6,
+                "i={} expected={} got={}",
+                i,
+                expected,
+                host[i],
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_fused_mul_add_broadcasts_with_rank_padded_bc() {
+        // Same pattern but b, c shaped [1, 1, hidden] instead of
+        // [hidden]. Should still dispatch via the broadcast path
+        // because numel == a.shape.last().
+        let (ctx, cache, mut pool) = setup();
+
+        let hidden = 4;
+        let a = GpuTensor::from_host_f32(
+            &ctx,
+            &(0..8).map(|i| i as f32).collect::<Vec<_>>(),
+            vec![2, hidden],
+        )
+        .unwrap();
+        let b = GpuTensor::from_host_f32(&ctx, &[1.0, 2.0, 3.0, 4.0], vec![1, 1, hidden]).unwrap();
+        let c = GpuTensor::from_host_f32(&ctx, &[0.0, 0.5, 1.0, 1.5], vec![1, 1, hidden]).unwrap();
+
+        let out = gpu_fused_mul_add(&ctx, &cache, &mut pool, &a, &b, &c)
+            .expect("rank-padded broadcast fused_mul_add");
+        let host = out.to_host_f32(&ctx).unwrap();
+
+        // i=0: 0*1 + 0 = 0
+        // i=1: 1*2 + 0.5 = 2.5
+        // i=2: 2*3 + 1 = 7
+        // i=3: 3*4 + 1.5 = 13.5
+        // i=4: 4*1 + 0 = 4
+        // i=5: 5*2 + 0.5 = 10.5
+        // i=6: 6*3 + 1 = 19
+        // i=7: 7*4 + 1.5 = 29.5
+        let expected = [0.0, 2.5, 7.0, 13.5, 4.0, 10.5, 19.0, 29.5];
+        for (i, &exp) in expected.iter().enumerate() {
+            assert!(
+                (host[i] - exp).abs() < 1e-6,
+                "i={} expected={} got={}",
+                i,
+                exp,
+                host[i],
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_fused_mul_add_rejects_incompatible_broadcast() {
+        // b and c shapes don't match the supported broadcast layouts
+        // (neither all-same-shape nor last-dim broadcast). Must error.
+        let (ctx, cache, mut pool) = setup();
+
+        let a = GpuTensor::from_host_f32(&ctx, &[1.0; 24], vec![2, 3, 4]).unwrap();
+        let b = GpuTensor::from_host_f32(&ctx, &[1.0; 6], vec![3, 2]).unwrap(); // numel matches a.last? 6 != 4
+        let c = GpuTensor::from_host_f32(&ctx, &[1.0; 6], vec![3, 2]).unwrap();
+
+        let result = gpu_fused_mul_add(&ctx, &cache, &mut pool, &a, &b, &c);
+        let msg = match result {
+            Ok(_) => panic!("expected shape-mismatch error, got Ok"),
+            Err(e) => format!("{}", e),
+        };
+        assert!(
+            msg.contains("shape mismatch"),
+            "expected shape-mismatch error, got: {}",
+            msg
+        );
     }
 
     #[test]

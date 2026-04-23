@@ -480,6 +480,18 @@ pub fn gpu_fused_gelu(
 }
 
 /// GPU fused mul_add: out = a * b + c.
+///
+/// Supports two shape layouts:
+///
+/// 1. All-same-shape: `a.shape() == b.shape() == c.shape()` — element-
+///    wise path via `fused_mul_add_kernel`.
+/// 2. Per-channel broadcast: `b` and `c` share a shape whose element
+///    count equals `a.shape().last()` (so `[last_dim]`,
+///    `[1, last_dim]`, `[1, 1, last_dim]`, etc. are all accepted).
+///    Dispatches to `fused_mul_add_bcast_last_dim_kernel` which uses
+///    `b[i % last_dim]` / `c[i % last_dim]` indexing. This is the
+///    standard transformer scale+bias pattern (e.g., Whisper's
+///    attention projections, LayerNorm affine).
 pub fn gpu_fused_mul_add(
     ctx: &IconnxCudaContext,
     cache: &FusedKernelCache,
@@ -490,27 +502,82 @@ pub fn gpu_fused_mul_add(
 ) -> Result<GpuTensor, CudaError> {
     let n = a.len();
 
-    if a.shape() != b.shape() || a.shape() != c.shape() {
-        return Err(CudaError::Kernel(format!(
-            "fused_mul_add: shape mismatch a={:?} b={:?} c={:?}",
-            a.shape(),
-            b.shape(),
-            c.shape()
-        )));
+    // Path 1: all shapes identical.
+    if a.shape() == b.shape() && a.shape() == c.shape() {
+        let mut out = pool.get_tensor_f32(ctx, a.shape().to_vec())?;
+        launch_ternary_f32(
+            ctx,
+            cache,
+            "fused_mul_add_kernel",
+            out.data_f32_mut()?,
+            a.data_f32()?,
+            b.data_f32()?,
+            c.data_f32()?,
+            n,
+        )?;
+        return Ok(out);
     }
 
-    let mut out = pool.get_tensor_f32(ctx, a.shape().to_vec())?;
-    launch_ternary_f32(
-        ctx,
-        cache,
-        "fused_mul_add_kernel",
-        out.data_f32_mut()?,
-        a.data_f32()?,
-        b.data_f32()?,
-        c.data_f32()?,
-        n,
-    )?;
-    Ok(out)
+    // Path 2: per-channel broadcast. b and c share shape; their
+    // element count equals a's last dim. The actual rank can vary
+    // ([last_dim], [1, last_dim], [1, 1, last_dim], ...) — the kernel
+    // indexes via `i % last_dim` regardless.
+    let a_last = a.shape().last().copied().ok_or_else(|| {
+        CudaError::Kernel(format!("fused_mul_add: `a` is rank-0 ({:?})", a.shape()))
+    })?;
+    if b.shape() == c.shape() && b.len() == a_last {
+        let mut out = pool.get_tensor_f32(ctx, a.shape().to_vec())?;
+
+        // SAFETY: fused_mul_add_bcast_last_dim_kernel signature is
+        // `(float* out, const float* a, const float* b, const float* c,
+        //   size_t n, size_t last_dim)`.
+        let kernel = unsafe {
+            cache.module().typed_kernel::<(
+                &mut DeviceSlice<'_, f32>,
+                &DeviceSlice<'_, f32>,
+                &DeviceSlice<'_, f32>,
+                &DeviceSlice<'_, f32>,
+                usize,
+                usize,
+            )>("fused_mul_add_bcast_last_dim_kernel")
+        }
+        .map_err(|e| {
+            CudaError::Kernel(format!(
+                "fused_mul_add_bcast_last_dim_kernel lookup failed: {}",
+                e
+            ))
+        })?;
+
+        kernel
+            .launch(
+                ctx.garboard_stream(),
+                &elementwise_config(n),
+                (
+                    out.data_f32_mut()?,
+                    a.data_f32()?,
+                    b.data_f32()?,
+                    c.data_f32()?,
+                    n,
+                    a_last,
+                ),
+            )
+            .map_err(|e| {
+                CudaError::Kernel(format!(
+                    "fused_mul_add_bcast_last_dim launch failed: {}",
+                    e
+                ))
+            })?;
+
+        return Ok(out);
+    }
+
+    Err(CudaError::Kernel(format!(
+        "fused_mul_add: shape mismatch a={:?} b={:?} c={:?} — supported layouts are \
+         (a.shape == b.shape == c.shape) or (b.shape == c.shape && b.numel == a.shape.last)",
+        a.shape(),
+        b.shape(),
+        c.shape()
+    )))
 }
 
 /// GPU fused add_mul: out = (a + b) * c.
