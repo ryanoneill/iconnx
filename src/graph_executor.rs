@@ -141,14 +141,21 @@ impl GraphExecutor {
 
             // Special handling for Constant nodes - extract value from attributes
             if node.op_type == "Constant" {
-                if let Some(value_tensor) = node.attributes.get_tensor("value") {
-                    // Constant node produces a tensor from its "value" attribute
+                if let Some(value_tensor) = node.attributes.resolve_constant_value() {
+                    // Constant node produces a tensor from whichever value-
+                    // carrying attribute is present (see
+                    // NodeAttributes::resolve_constant_value for the full
+                    // ONNX spec's accepted set: value, value_int(s),
+                    // value_float(s)).
                     assert_eq!(node.outputs.len(), 1, "Constant should have 1 output");
-                    values.insert(node.outputs[0].clone(), value_tensor.clone());
+                    values.insert(node.outputs[0].clone(), value_tensor);
                     continue; // Skip normal execution
                 } else {
-                    // No value attribute - this shouldn't happen but handle gracefully
-                    anyhow::bail!("Constant node '{}' missing 'value' attribute", node.name);
+                    anyhow::bail!(
+                        "Constant node '{}' missing all value-carrying attributes \
+                         (value / value_int / value_ints / value_float / value_floats)",
+                        node.name
+                    );
                 }
             }
 
@@ -406,12 +413,16 @@ impl GraphExecutor {
             let _name = node.outputs.first().map(|s| s.as_str()).unwrap_or("");
             // Special handling for Constant nodes
             if node.op_type == "Constant" {
-                if let Some(value_tensor) = node.attributes.get_tensor("value") {
+                if let Some(value_tensor) = node.attributes.resolve_constant_value() {
                     assert_eq!(node.outputs.len(), 1, "Constant should have 1 output");
-                    values.insert(node.outputs[0].clone(), value_tensor.clone());
+                    values.insert(node.outputs[0].clone(), value_tensor);
                     continue;
                 } else {
-                    anyhow::bail!("Constant node '{}' missing 'value' attribute", node.name);
+                    anyhow::bail!(
+                        "Constant node '{}' missing all value-carrying attributes \
+                         (value / value_int / value_ints / value_float / value_floats)",
+                        node.name
+                    );
                 }
             }
 

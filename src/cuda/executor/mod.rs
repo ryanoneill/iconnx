@@ -142,13 +142,14 @@ impl Executor {
             // name. Port of today's handling in
             // `cuda::inference::mod.rs::run`, ~line 2998.
             if op.node.op_type == "Constant" {
-                let value_tensor = op.node.attributes.get_tensor("value").ok_or_else(|| {
+                let value_tensor = op.node.attributes.resolve_constant_value().ok_or_else(|| {
                     CudaError::Kernel(format!(
-                        "Constant node '{}' missing 'value' attribute",
+                        "Constant node '{}' missing all value-carrying attributes \
+                         (value / value_int / value_ints / value_float / value_floats)",
                         op.node.name
                     ))
                 })?;
-                let gpu_tensor = upload_tensor(&self.ctx, value_tensor)?;
+                let gpu_tensor = upload_tensor(&self.ctx, &value_tensor)?;
                 // Constants always have exactly one output in valid ONNX.
                 if let Some(out_name) = op.node.outputs.first() {
                     values.insert(out_name.clone(), gpu_tensor);

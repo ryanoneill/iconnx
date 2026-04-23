@@ -69,8 +69,8 @@ fn collect_i64_values(graph: &OptimizableGraph) -> HashMap<String, Vec<i64>> {
         if node.op_type != "Constant" {
             continue;
         }
-        if let Some(value) = node.attributes.get_tensor("value") {
-            if let Tensor::Int64(_) = value {
+        if let Some(value) = node.attributes.resolve_constant_value() {
+            if let Tensor::Int64(_) = &value {
                 if let Some(output) = node.outputs.first() {
                     out.insert(output.clone(), value.as_slice_i64());
                 }

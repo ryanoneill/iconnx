@@ -99,14 +99,15 @@ impl Executor {
             }
 
             if op.node.op_type == "Constant" {
-                let value_tensor = op.node.attributes.get_tensor("value").ok_or_else(|| {
+                let value_tensor = op.node.attributes.resolve_constant_value().ok_or_else(|| {
                     ValidationError::Cuda(CudaError::Kernel(format!(
-                        "Constant node '{}' missing 'value' attribute",
+                        "Constant node '{}' missing all value-carrying attributes \
+                         (value / value_int / value_ints / value_float / value_floats)",
                         op.node.name
                     )))
                 })?;
                 let gpu_tensor =
-                    upload_tensor(&self.ctx, value_tensor).map_err(ValidationError::from)?;
+                    upload_tensor(&self.ctx, &value_tensor).map_err(ValidationError::from)?;
                 if let Some(out_name) = op.node.outputs.first() {
                     values.insert(out_name.clone(), gpu_tensor);
                 }
@@ -202,13 +203,14 @@ impl Executor {
             }
 
             if op.node.op_type == "Constant" {
-                let value_tensor = op.node.attributes.get_tensor("value").ok_or_else(|| {
+                let value_tensor = op.node.attributes.resolve_constant_value().ok_or_else(|| {
                     CudaError::Kernel(format!(
-                        "Constant node '{}' missing 'value' attribute",
+                        "Constant node '{}' missing all value-carrying attributes \
+                         (value / value_int / value_ints / value_float / value_floats)",
                         op.node.name
                     ))
                 })?;
-                let gpu_tensor = upload_tensor(&self.ctx, value_tensor)?;
+                let gpu_tensor = upload_tensor(&self.ctx, &value_tensor)?;
                 if let Some(out_name) = op.node.outputs.first() {
                     values.insert(out_name.clone(), gpu_tensor);
                 }
@@ -298,13 +300,14 @@ impl Executor {
             }
 
             if op.node.op_type == "Constant" {
-                let value_tensor = op.node.attributes.get_tensor("value").ok_or_else(|| {
+                let value_tensor = op.node.attributes.resolve_constant_value().ok_or_else(|| {
                     CudaError::Kernel(format!(
-                        "Constant node '{}' missing 'value' attribute",
+                        "Constant node '{}' missing all value-carrying attributes \
+                         (value / value_int / value_ints / value_float / value_floats)",
                         op.node.name
                     ))
                 })?;
-                let gpu_tensor = upload_tensor(&self.ctx, value_tensor)?;
+                let gpu_tensor = upload_tensor(&self.ctx, &value_tensor)?;
                 if let Some(out_name) = op.node.outputs.first() {
                     values.insert(out_name.clone(), gpu_tensor);
                 }
@@ -440,13 +443,14 @@ impl Executor {
             }
 
             if op.node.op_type == "Constant" {
-                let value_tensor = op.node.attributes.get_tensor("value").ok_or_else(|| {
+                let value_tensor = op.node.attributes.resolve_constant_value().ok_or_else(|| {
                     CudaError::Kernel(format!(
-                        "Constant node '{}' missing 'value' attribute",
+                        "Constant node '{}' missing all value-carrying attributes \
+                         (value / value_int / value_ints / value_float / value_floats)",
                         op.node.name
                     ))
                 })?;
-                let gpu_tensor = upload_tensor(&self.ctx, value_tensor)?;
+                let gpu_tensor = upload_tensor(&self.ctx, &value_tensor)?;
                 if let Some(out_name) = op.node.outputs.first() {
                     values.insert(out_name.clone(), gpu_tensor);
                 }
