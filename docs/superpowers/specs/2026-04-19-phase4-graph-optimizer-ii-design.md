@@ -537,6 +537,43 @@ None remaining. All architectural choices made in brainstorming dialogue with le
 
 ## Amendment history
 
+### 2026-04-22 (sixth refinement) — Commit 3 A splits into A1 (planner) + A2 (runtime arena), A2 deferred to Phase 5
+
+**Trigger.** Attempt at Commit 3 A was BLOCKED twice on an iconnx/garboard dispatch-model gap. The first attempt found garboard's `DeviceSlice` had no sub-view / reinterpret API. Leadline added a sub-view primitive (garboard `7d73675a`) returning `DeviceSliceView<'a, T>`. The second attempt verified the new API works for garboard's own traits but **does not bridge to iconnx's dispatch**: `GpuTensor` stores `Arc<DeviceSlice<'static, T>>`; every kernel/executor/op reads `tensor.data_f32() -> &DeviceSlice<'static, f32>`. No safe path converts a borrowed `DeviceSliceView<'a, T>` back to `Arc<DeviceSlice<'static, T>>` without `unsafe` (forbidden) or `Box::leak` (unacceptable).
+
+**Diagnosis — iconnx dispatch-model gap, not a garboard API gap.** iconnx's choice of `Arc<DeviceSlice<'static, T>>` for `GpuTensor` assumed "every tensor owns its own allocation." Arena-allocated tensors break that assumption. A minimal garboard primitive (`partition` or `into_device_slice`) would still return borrowed-lifetime types; only an `Arc`-based owning sub-slice would bridge, but that's a substantial new garboard primitive added speculatively for one consumer. The principled long-term fix is iconnx-side: refactor `GpuTensor` dispatch to accept borrowed lifetimes or `dyn DeviceMemory<T>` trait-object dispatch. 50+ files; not a drop-in Commit 3 change.
+
+**A1 landing (this refinement).** Lands the full planner as pure-data infrastructure. Includes:
+
+- Eligibility predicate (`is_planner_eligible`) + 6 unit tests (Task 3.1)
+- `is_fusion_skipped` structural filter
+- `MemoryPlan` struct + `PlannerClassification` + `arena_offset: Option<usize>` on `PlannedOp` (Task 3.2)
+- Greedy linear scan allocator with size-class slots + determinism contract (Task 3.3)
+- 5 allocator unit tests (Task 3.4)
+- `lower()` wires the planner; `PlannedOp.arena_offset` stamped at plan time (Task 3.6)
+- Determinism snapshot test on planner output (Task 3.10)
+- Classification coverage test: on Kokoro, `arena_assigned / arena_eligible ≥ 0.7` asserted from `MemoryPlan::classification_counts()` (Task 3.8 reshaped to test the planner's output, not a runtime-arena property)
+
+Landing criteria disposition:
+- (3) Determinism — achievable via planner snapshot test.
+- (4) Classification coverage ≥ 70% — achievable via the counts exposed on `MemoryPlan`.
+- (6) Zero warnings + signed — achievable.
+- (1) Kokoro correctness with arena active — **deferred to A2** (no runtime arena path exists yet).
+- (2) Pool fallback works — **deferred to A2** (tautologically holds under A1 since everything still takes the pool path).
+- (5) Always-on size assertion — **deferred to A2** (no arena branch to assert on).
+
+**A2 deferred to Phase 5.** Scope:
+- iconnx dispatch-model refactor (`GpuTensor` enum accepts borrowed lifetimes OR trait-object dispatch via `dyn DeviceMemory<T>`). 50+ files. Expected to be the bulk of the effort.
+- Runtime arena branching: `Executor` allocates `ArenaBuffer` at `run()` start, ops consume via `PlannedOp.arena_offset`.
+- Always-on `assert_eq!(actual_bytes, slot_bytes)` at op-execute time.
+- `ICONNX_DISABLE_MEMORY_PLANNER=1` env-var escape hatch.
+- Kokoro arena-vs-pool numerical parity test (Task 3.9).
+- Criteria (1), (2), (5) all become achievable once A2's dispatch refactor lands.
+
+**No garboard work this cycle.** Per leadline: A2's dispatch refactor decides whether iconnx adopts Path 2 (trait-object dispatch) or asks garboard for an `Arc`-based owning sub-slice primitive. Making that decision with A2 implementation data beats making it speculatively.
+
+**Phase 4 closes with:** Commit 1 (refactor) + Commit 2 B via Path B + Commit 3 A via A1. A2 + B's Kokoro integration unlock (shape-inference value-tracking) are Phase 5 scope.
+
 ### 2026-04-22 (fifth refinement) — Path B landing: mechanism validated, Kokoro integration deferred to Phase 5+
 
 **Trigger.** Attempt #2's bounded fixpoint iteration measured `fold_counts.total = 1/124` on Kokoro (Red tier). The fixpoint loop itself works correctly (iter 0 produces 16 new initializers + 10 None→Some resolutions; iter 1 produces zero progress → early-break as designed). But only 1 of Kokoro's 73 Shape nodes has a fully-concrete input precondition — 52 are partial, 20 are fully empty. The upstream shape-inference gap: `infer_unsqueeze` / `infer_concat` / `infer_transpose` / `infer_slice` consume tensor shapes but not tensor VALUES, while modern ONNX passes op parameters as tensors (Unsqueeze.axes, Concat.axis, etc.). Every chain bottoms out on an op whose output shape depends on values it can't read. Empty-shape cascade on Kokoro: Reshape 60/60, Unsqueeze 192/192, Concat 70/72, Transpose 77/79, Gather 119/120.
