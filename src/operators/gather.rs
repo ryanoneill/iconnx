@@ -52,6 +52,35 @@ impl Gather {
 
         let axis_len = inputs[0].shape()[axis];
 
+        // ONNX Gather output shape: data.shape[:axis] + indices.shape + data.shape[axis+1:].
+        // If indices is empty (total element count == 0), the output has 0 elements,
+        // and `index_axis(Axis(axis), idx)` is never called. But if `axis_len == 0`
+        // with a non-empty indices we would panic on the first `index_axis` call.
+        // Short-circuit both cases by constructing an empty output directly when the
+        // output shape is empty in any dimension.
+        let indices_shape_early = inputs[1].shape();
+        let indices_elem_count: usize = indices_shape_early.iter().product();
+        if indices_elem_count == 0 || axis_len == 0 {
+            let mut output_shape = Vec::new();
+            output_shape.extend_from_slice(&inputs[0].shape()[..axis]);
+            output_shape.extend_from_slice(indices_shape_early);
+            output_shape.extend_from_slice(&inputs[0].shape()[axis + 1..]);
+            let total: usize = output_shape.iter().product();
+            return match &inputs[0] {
+                Tensor::Int64(_) => Tensor::from_array_i64(
+                    Array::from_shape_vec(IxDyn(&output_shape), vec![0i64; total]).unwrap(),
+                ),
+                Tensor::Float32(_) => Tensor::from_array(
+                    Array::from_shape_vec(IxDyn(&output_shape), vec![0.0f32; total]).unwrap(),
+                ),
+                _ => {
+                    // For other dtypes, fall through to Float32 via conversion.
+                    let data_f32 = inputs[0].to_float32();
+                    Self::forward(&[data_f32, inputs[1].clone()], attributes)
+                }
+            };
+        }
+
         // Convert indices, handling negative indexing (e.g., -1 = last element)
         let idx_vec: Vec<usize> = if inputs[1].is_int64() {
             inputs[1]
@@ -178,5 +207,27 @@ impl Gather {
                 Self::forward(&[data_f32, inputs[1].clone()], attributes)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attributes::NodeAttributes;
+
+    #[test]
+    fn gather_on_empty_indices_returns_empty_output_without_panic() {
+        // data: Int64[3]; indices: Int64[0] (empty). Per ONNX Gather spec,
+        // output shape = data.shape[:0] + indices.shape + data.shape[1:]
+        //              = [] + [0] + [] = [0].
+        // Must not panic on the empty `index_axis` loop body; we short-
+        // circuit when indices has zero elements.
+        let data = Tensor::from_vec_i64(vec![10, 20, 30], vec![3]);
+        let indices = Tensor::from_vec_i64(vec![], vec![0]);
+        let mut attrs = NodeAttributes::new();
+        attrs.add_int("axis".to_string(), 0);
+        let out = Gather::forward(&[data, indices], &attrs);
+        assert!(out.is_int64(), "output dtype must be preserved as Int64");
+        assert_eq!(out.shape(), &[0usize][..]);
     }
 }

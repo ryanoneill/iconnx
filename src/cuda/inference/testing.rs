@@ -229,3 +229,18 @@ fn increment(count: &mut PatternCount, pattern: &FusedPattern) {
         FusedPattern::GeneralChain { .. } => count.general_chain += 1,
     }
 }
+
+/// Snapshot of shape_extraction_folding's per-pattern fold counts for
+/// the current thread. Call AFTER a lower() that triggers the pass;
+/// counts are cumulative within the thread until
+/// `reset_shape_extraction_folding_counters()` runs.
+pub fn shape_extraction_folding_counts() -> crate::ir::passes::ShapeExtractionFoldingCounts {
+    crate::ir::passes::shape_extraction_folding::ShapeExtractionFoldingCounts::snapshot()
+}
+
+/// Reset the thread-local fold counters to zero. Call before a test
+/// that asserts on counts, to avoid contamination from prior lower()
+/// calls in the same thread.
+pub fn reset_shape_extraction_folding_counters() {
+    crate::ir::passes::shape_extraction_folding::reset_fold_counters();
+}

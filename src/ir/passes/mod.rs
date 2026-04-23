@@ -7,6 +7,7 @@ pub mod elementwise_fusion_codegen;
 pub mod folding_core;
 pub mod fusion;
 pub mod precompute;
+pub mod shape_extraction_folding;
 pub mod shape_inference;
 pub mod topo_sort;
 
@@ -17,5 +18,6 @@ pub use elementwise_fusion::{
 };
 pub use fusion::{FusionAnnotations, detect_fusion};
 pub use precompute::precompute_params;
+pub use shape_extraction_folding::{shape_extraction_folding, ShapeExtractionFoldingCounts};
 pub use shape_inference::{shape_inference, tensor_shapes_from_graph};
 pub use topo_sort::topo_sort;
