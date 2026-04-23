@@ -13,9 +13,9 @@ use crate::cuda::{CudaError, GpuTensor, IconnxCudaContext};
 use crate::ir::graph::OptimizableGraph;
 use crate::ir::passes::{
     constant_folding_pass, dead_code_elimination, detect_fusion,
-    elementwise_fusion_pass, fusion_annotations_from_graph, precompute_params,
-    shape_extraction_folding, shape_inference, tensor_shapes_from_graph, topo_sort,
-    FusionAnnotations,
+    elementwise_fusion_pass, fusion_annotations_from_graph, memory_planner,
+    precompute_params, shape_extraction_folding, shape_inference,
+    tensor_shapes_from_graph, topo_sort, FusionAnnotations,
 };
 use crate::ir::plan::{
     ExecutionPlan, LstmPlanCache, LstmWeightCache, OpKind, PlannedOp,
@@ -137,7 +137,9 @@ pub fn lower(
     let lstm_weights = pack_lstm_weights_eagerly(&graph, &weights, ctx)?;
 
     // 10. Build PlannedOp sequence from sorted nodes + fusion + precomputed.
-    let ops: Vec<PlannedOp> = graph
+    // `arena_offset` is populated in step 12 after the memory planner runs;
+    // start with `None` so ops that end up non-eligible keep the pool path.
+    let mut ops: Vec<PlannedOp> = graph
         .nodes
         .iter()
         .map(|node| {
@@ -156,12 +158,41 @@ pub fn lower(
                 node: node.clone(),
                 kind,
                 precomputed,
+                arena_offset: None,
             }
         })
         .collect();
 
-    // 11. Compute tensor_last_use for memory-pool return timing.
+    // 11. Compute tensor_last_use for memory-pool return timing; and
+    // tensor_first_use for the memory planner's lifetime analysis.
     let tensor_last_use = compute_tensor_last_use(&ops, &graph.outputs, &weights);
+    let tensor_first_use = compute_tensor_first_use(&ops);
+
+    // 12. Run the static memory planner (Phase 4 A1). Produces a
+    // `MemoryPlan` whose byte offsets are stamped onto each `PlannedOp`.
+    // The runtime arena path that consumes the stamped offsets is
+    // deferred to Phase 5 A2; today's runtime ignores `arena_offset`
+    // and every op takes the pool path.
+    let memory_plan = memory_planner(
+        &graph,
+        &tensor_shapes,
+        &tensor_last_use,
+        &tensor_first_use,
+        &fusion,
+    );
+    for op in ops.iter_mut() {
+        // An op's primary output is its first output name; any other
+        // outputs (rare — LSTM's Y_h/Y_c, etc.) stay pool-backed. This
+        // matches `PlannedOp::arena_offset`'s documented "primary
+        // output" contract (src/ir/plan.rs) and the planner's own
+        // enumeration which also only considers node.outputs.first().
+        op.arena_offset = op
+            .node
+            .outputs
+            .first()
+            .filter(|name| !name.is_empty())
+            .and_then(|name| memory_plan.arena_offset(name));
+    }
 
     Ok(ExecutionPlan {
         ops,
@@ -174,6 +205,7 @@ pub fn lower(
         graph_inputs: graph.inputs,
         graph_outputs: graph.outputs,
         tensor_shapes,
+        memory_plan,
     })
 }
 
@@ -353,6 +385,27 @@ fn compute_tensor_last_use(
         }
     }
     last_use
+}
+
+/// For each tensor produced by some op in `ops`, record the op-index
+/// at which it is first defined. Mirrors [`compute_tensor_last_use`]
+/// but tracks definition sites instead of consumption sites.
+///
+/// Under topological ordering each output name appears at exactly
+/// one op, so iterating `ops` and using `entry(...).or_insert(idx)`
+/// records the first (= only) definition. Used by the Phase 4 memory
+/// planner's greedy linear scan as the lower bound of each eligible
+/// tensor's lifetime.
+fn compute_tensor_first_use(ops: &[PlannedOp]) -> HashMap<String, usize> {
+    let mut first_use: HashMap<String, usize> = HashMap::new();
+    for (idx, op) in ops.iter().enumerate() {
+        for out_name in op.node.outputs.iter() {
+            if !out_name.is_empty() {
+                first_use.entry(out_name.clone()).or_insert(idx);
+            }
+        }
+    }
+    first_use
 }
 
 /// Sum the number of `None` entries across every shape in the map.

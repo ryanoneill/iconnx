@@ -6,6 +6,7 @@ pub mod elementwise_fusion;
 pub mod elementwise_fusion_codegen;
 pub mod folding_core;
 pub mod fusion;
+pub mod memory_planner;
 pub mod precompute;
 pub mod shape_extraction_folding;
 pub mod shape_inference;
@@ -17,6 +18,7 @@ pub use elementwise_fusion::{
     elementwise_fusion as elementwise_fusion_pass, fusion_annotations_from_graph,
 };
 pub use fusion::{FusionAnnotations, detect_fusion};
+pub use memory_planner::memory_planner;
 pub use precompute::precompute_params;
 pub use shape_extraction_folding::{shape_extraction_folding, ShapeExtractionFoldingCounts};
 pub use shape_inference::{shape_inference, tensor_shapes_from_graph};

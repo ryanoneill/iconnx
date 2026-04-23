@@ -19,7 +19,12 @@ use crate::cuda::context::IconnxCudaContext;
 use crate::cuda::inference::fusion::detect_fused_patterns;
 use crate::cuda::tensor::GpuTensor;
 use crate::ir::graph::GraphNode;
-use crate::ir::plan::OpKind;
+use crate::ir::plan::{MemoryPlan, OpKind};
+
+// Re-export the memory-plan types so integration tests can inspect
+// `memory_planner` output without reaching across the `pub(crate)`
+// boundary of `ir::plan`.
+pub use crate::ir::plan::{MemoryPlan as MemoryPlanSnapshot, PlannerClassification};
 
 // Re-export the pattern types on the testing surface so integration
 // tests can consume them without walking the private `fusion` submodule
@@ -228,6 +233,27 @@ fn increment(count: &mut PatternCount, pattern: &FusedPattern) {
         FusedPattern::DivMul { .. } => count.div_mul += 1,
         FusedPattern::GeneralChain { .. } => count.general_chain += 1,
     }
+}
+
+/// Snapshot of the executor's compiled [`MemoryPlan`] — a clone of the
+/// plan-level memory-plan produced by `memory_planner`. Forces
+/// compilation if the plan hasn't been built yet.
+///
+/// Returns `None` only if compilation itself failed to produce a plan
+/// (impossible under normal flow; the `compile()` call returns an error
+/// rather than a partial plan).
+///
+/// Used by the Phase 4 A1 Kokoro coverage + determinism tests to
+/// inspect the planner's output directly without requiring the runtime
+/// arena path (deferred to A2).
+pub fn get_memory_plan(
+    executor: &crate::cuda::inference::GpuGraphExecutor,
+) -> Option<MemoryPlan> {
+    executor
+        .compile()
+        .expect("compile executor graph for memory-plan snapshot");
+    let plan_ref = executor.compiled_plan();
+    plan_ref.as_ref().map(|p| p.memory_plan.clone())
 }
 
 /// Snapshot of shape_extraction_folding's per-pattern fold counts for
