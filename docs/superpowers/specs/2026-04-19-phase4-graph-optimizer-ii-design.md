@@ -537,6 +537,45 @@ None remaining. All architectural choices made in brainstorming dialogue with le
 
 ## Amendment history
 
+### 2026-04-22 (fourth refinement) — Attempt #2: fixpoint iteration of shape_inference ↔ shape_extraction_folding
+
+**Trigger.** Third-refinement's infer_reshape completion + Constant inferencer addition still measured `fold_counts.total = 1/124`. Diagnostic instrumentation across all 124 chains showed the blocker is pipeline-sequencing, not op-inferencer coverage: chains exit via `ConstantOfShape` / `Expand` / `LayerNormalization` outputs whose shapes depend on upstream `Shape → extraction` fragments that haven't folded yet. `shape_inference` runs once before `shape_extraction_folding`, so the folding pass sees a stale `tensor_shapes` map with `None` dims that would become `Some(_)` if the two passes iterated.
+
+**Attempt #2 mechanism: bounded fixpoint iteration.** Loop `shape_inference → tensor_shapes_from_graph → shape_extraction_folding` until no new folds produced. Monotonicity: each iteration can only add synthesized initializers (via the pass's fold) and refine `None → Some` dims (via shape_inference consuming the new initializers). Guaranteed termination by strict progress assertion.
+
+**Attempt-counter classification.** This IS attempt #2 of 3 — a legitimate architectural shift (changes how the pipeline runs, not just what it knows). Classifying it as attempt #1 continuation would make the three-attempt clause meaningless; holding the line now preserves the clause's discipline.
+
+**Scope bounds (Path A per leadline):**
+
+1. **3-iteration cap.** If fixpoint not reached within 3 loop iterations, abandon attempt #2, fall to Path B (mechanism-validated-via-unit-tests, Kokoro integration deferred).
+2. **Fixpoint confined to `shape_inference` + `shape_extraction_folding` only.** Do NOT generalize to other passes (e.g., `constant_folding`) in this amendment; generalized fixpoint is a separate design.
+3. **Termination assertion.** Loop asserts progress: each iteration must add ≥1 initializer OR refine ≥1 `None → Some`. If an iteration produces zero change before the 3-cap, break early (fixpoint reached). Catches monotonicity bugs and ensures explicit termination even under the cap.
+4. **Gate thresholds:** Green = `fold_counts.total == 124`; Amber = `60 ≤ total < 124` (investigate which chains still blocked, per-pattern breakdown); Red = `total < 60`. No further denominator recalibration — 124 is the concrete-shape ceiling measured at attempt #1's round 2 and is definitive.
+5. **Phase 5+ deferral plan** if attempt #2 fails and we fall to Path B: runtime specialization, symbolic-dim tracking, OR generalized fixpoint across `constant_folding + shape_inference + shape_extraction_folding` as the three candidate resolutions. Path B still lands all attempt-work (8 WIPs including infer_reshape + Constant inferencers, the 11-test mechanism, the Gather rank-0 bugfix); only the Kokoro `assert_eq!` becomes an `eprintln!` diagnostic.
+
+**Design sketch (in-tree, `lower()`):**
+
+```rust
+// Phase 4 B fixpoint iteration per spec §Amendment history "fourth refinement".
+const SHAPE_FOLDING_FIXPOINT_MAX_ITERATIONS: usize = 3;
+let mut tensor_shapes = tensor_shapes_from_graph(&graph);
+for _iter in 0..SHAPE_FOLDING_FIXPOINT_MAX_ITERATIONS {
+    let initializer_count_before = graph.initializers.len();
+    let none_dim_count_before = count_none_dims(&tensor_shapes);
+    graph = shape_extraction_folding(graph, &tensor_shapes);
+    tensor_shapes = tensor_shapes_from_graph(&graph);
+    let initializer_count_after = graph.initializers.len();
+    let none_dim_count_after = count_none_dims(&tensor_shapes);
+    let added_inits = initializer_count_after - initializer_count_before;
+    let resolved_dims = none_dim_count_before.saturating_sub(none_dim_count_after);
+    if added_inits == 0 && resolved_dims == 0 {
+        break;  // Fixpoint: no progress this iteration.
+    }
+}
+```
+
+`count_none_dims` is a helper summing `iter().filter(|d| d.is_none()).count()` across all tensor_shapes entries; added in this amendment.
+
 ### 2026-04-22 (third refinement) — Commit 2 continues attempt #1: complete infer_reshape's Phase 3 Known limitation
 
 **Trigger.** Second-refinement reframe (concrete-shape `add_input` loader) measured `fold_counts.total = 1/124` on Kokoro — not 124 as projected. Rejection-reason instrumentation showed 100 of 110 candidate Shape→Gather chains reject via `REJECT_NONE_DIM`: the extracted index (batch or seq_len) shows as `None` in `tensor_shapes`, EVEN THOUGH the caller seeded concrete `[Some(1), Some(5)]` for `tokens`.
