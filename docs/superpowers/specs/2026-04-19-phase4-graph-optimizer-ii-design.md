@@ -537,6 +537,23 @@ None remaining. All architectural choices made in brainstorming dialogue with le
 
 ## Amendment history
 
+### 2026-04-22 (third refinement) — Commit 2 continues attempt #1: complete infer_reshape's Phase 3 Known limitation
+
+**Trigger.** Second-refinement reframe (concrete-shape `add_input` loader) measured `fold_counts.total = 1/124` on Kokoro — not 124 as projected. Rejection-reason instrumentation showed 100 of 110 candidate Shape→Gather chains reject via `REJECT_NONE_DIM`: the extracted index (batch or seq_len) shows as `None` in `tensor_shapes`, EVEN THOUGH the caller seeded concrete `[Some(1), Some(5)]` for `tokens`.
+
+**Root cause.** `src/ir/passes/shape_inference.rs:220-227`: `infer_reshape` returns `Shape::new()` unconditionally ("Phase 3 spec §Commit #3 Known limitation"). In Kokoro's BERT path, `tokens → Gather(embed_weight) → Reshape → Gemm → Add(bias)`, the first Reshape zeros out shape propagation. Downstream `infer_gemm` sees one empty-rank input and returns `Shape::new()` too. Downstream `infer_add` broadcasts `empty + bias[1,1,768]` → `[None, None, Some(768)]`. Every intermediate from the BERT body onward has batch+seq_len dropped. Extraction chains landing on those intermediates then reject — not because Kokoro "extracts dynamic dims" (the second-refinement framing) but because `infer_reshape`'s stub made them look dynamic upstream.
+
+**Corrected diagnosis.** The 2026-04-22 second refinement was also incomplete. Attempt #1's "0/124 folds" and the 53-case structural ceiling were both downstream symptoms of the infer_reshape stub, not architectural facts about Kokoro. Completing infer_reshape unblocks the reframe.
+
+**Scope (Option A2 per leadline, bounded):**
+
+1. Extend `infer_reshape` to resolve its shape input when it's an initializer, reusing the same pattern `src/ir/passes/precompute.rs::precompute_reshape_shape` already uses (lookup in `graph.initializers`, read int64 values, resolve `0` placeholders against data shape, resolve single `-1` against data element count). Signature cascade: `infer_reshape` gains `&HashMap<String, Tensor>`; `infer_node_output_shapes` and `tensor_shapes_from_graph` plumb `&graph.initializers` through.
+2. Re-run the Kokoro gate. If `fold_counts.total == 124`, attempt #1 converges. If partial, escalate before expanding scope.
+3. **Pre-authorized:** fixing at most ONE additional op inferencer in this same attempt if infer_reshape unblocks most but not all chains. Three-or-more op fixes trigger a new spec amendment.
+4. Update `infer_reshape`'s in-code comment: "Phase 3 Known limitation — completed in Phase 4 B 2026-04-22" replaces the "constant_folding often resolves Reshape before this pass runs anyway" rationale (empirically false for Kokoro's runtime-shape-sourced Reshapes).
+
+**Attempt-count classification.** Still attempt #1. The three-attempt clause targets *mechanism pivots* (different predicate designs). Completing a Phase-3-acknowledged Known limitation in an upstream dependency isn't a mechanism pivot — it's finishing the work `shape_extraction_folding` legitimately assumed was already done. Counter stays at 1/3.
+
 ### 2026-04-22 (second refinement) — Commit 2 contract reframe: concrete-shape calling contract, deterministic gate
 
 **Trigger.** Implementer executed attempt #1 of the redesigned `shape_extraction_folding` pass (three patterns: Gather, Cast→Gather, Slice; all 11 unit tests green) and ran the structural gate. Measured `fold_counts.total = 0` of the projected ≥ 38 — deep Red. Instrumentation showed all 124 extraction-chain candidates on Kokoro target `batch` or `seq_len` (both `None` under ONNX-symbolic calling contract); 0 target the `Some(768)` hidden_dim. The 53-case denominator from the first 2026-04-22 amendment was a counting error (tensors with SOME concrete dim, without filtering for "and the extraction targets it").
