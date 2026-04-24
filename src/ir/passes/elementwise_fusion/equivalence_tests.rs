@@ -587,6 +587,98 @@ fn erf_chain_gelu_prefix_fuses_into_general_chain_matches_sequential() {
     assert_approx_eq("ErfChainGeneral", &fused_vals, &expected, 1e-5);
 }
 
+/// Relu-chain GeneralChain: a pure-unary chain containing `Relu`
+/// (`Sqrt → Relu → Tanh`) must fuse into a single
+/// `FusedPattern::GeneralChain` whose `chain_signature` carries
+/// "Relu" verbatim, and the fused output must match a sequential CPU
+/// reference at 1e-5 tolerance.
+///
+/// Note: Sqrt guarantees non-negative outputs on positive inputs, so
+/// Relu acts as an identity on the intermediate. The structural
+/// assertion (Relu accepted into `ELEMENTWISE_OPS` + `UNARY_ELEMENTWISE_OPS`,
+/// emitted by the codegen arm as `fmaxf(v, 0.0f)`, compiled into the
+/// NVRTC source, and landed as a `GeneralChain` in the plan) is still
+/// non-trivial — it exercises the whole Relu wiring path.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn relu_chain_fuses_into_general_chain_matches_sequential() {
+    use crate::ir::plan::OpKind;
+
+    // Positive inputs only — Sqrt rejects negatives.
+    let input_vals: Vec<f32> = (0..64).map(|i| 0.01 + (i as f32) * 0.05).collect();
+
+    let mut executor =
+        crate::cuda::inference::GpuGraphExecutor::new().expect("create executor");
+    executor.add_input("x".into(), vec![Some(64)]);
+    executor.add_node(
+        "sqrt_node",
+        "Sqrt",
+        vec!["x"],
+        vec!["sqrted"],
+        NodeAttributes::new(),
+    );
+    executor.add_node(
+        "relu_node",
+        "Relu",
+        vec!["sqrted"],
+        vec!["relud"],
+        NodeAttributes::new(),
+    );
+    executor.add_node(
+        "tanh_node",
+        "Tanh",
+        vec!["relud"],
+        vec!["out"],
+        NodeAttributes::new(),
+    );
+
+    // Force compilation and inspect the plan: expect at least one
+    // FusedHead(GeneralChain) whose chain_signature contains "Relu".
+    executor.compile().expect("compile");
+    let plan_ref = executor.compiled_plan();
+    let plan = plan_ref.as_ref().expect("plan present after compile");
+    let general_chains_with_relu: Vec<String> = plan
+        .ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FusedHead(FusedPattern::GeneralChain {
+                chain_signature, ..
+            }) if chain_signature.contains("Relu") => Some(chain_signature.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !general_chains_with_relu.is_empty(),
+        "expected FusedPattern::GeneralChain with 'Relu' in chain_signature on the \
+         pure-unary chain (Sqrt → Relu → Tanh). Fused annotations seen: {:?}",
+        plan.ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FusedHead(p) => Some(format!("{:?}", p)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+    drop(plan_ref);
+
+    // Run the fused graph end-to-end.
+    let mut inputs = HashMap::new();
+    inputs.insert(
+        "x".to_string(),
+        Tensor::from_vec_f32(input_vals.clone(), vec![64]),
+    );
+    let outputs = executor.run(inputs, vec!["out"]).expect("run fused");
+    let fused_vals = outputs.get("out").expect("out").as_slice();
+
+    // Sequential CPU reference: tanh(relu(sqrt(x))).
+    let expected: Vec<f32> = input_vals
+        .iter()
+        .map(|&x| crate::operators::relu::relu_f32(x.sqrt()).tanh())
+        .collect();
+
+    assert_approx_eq("ReluChainGeneral", &fused_vals, &expected, 1e-5);
+}
+
 /// Sanity: ensure the new pass does NOT demote a matched variant to
 /// `GeneralChain`. If this ever fires, the specialized kernel is being
 /// bypassed in favor of the slower NVRTC path.

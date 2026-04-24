@@ -43,6 +43,7 @@ pub mod pow;
 pub mod range;
 pub mod reduce_mean;
 pub mod reduce_sum;
+pub mod relu;
 pub mod reshape;
 pub mod resize;
 pub mod round;
