@@ -80,6 +80,53 @@ pub fn gpu_constant_of_shape_direct(
     Ok(output)
 }
 
+/// Int64 variant of [`gpu_constant_of_shape_direct`].
+///
+/// ONNX ConstantOfShape's output dtype is determined by the `value`
+/// attribute's dtype. When that attribute is Int64 — common after a
+/// Shape op whose output is Int64 by spec — this path allocates an
+/// Int64 output tensor and launches `fill_i64_kernel` instead of the
+/// f32 path. YOLOS-tiny's ViT embedding interpolation hit this case.
+pub fn gpu_constant_of_shape_direct_i64(
+    ctx: &IconnxCudaContext,
+    cache: &OpsKernelCache,
+    pool: &mut GpuMemoryPool,
+    target_shape: Vec<usize>,
+    value: i64,
+) -> Result<GpuTensor, CudaError> {
+    let total_elements: usize = target_shape.iter().product();
+
+    if total_elements == 0 {
+        return pool.get_tensor_i64(ctx, target_shape);
+    }
+
+    let mut output = pool.get_tensor_i64(ctx, target_shape)?;
+
+    // SAFETY: fill_i64_kernel takes (long long* out, long long value,
+    // size_t total_elements). CUDA's `long long` is int64 on all
+    // supported toolchains.
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, i64>,
+            i64,
+            usize,
+        )>("fill_i64_kernel")
+    }
+    .map_err(|e| CudaError::Kernel(format!("fill_i64_kernel lookup: {}", e)))?;
+
+    let config = garboard::LaunchConfig::for_num_elems(total_elements as u32);
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (output.data_i64_mut()?, value, total_elements),
+        )
+        .map_err(|e| CudaError::Kernel(format!("fill_i64_kernel launch failed: {}", e)))?;
+
+    Ok(output)
+}
+
 /// GPU 2D Transpose: [M, N] -> [N, M]
 pub fn gpu_transpose_2d(
     ctx: &IconnxCudaContext,

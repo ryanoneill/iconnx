@@ -22,14 +22,15 @@ use std::collections::HashMap;
 
 use crate::cuda::inference::{compute_broadcast_shape, maybe_expand};
 use crate::cuda::ops::{
-    gpu_cast, gpu_concat, gpu_constant_of_shape_direct, gpu_copy, gpu_cumsum, gpu_expand,
-    gpu_gather_from_gpu, gpu_nonzero, gpu_pad, gpu_range, gpu_range_i64, gpu_resize,
-    gpu_scatter_nd, gpu_shape, gpu_slice_nd, gpu_transpose_2d, gpu_transpose_nd, gpu_where,
-    ResizeCoordMode, ResizeMode, ResizeNearestMode,
+    gpu_cast, gpu_concat, gpu_constant_of_shape_direct, gpu_constant_of_shape_direct_i64, gpu_copy,
+    gpu_cumsum, gpu_expand, gpu_gather_from_gpu, gpu_nonzero, gpu_pad, gpu_range, gpu_range_i64,
+    gpu_resize, gpu_scatter_nd, gpu_shape, gpu_slice_nd, gpu_transpose_2d, gpu_transpose_nd,
+    gpu_where, ResizeCoordMode, ResizeMode, ResizeNearestMode,
 };
 use crate::cuda::tensor::DType;
 use crate::cuda::{CudaError, GpuTensor};
 use crate::ir::{ExecutionPlan, PlannedOp};
+use crate::tensor::Tensor;
 
 use super::{resolve_inputs, Executor};
 
@@ -153,12 +154,15 @@ impl Executor {
             }
 
             // --- ConstantOfShape: fill tensor of given shape with value ---
+            //
+            // ONNX spec: the `value` attribute (a scalar tensor) determines
+            // both the fill value AND the output dtype. When absent, the
+            // spec default is an f32 zero. YOLOS-tiny's ViT embedding
+            // interpolation produces ConstantOfShape nodes with an Int64
+            // `value` (its input is derived from Shape → …, which is Int64
+            // by spec); pre-fix that path hit `Tensor::as_slice()`'s
+            // "called on non-Float32 tensor" panic at tensor.rs:296.
             "ConstantOfShape" => {
-                let value = attributes
-                    .get_tensor("value")
-                    .map(|t| t.as_slice()[0])
-                    .unwrap_or(0.0f32);
-
                 let shape_name = input_names.first().map(|s| s.as_str()).unwrap_or("");
                 let target_shape: Vec<usize> = self
                     .get_or_fetch_i64(shape_name, inputs[0], plan)?
@@ -166,13 +170,49 @@ impl Executor {
                     .map(|&d| d as usize)
                     .collect();
 
-                gpu_constant_of_shape_direct(
-                    &self.ctx,
-                    &self.ops_kernels,
-                    &mut pool,
-                    target_shape,
-                    value,
-                )
+                match attributes.get_tensor("value") {
+                    None => {
+                        // Spec default: fill with f32 0.
+                        gpu_constant_of_shape_direct(
+                            &self.ctx,
+                            &self.ops_kernels,
+                            &mut pool,
+                            target_shape,
+                            0.0f32,
+                        )
+                    }
+                    Some(Tensor::Float32(_)) => {
+                        let value = attributes
+                            .get_tensor("value")
+                            .map(|t| t.as_slice()[0])
+                            .unwrap_or(0.0f32);
+                        gpu_constant_of_shape_direct(
+                            &self.ctx,
+                            &self.ops_kernels,
+                            &mut pool,
+                            target_shape,
+                            value,
+                        )
+                    }
+                    Some(Tensor::Int64(_)) => {
+                        let value = attributes
+                            .get_tensor("value")
+                            .map(|t| t.as_slice_i64()[0])
+                            .unwrap_or(0i64);
+                        gpu_constant_of_shape_direct_i64(
+                            &self.ctx,
+                            &self.ops_kernels,
+                            &mut pool,
+                            target_shape,
+                            value,
+                        )
+                    }
+                    Some(other) => Err(CudaError::Kernel(format!(
+                        "ConstantOfShape: unsupported `value` dtype {} \
+                         (supported: Float32, Int64)",
+                        other.dtype()
+                    ))),
+                }
             }
 
             // --- Transpose with perm-length repair -----------------------

@@ -74,6 +74,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "slice_4d_i64_scalar_kernel",
     "gather_i64_kernel",
     "fill_kernel",
+    "fill_i64_kernel",
 ];
 
 /// CUDA kernel source code
@@ -1561,6 +1562,18 @@ extern "C" __global__ void slice_4d_i64_scalar_kernel(
 // Fill kernel - fills array with constant value
 extern "C" __global__ void fill_kernel(
     float* out, float value, size_t total_elements
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    out[idx] = value;
+}
+
+// Int64 variant of fill_kernel. Needed for ONNX ConstantOfShape when the
+// `value` attribute carries an Int64 scalar (common after a Shape op
+// whose output is Int64 by spec). Using the f32 fill_kernel with a
+// reinterpret would be unsound; this kernel writes typed i64 values.
+extern "C" __global__ void fill_i64_kernel(
+    long long* out, long long value, size_t total_elements
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;

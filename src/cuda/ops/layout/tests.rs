@@ -81,6 +81,38 @@ fn test_constant_of_shape() {
 
 #[test]
 #[ignore = "requires CUDA GPU"]
+fn test_constant_of_shape_direct_i64_fills_with_int64_scalar() {
+    let (ctx, cache, mut pool) = setup();
+
+    // Target shape [3, 4] filled with i64 value 42.
+    let output = gpu_constant_of_shape_direct_i64(&ctx, &cache, &mut pool, vec![3, 4], 42)
+        .expect("gpu_constant_of_shape_direct_i64");
+    assert_eq!(output.shape(), &[3, 4]);
+    let result = output.to_host_i64(&ctx).expect("to_host_i64");
+    assert_eq!(result.len(), 12);
+    assert!(
+        result.iter().all(|&v| v == 42),
+        "expected all 42s, got {:?}",
+        result
+    );
+
+    // Negative value + 1-D shape.
+    let neg = gpu_constant_of_shape_direct_i64(&ctx, &cache, &mut pool, vec![5], -7)
+        .expect("gpu_constant_of_shape_direct_i64 negative");
+    assert_eq!(neg.shape(), &[5]);
+    let neg_result = neg.to_host_i64(&ctx).expect("to_host_i64");
+    assert!(neg_result.iter().all(|&v| v == -7));
+
+    // Zero-element target shape — takes the `total_elements == 0`
+    // early path. Must succeed without launching the kernel.
+    let empty = gpu_constant_of_shape_direct_i64(&ctx, &cache, &mut pool, vec![0], 1)
+        .expect("zero-element target shape");
+    assert_eq!(empty.shape(), &[0]);
+    assert_eq!(empty.to_host_i64(&ctx).unwrap().len(), 0);
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
 fn test_transpose_2d() {
     let (ctx, cache, mut pool) = setup();
 
