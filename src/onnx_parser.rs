@@ -273,6 +273,27 @@ impl OnnxModel {
             // ONNX dtype enum (see onnx.proto TensorProto.DataType).
             let data_type = tensor_proto.data_type.unwrap_or(1);
 
+            // Zero-element initializer fast path — empty data is the
+            // CORRECT representation, not corruption (same refinement as
+            // parse_tensor_proto; see the fix-zero-element-tensors commit).
+            if expected_len == 0 {
+                let tensor = match data_type {
+                    1 => crate::tensor::Tensor::from_vec_f32(Vec::new(), shape),
+                    7 => crate::tensor::Tensor::from_vec_i64(Vec::new(), shape),
+                    6 => crate::tensor::Tensor::from_vec_i32(Vec::new(), shape),
+                    11 => crate::tensor::Tensor::from_vec_f64(Vec::new(), shape),
+                    9 => crate::tensor::Tensor::from_vec_bool(Vec::new(), shape),
+                    other => {
+                        return Err(ParseError::UnsupportedInitializerDType {
+                            name,
+                            dtype_id: other,
+                        });
+                    }
+                };
+                weights.insert(name, tensor);
+                continue;
+            }
+
             let tensor = match data_type {
                 1 => {
                     // FLOAT (f32)
@@ -612,6 +633,24 @@ impl OnnxModel {
             shape.iter().product()
         };
         let data_type = tensor_proto.data_type.unwrap_or(1); // default to FLOAT
+
+        // Zero-element tensor fast path (e.g. dims = [0] or [0, 3]). Valid
+        // per ONNX spec: empty float_data / int_data / raw_data is the
+        // CORRECT representation, not corruption. Catches this case before
+        // the typed-data decoders reject `"empty raw_data for FLOAT tensor"`
+        // — the WS-1 M1.2 strict-mode refinement surfaced by YOLOS-tiny's
+        // `/vit/embeddings/interpolation/Constant_{2,3}` nodes.
+        if expected_len == 0 {
+            return match data_type {
+                1 => Ok(crate::tensor::Tensor::from_vec_f32(Vec::new(), shape)),
+                7 => Ok(crate::tensor::Tensor::from_vec_i64(Vec::new(), shape)),
+                6 => Ok(crate::tensor::Tensor::from_vec_i32(Vec::new(), shape)),
+                other => Err(ParseError::UnsupportedDType {
+                    name,
+                    dtype_id: other,
+                }),
+            };
+        }
 
         match data_type {
             1 => {
@@ -1069,6 +1108,150 @@ mod tests {
                 assert_eq!(dtype_id, 10);
             }
             other => panic!("expected UnsupportedDType, got {:?}", other),
+        }
+    }
+
+    // ---- Zero-element tensor strict-mode refinement -----------------
+    //
+    // Surfaced by YOLOS-tiny's
+    // `/vit/embeddings/interpolation/Constant_{2,3}` nodes, which carry
+    // FLOAT tensors with `dims = [0]` and empty float_data / raw_data /
+    // int_data. Per the ONNX spec this is a zero-element placeholder —
+    // the correct payload representation is "nothing to decode." WS-1
+    // M1.2's strict-mode check rejected this case as
+    // `InvalidTensorData { reason: "empty raw_data for FLOAT tensor" }`.
+    // The refinement distinguishes `expected_len == 0` (valid empty
+    // tensor) from `expected_len > 0 + no data` (genuine corruption).
+
+    #[test]
+    fn parse_tensor_proto_zero_element_float_succeeds() {
+        // Mirrors YOLOS-tiny's Constant_{2,3} attribute tensors.
+        let proto = onnx_proto::TensorProto {
+            name: Some("empty_float".to_string()),
+            data_type: Some(1), // FLOAT
+            dims: vec![0],
+            ..Default::default()
+        };
+        let tensor = OnnxModel::parse_tensor_proto(&proto).expect("zero-element FLOAT should parse");
+        match tensor {
+            Tensor::Float32(arr) => {
+                assert_eq!(arr.shape(), &[0]);
+                assert_eq!(arr.len(), 0);
+            }
+            other => panic!("expected Tensor::Float32, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_zero_element_int64_succeeds() {
+        let proto = onnx_proto::TensorProto {
+            name: Some("empty_i64".to_string()),
+            data_type: Some(7),
+            dims: vec![0],
+            ..Default::default()
+        };
+        let tensor = OnnxModel::parse_tensor_proto(&proto).expect("zero-element INT64 should parse");
+        match tensor {
+            Tensor::Int64(arr) => {
+                assert_eq!(arr.shape(), &[0]);
+                assert_eq!(arr.len(), 0);
+            }
+            other => panic!("expected Tensor::Int64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_zero_element_int32_succeeds() {
+        let proto = onnx_proto::TensorProto {
+            name: Some("empty_i32".to_string()),
+            data_type: Some(6),
+            dims: vec![0],
+            ..Default::default()
+        };
+        let tensor = OnnxModel::parse_tensor_proto(&proto).expect("zero-element INT32 should parse");
+        match tensor {
+            Tensor::Int32(arr) => {
+                assert_eq!(arr.shape(), &[0]);
+                assert_eq!(arr.len(), 0);
+            }
+            other => panic!("expected Tensor::Int32, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_zero_element_multi_dim_succeeds() {
+        // dims = [0, 3] — rank-2 tensor with zero rows; still
+        // zero elements, empty data is correct.
+        let proto = onnx_proto::TensorProto {
+            name: Some("empty_matrix".to_string()),
+            data_type: Some(1),
+            dims: vec![0, 3],
+            ..Default::default()
+        };
+        let tensor = OnnxModel::parse_tensor_proto(&proto).expect("zero-element matrix should parse");
+        match tensor {
+            Tensor::Float32(arr) => {
+                assert_eq!(arr.shape(), &[0, 3]);
+                assert_eq!(arr.len(), 0);
+            }
+            other => panic!("expected Tensor::Float32, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_nonempty_dims_with_no_data_still_errors() {
+        // Genuine corruption case: declared 3 elements but no payload.
+        // Must remain an error — the zero-element refinement only
+        // applies when expected_len == 0.
+        let proto = onnx_proto::TensorProto {
+            name: Some("corrupted".to_string()),
+            data_type: Some(1),
+            dims: vec![3],
+            ..Default::default()
+        };
+        match OnnxModel::parse_tensor_proto(&proto) {
+            Err(ParseError::InvalidTensorData { name, .. }) => {
+                assert_eq!(name, "corrupted");
+            }
+            other => panic!("expected InvalidTensorData, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_zero_element_unsupported_dtype_still_errors() {
+        // Zero-element refinement must not mask unsupported dtypes —
+        // an FP16 tensor with dims=[0] should still surface as
+        // UnsupportedDType rather than silently succeeding.
+        let proto = onnx_proto::TensorProto {
+            name: Some("empty_fp16".to_string()),
+            data_type: Some(10), // FP16 — WS-3 scope
+            dims: vec![0],
+            ..Default::default()
+        };
+        match OnnxModel::parse_tensor_proto(&proto) {
+            Err(ParseError::UnsupportedDType { name, dtype_id }) => {
+                assert_eq!(name, "empty_fp16");
+                assert_eq!(dtype_id, 10);
+            }
+            other => panic!("expected UnsupportedDType, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_weights_zero_element_initializer_succeeds() {
+        // Symmetric coverage for extract_weights — zero-element
+        // initializers are uncommon but valid per ONNX.
+        let init = init_proto("empty_init", 1, vec![0]);
+        let model = model_with_initializer(init);
+        let weights = model
+            .extract_weights()
+            .expect("zero-element initializer should load");
+        match weights.get("empty_init").unwrap() {
+            Tensor::Float32(arr) => {
+                assert_eq!(arr.shape(), &[0]);
+                assert_eq!(arr.len(), 0);
+            }
+            other => panic!("expected Tensor::Float32, got {:?}", other),
         }
     }
 }
