@@ -67,6 +67,7 @@ const KERNEL_NAMES: &[&str] = &[
     "mul_kernel",
     "mul_i64_kernel",
     "div_kernel",
+    "div_i64_kernel",
     // Activations
     "sigmoid_kernel",
     "tanh_kernel",
@@ -158,6 +159,20 @@ extern "C" __global__ void mul_i64_kernel(long long* out, const long long* a, co
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = a[i] * b[i];
+    }
+}
+
+// Int64 Div: CUDA's `/` on signed integers does truncating division toward
+// zero, matching C and ORT semantics for ONNX Div on integer tensors.
+// Guard against divide-by-zero by emitting 0 for those positions. CUDA
+// signed-integer div-by-zero is undefined behavior at the hardware level
+// (may trap and corrupt the context), so the guard is load-bearing even
+// though shape-arithmetic pipelines typically never hit the case.
+extern "C" __global__ void div_i64_kernel(long long* out, const long long* a, const long long* b, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        long long denom = b[i];
+        out[i] = (denom == 0) ? 0LL : (a[i] / denom);
     }
 }
 
@@ -715,6 +730,13 @@ pub fn gpu_mul(
 }
 
 /// GPU Div: out = a / b (elementwise).
+///
+/// Supports Float32 and Int64 dtypes. Int64 Div uses CUDA's truncating
+/// signed division (matching C / ORT semantics) and guards against
+/// divide-by-zero by emitting 0, since hardware signed-integer div-by-zero
+/// is undefined behavior. Added for WS-2 YOLOS-tiny: ViT's dynamic
+/// interpolation computes target patch-grid sizes via `Div(int64_dim,
+/// int64_scale)`.
 pub fn gpu_div(
     ctx: &IconnxCudaContext,
     kernels: &KernelCache,
@@ -724,17 +746,35 @@ pub fn gpu_div(
 ) -> Result<GpuTensor, CudaError> {
     assert_eq!(a.shape(), b.shape(), "Div: shapes must match");
     let n = a.len();
-    let mut out = pool.get_tensor_f32(ctx, a.shape().to_vec())?;
-    launch_binary_f32(
-        ctx,
-        kernels,
-        "div_kernel",
-        out.data_f32_mut()?,
-        a.data_f32()?,
-        b.data_f32()?,
-        n,
-    )?;
-    Ok(out)
+
+    match (a, b) {
+        (GpuTensor::Int64 { .. }, GpuTensor::Int64 { .. }) => {
+            let mut out = pool.get_tensor_i64(ctx, a.shape().to_vec())?;
+            launch_binary_i64(
+                ctx,
+                kernels,
+                "div_i64_kernel",
+                out.data_i64_mut()?,
+                a.data_i64()?,
+                b.data_i64()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        _ => {
+            let mut out = pool.get_tensor_f32(ctx, a.shape().to_vec())?;
+            launch_binary_f32(
+                ctx,
+                kernels,
+                "div_kernel",
+                out.data_f32_mut()?,
+                a.data_f32()?,
+                b.data_f32()?,
+                n,
+            )?;
+            Ok(out)
+        }
+    }
 }
 
 // =============================================================================
