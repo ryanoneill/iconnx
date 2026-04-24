@@ -97,6 +97,58 @@ impl Tensor {
         Tensor::Int32(array)
     }
 
+    /// Create Float64 tensor from flat vector and shape.
+    ///
+    /// Added in WS-1 M1.2 so `extract_weights` can represent ONNX
+    /// FLOAT64(11) initializers rather than silently dropping them.
+    pub fn from_vec_f64(data: Vec<f64>, shape: Vec<usize>) -> Self {
+        let expected_len: usize = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product()
+        };
+
+        if data.len() != expected_len {
+            panic!(
+                "Shape mismatch: data has {} elements but shape {:?} requires {}",
+                data.len(),
+                shape,
+                expected_len
+            );
+        }
+
+        let array = ArrayD::from_shape_vec(IxDyn(&shape), data)
+            .expect("Failed to create array from shape and data");
+
+        Tensor::Float64(array)
+    }
+
+    /// Create Bool tensor from flat vector and shape.
+    ///
+    /// Added in WS-1 M1.2 so `extract_weights` can represent ONNX
+    /// BOOL(9) initializers rather than silently dropping them.
+    pub fn from_vec_bool(data: Vec<bool>, shape: Vec<usize>) -> Self {
+        let expected_len: usize = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product()
+        };
+
+        if data.len() != expected_len {
+            panic!(
+                "Shape mismatch: data has {} elements but shape {:?} requires {}",
+                data.len(),
+                shape,
+                expected_len
+            );
+        }
+
+        let array = ArrayD::from_shape_vec(IxDyn(&shape), data)
+            .expect("Failed to create array from shape and data");
+
+        Tensor::Bool(array)
+    }
+
     /// Legacy: Create Float32 tensor (backward compatibility)
     pub fn from_vec(data: Vec<f32>, shape: Vec<usize>) -> Self {
         Self::from_vec_f32(data, shape)

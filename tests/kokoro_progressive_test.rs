@@ -13,7 +13,7 @@ use std::collections::HashMap;
 fn run_kokoro_first_n_nodes(n: usize) -> Result<(), String> {
     let model_path = common::kokoro_model::kokoro_model_path();
     let model = OnnxParser::parse_file(&model_path).map_err(|e| e.to_string())?;
-    let weights = model.extract_weights();
+    let weights = model.extract_weights().expect("extract weights");
     let graph = model.computation_graph().expect("parse computation graph");
     let nodes = graph.nodes();
 

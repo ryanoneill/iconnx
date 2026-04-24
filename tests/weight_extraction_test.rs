@@ -9,7 +9,7 @@ use iconnx::onnx_parser::OnnxParser;
 fn test_extract_kokoro_weights() {
     let model_path = common::kokoro_model::kokoro_model_path();
     let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
-    let weights = model.extract_weights();
+    let weights = model.extract_weights().expect("extract weights");
 
     println!("\n=== Weight Extraction ===");
     println!("Total weights extracted: {}", weights.len());

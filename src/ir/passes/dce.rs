@@ -166,7 +166,7 @@ mod tests {
         // `node_{i}` to match the pattern used by the `GpuGraphExecutor`
         // adapter in `tests/kokoro_inference_test.rs`.
         let mut builder = ir::OptimizableGraphBuilder::new();
-        for (name, tensor) in model.extract_weights() {
+        for (name, tensor) in model.extract_weights().expect("extract weights") {
             builder.add_initializer(name, tensor);
         }
         let graph_inputs = model.inputs();

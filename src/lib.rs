@@ -29,7 +29,7 @@
 //! let mut executor = GpuGraphExecutor::new()?;
 //!
 //! // Add model weights
-//! for (name, tensor) in model.extract_weights() {
+//! for (name, tensor) in model.extract_weights()? {
 //!     executor.add_initializer(name, &tensor)?;
 //! }
 //!

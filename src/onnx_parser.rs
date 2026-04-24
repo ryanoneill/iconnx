@@ -199,142 +199,227 @@ impl OnnxModel {
             .unwrap_or_default()
     }
 
-    /// Extract weight tensors from initializers
+    /// Extract weight tensors from initializers.
     ///
-    /// Returns a map of tensor name -> Tensor
-    /// Handles Float32, Int64, Int32 dtypes from ONNX
+    /// Returns a map of tensor name → Tensor. Supports ONNX dtypes
+    /// FLOAT(1), INT64(7), INT32(6), FLOAT64(11), and BOOL(9) —
+    /// the five dtypes currently representable by [`crate::tensor::Tensor`].
+    ///
+    /// Any other dtype (FP16=10, BF16=16, INT8=3, UINT8=2, INT16=5,
+    /// UINT16=4, UINT32=12, UINT64=13, the FLOAT*E* variants, …) is
+    /// surfaced as [`ParseError::UnsupportedInitializerDType`]
+    /// rather than silently dropped: the pre-WS-1 `#[cfg(debug_assertions)]
+    /// eprintln!` fallback produced release-mode-invisible weight
+    /// drops that corrupt downstream inference.
+    ///
+    /// Payload-decoding failures (bad raw_data length, no data at
+    /// all) are surfaced as [`ParseError::InvalidTensorData`].
     pub fn extract_weights(
         &self,
-    ) -> std::collections::HashMap<String, crate::tensor::Tensor> {
+    ) -> Result<std::collections::HashMap<String, crate::tensor::Tensor>, ParseError> {
         use std::collections::HashMap;
 
         let mut weights = HashMap::new();
 
-        if let Some(graph) = self.proto.graph.as_ref() {
-            for tensor_proto in &graph.initializer {
-                let name = tensor_proto.name.clone().unwrap_or_default();
+        let Some(graph) = self.proto.graph.as_ref() else {
+            return Ok(weights);
+        };
 
-                // Get shape
-                let shape: Vec<usize> = tensor_proto.dims.iter().map(|&d| d as usize).collect();
-                let expected_len: usize = if shape.is_empty() {
-                    1
-                } else {
-                    shape.iter().product()
-                };
+        for tensor_proto in &graph.initializer {
+            let name = tensor_proto.name.clone().unwrap_or_default();
 
-                // Determine dtype from ONNX data_type field
-                // https://github.com/onnx/onnx/blob/main/onnx/onnx.proto
-                // 1 = FLOAT, 6 = INT32, 7 = INT64
-                let data_type = tensor_proto.data_type.unwrap_or(1); // Default to FLOAT
+            // Declared shape + expected element count.
+            let shape: Vec<usize> = tensor_proto.dims.iter().map(|&d| d as usize).collect();
+            let expected_len: usize = if shape.is_empty() {
+                1
+            } else {
+                shape.iter().product()
+            };
 
-                let tensor_opt = match data_type {
-                    1 => {
-                        // FLOAT (f32)
-                        let data: Vec<f32> = if !tensor_proto.float_data.is_empty() {
-                            tensor_proto.float_data.clone()
-                        } else if let Some(raw) = &tensor_proto.raw_data {
-                            if !raw.is_empty() {
-                                raw.chunks_exact(4)
-                                    .map(|chunk| {
-                                        f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                                    })
-                                    .collect()
-                            } else {
-                                vec![]
-                            }
-                        } else {
-                            vec![]
-                        };
+            // ONNX dtype enum (see onnx.proto TensorProto.DataType).
+            let data_type = tensor_proto.data_type.unwrap_or(1);
 
-                        if !data.is_empty() {
-                            let final_shape =
-                                Self::correct_shape(&name, &shape, expected_len, data.len());
-                            Some(crate::tensor::Tensor::from_vec_f32(
-                                data,
-                                final_shape,
-                            ))
-                        } else {
-                            None
-                        }
-                    }
-                    7 => {
-                        // INT64 (i64)
-                        let data: Vec<i64> = if !tensor_proto.int64_data.is_empty() {
-                            tensor_proto.int64_data.clone()
-                        } else if let Some(raw) = &tensor_proto.raw_data {
-                            if !raw.is_empty() {
-                                raw.chunks_exact(8)
-                                    .map(|chunk| {
-                                        i64::from_le_bytes([
-                                            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4],
-                                            chunk[5], chunk[6], chunk[7],
-                                        ])
-                                    })
-                                    .collect()
-                            } else {
-                                vec![]
-                            }
-                        } else {
-                            vec![]
-                        };
-
-                        if !data.is_empty() {
-                            let final_shape =
-                                Self::correct_shape(&name, &shape, expected_len, data.len());
-                            Some(crate::tensor::Tensor::from_vec_i64(
-                                data,
-                                final_shape,
-                            ))
-                        } else {
-                            None
-                        }
-                    }
-                    6 => {
-                        // INT32 (i32)
-                        let data: Vec<i32> = if !tensor_proto.int32_data.is_empty() {
-                            tensor_proto.int32_data.clone()
-                        } else if let Some(raw) = &tensor_proto.raw_data {
-                            if !raw.is_empty() {
-                                raw.chunks_exact(4)
-                                    .map(|chunk| {
-                                        i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                                    })
-                                    .collect()
-                            } else {
-                                vec![]
-                            }
-                        } else {
-                            vec![]
-                        };
-
-                        if !data.is_empty() {
-                            let final_shape =
-                                Self::correct_shape(&name, &shape, expected_len, data.len());
-                            Some(crate::tensor::Tensor::from_vec_i32(
-                                data,
-                                final_shape,
-                            ))
-                        } else {
-                            None
-                        }
-                    }
-                    _ => {
-                        #[cfg(debug_assertions)]
-                        eprintln!(
-                            "Warning: Unsupported data_type {} for '{}', skipping",
-                            data_type, name
-                        );
-                        None
-                    }
-                };
-
-                if let Some(tensor) = tensor_opt {
-                    weights.insert(name, tensor);
+            let tensor = match data_type {
+                1 => {
+                    // FLOAT (f32)
+                    let data = Self::decode_f32_payload(&name, tensor_proto)?;
+                    let final_shape = Self::correct_shape(&name, &shape, expected_len, data.len());
+                    crate::tensor::Tensor::from_vec_f32(data, final_shape)
                 }
-            }
+                7 => {
+                    // INT64 (i64)
+                    let data = Self::decode_i64_payload(&name, tensor_proto)?;
+                    let final_shape = Self::correct_shape(&name, &shape, expected_len, data.len());
+                    crate::tensor::Tensor::from_vec_i64(data, final_shape)
+                }
+                6 => {
+                    // INT32 (i32)
+                    let data = Self::decode_i32_payload(&name, tensor_proto)?;
+                    let final_shape = Self::correct_shape(&name, &shape, expected_len, data.len());
+                    crate::tensor::Tensor::from_vec_i32(data, final_shape)
+                }
+                11 => {
+                    // DOUBLE (f64) — WS-1 M1.2 expansion.
+                    let data = Self::decode_f64_payload(&name, tensor_proto)?;
+                    let final_shape = Self::correct_shape(&name, &shape, expected_len, data.len());
+                    crate::tensor::Tensor::from_vec_f64(data, final_shape)
+                }
+                9 => {
+                    // BOOL — WS-1 M1.2 expansion. ONNX stores booleans
+                    // in either int32_data (one i32 per bool) or
+                    // raw_data (one byte per bool).
+                    let data = Self::decode_bool_payload(&name, tensor_proto)?;
+                    let final_shape = Self::correct_shape(&name, &shape, expected_len, data.len());
+                    crate::tensor::Tensor::from_vec_bool(data, final_shape)
+                }
+                other => {
+                    return Err(ParseError::UnsupportedInitializerDType {
+                        name,
+                        dtype_id: other,
+                    });
+                }
+            };
+
+            weights.insert(name, tensor);
         }
 
-        weights
+        Ok(weights)
+    }
+
+    fn decode_f32_payload(
+        name: &str,
+        tensor_proto: &onnx_proto::TensorProto,
+    ) -> Result<Vec<f32>, ParseError> {
+        if !tensor_proto.float_data.is_empty() {
+            return Ok(tensor_proto.float_data.clone());
+        }
+        let raw = tensor_proto.raw_data.as_ref().ok_or_else(|| ParseError::InvalidTensorData {
+            name: name.to_string(),
+            reason: "no float_data and no raw_data".to_string(),
+        })?;
+        if raw.is_empty() {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: "empty raw_data for FLOAT tensor".to_string(),
+            });
+        }
+        if raw.len() % 4 != 0 {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: format!("raw_data length {} not a multiple of 4 for FLOAT", raw.len()),
+            });
+        }
+        Ok(raw.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    fn decode_i64_payload(
+        name: &str,
+        tensor_proto: &onnx_proto::TensorProto,
+    ) -> Result<Vec<i64>, ParseError> {
+        if !tensor_proto.int64_data.is_empty() {
+            return Ok(tensor_proto.int64_data.clone());
+        }
+        let raw = tensor_proto.raw_data.as_ref().ok_or_else(|| ParseError::InvalidTensorData {
+            name: name.to_string(),
+            reason: "no int64_data and no raw_data".to_string(),
+        })?;
+        if raw.is_empty() {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: "empty raw_data for INT64 tensor".to_string(),
+            });
+        }
+        if raw.len() % 8 != 0 {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: format!("raw_data length {} not a multiple of 8 for INT64", raw.len()),
+            });
+        }
+        Ok(raw.chunks_exact(8)
+            .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect())
+    }
+
+    fn decode_i32_payload(
+        name: &str,
+        tensor_proto: &onnx_proto::TensorProto,
+    ) -> Result<Vec<i32>, ParseError> {
+        if !tensor_proto.int32_data.is_empty() {
+            return Ok(tensor_proto.int32_data.clone());
+        }
+        let raw = tensor_proto.raw_data.as_ref().ok_or_else(|| ParseError::InvalidTensorData {
+            name: name.to_string(),
+            reason: "no int32_data and no raw_data".to_string(),
+        })?;
+        if raw.is_empty() {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: "empty raw_data for INT32 tensor".to_string(),
+            });
+        }
+        if raw.len() % 4 != 0 {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: format!("raw_data length {} not a multiple of 4 for INT32", raw.len()),
+            });
+        }
+        Ok(raw.chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    fn decode_f64_payload(
+        name: &str,
+        tensor_proto: &onnx_proto::TensorProto,
+    ) -> Result<Vec<f64>, ParseError> {
+        if !tensor_proto.double_data.is_empty() {
+            return Ok(tensor_proto.double_data.clone());
+        }
+        let raw = tensor_proto.raw_data.as_ref().ok_or_else(|| ParseError::InvalidTensorData {
+            name: name.to_string(),
+            reason: "no double_data and no raw_data".to_string(),
+        })?;
+        if raw.is_empty() {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: "empty raw_data for DOUBLE tensor".to_string(),
+            });
+        }
+        if raw.len() % 8 != 0 {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: format!("raw_data length {} not a multiple of 8 for DOUBLE", raw.len()),
+            });
+        }
+        Ok(raw.chunks_exact(8)
+            .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect())
+    }
+
+    fn decode_bool_payload(
+        name: &str,
+        tensor_proto: &onnx_proto::TensorProto,
+    ) -> Result<Vec<bool>, ParseError> {
+        // ONNX carries BOOL in int32_data (one i32 per bool) when
+        // the type-specific path is used; each nonzero value means
+        // `true`. raw_data uses one byte per bool (again, nonzero
+        // = true).
+        if !tensor_proto.int32_data.is_empty() {
+            return Ok(tensor_proto.int32_data.iter().map(|&v| v != 0).collect());
+        }
+        let raw = tensor_proto.raw_data.as_ref().ok_or_else(|| ParseError::InvalidTensorData {
+            name: name.to_string(),
+            reason: "no int32_data and no raw_data".to_string(),
+        })?;
+        if raw.is_empty() {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: "empty raw_data for BOOL tensor".to_string(),
+            });
+        }
+        Ok(raw.iter().map(|&b| b != 0).collect())
     }
 
     /// Helper: Correct shape mismatches between ONNX metadata and actual data
@@ -731,6 +816,127 @@ mod tests {
                 assert_eq!(arr.iter().copied().collect::<Vec<_>>(), vec![-7]);
             }
             other => panic!("expected Tensor::Int32, got {:?}", other),
+        }
+    }
+
+    fn init_proto(
+        name: &str,
+        data_type: i32,
+        dims: Vec<i64>,
+    ) -> onnx_proto::TensorProto {
+        onnx_proto::TensorProto {
+            name: Some(name.to_string()),
+            data_type: Some(data_type),
+            dims,
+            ..Default::default()
+        }
+    }
+
+    /// Helper: build an `OnnxModel` carrying a single initializer
+    /// so we can exercise `extract_weights` without a real file.
+    fn model_with_initializer(init: onnx_proto::TensorProto) -> OnnxModel {
+        OnnxModel {
+            proto: onnx_proto::ModelProto {
+                graph: Some(onnx_proto::GraphProto {
+                    initializer: vec![init],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn extract_weights_decodes_float64_via_double_data() {
+        // FLOAT64 via double_data — exercises M1.2 dtype 11.
+        let mut init = init_proto("bias_f64", 11, vec![3]);
+        init.double_data = vec![1.0_f64, 2.5, -0.25];
+        let model = model_with_initializer(init);
+
+        let weights = model.extract_weights().expect("f64 initializer should load");
+        let tensor = weights.get("bias_f64").expect("tensor present");
+        match tensor {
+            Tensor::Float64(arr) => {
+                assert_eq!(arr.shape(), &[3]);
+                assert_eq!(arr.iter().copied().collect::<Vec<_>>(), vec![1.0, 2.5, -0.25]);
+            }
+            other => panic!("expected Tensor::Float64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_weights_decodes_float64_via_raw_data() {
+        let values: Vec<f64> = vec![0.0, 1.0, -1.0, 3.14];
+        let mut raw = Vec::with_capacity(values.len() * 8);
+        for v in &values {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut init = init_proto("weights_f64", 11, vec![values.len() as i64]);
+        init.raw_data = Some(raw);
+        let model = model_with_initializer(init);
+
+        let weights = model.extract_weights().expect("f64 raw_data should decode");
+        match weights.get("weights_f64").unwrap() {
+            Tensor::Float64(arr) => {
+                assert_eq!(arr.iter().copied().collect::<Vec<_>>(), values);
+            }
+            other => panic!("expected Tensor::Float64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_weights_decodes_bool_via_int32_data() {
+        // BOOL via int32_data — one i32 per bool, nonzero = true.
+        let mut init = init_proto("mask", 9, vec![4]);
+        init.int32_data = vec![0, 1, 0, 2];
+        let model = model_with_initializer(init);
+
+        let weights = model.extract_weights().expect("bool initializer should load");
+        match weights.get("mask").unwrap() {
+            Tensor::Bool(arr) => {
+                assert_eq!(arr.shape(), &[4]);
+                assert_eq!(
+                    arr.iter().copied().collect::<Vec<_>>(),
+                    vec![false, true, false, true]
+                );
+            }
+            other => panic!("expected Tensor::Bool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_weights_decodes_bool_via_raw_data() {
+        // BOOL via raw_data — one byte per bool.
+        let mut init = init_proto("flags", 9, vec![3]);
+        init.raw_data = Some(vec![0u8, 1u8, 0xFFu8]);
+        let model = model_with_initializer(init);
+
+        let weights = model.extract_weights().expect("bool raw_data should decode");
+        match weights.get("flags").unwrap() {
+            Tensor::Bool(arr) => {
+                assert_eq!(
+                    arr.iter().copied().collect::<Vec<_>>(),
+                    vec![false, true, true]
+                );
+            }
+            other => panic!("expected Tensor::Bool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_weights_unsupported_dtype_returns_error() {
+        // dtype 10 = FP16 — not representable in today's Tensor enum;
+        // must be an Err per WS-1, not silently dropped.
+        let mut init = init_proto("fp16_weights", 10, vec![4]);
+        init.raw_data = Some(vec![0u8; 8]);
+        let model = model_with_initializer(init);
+
+        match model.extract_weights() {
+            Err(ParseError::UnsupportedInitializerDType { name, dtype_id }) => {
+                assert_eq!(name, "fp16_weights");
+                assert_eq!(dtype_id, 10);
+            }
+            other => panic!("expected UnsupportedInitializerDType, got {:?}", other),
         }
     }
 

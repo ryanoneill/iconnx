@@ -46,7 +46,7 @@ fn build_kokoro_graph_same_as_executor() -> iconnx::ir::OptimizableGraph {
          shape-inference regressions — see Phase 3 Commit 3's Gather bug."
     );
     let model = OnnxParser::parse_file(model_path).expect("parse kokoro-v1.0.onnx");
-    let weights = model.extract_weights();
+    let weights = model.extract_weights().expect("extract weights");
     let graph = model.computation_graph().expect("parse computation graph");
     let nodes = graph.nodes();
 

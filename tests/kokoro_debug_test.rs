@@ -42,7 +42,7 @@ fn test_debug_first_10_nodes() {
 fn test_run_first_constant_nodes() {
     let model_path = common::kokoro_model::kokoro_model_path();
     let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
-    let weights = model.extract_weights();
+    let weights = model.extract_weights().expect("extract weights");
     let graph = model.computation_graph().expect("parse computation graph");
     let nodes = graph.nodes();
 
