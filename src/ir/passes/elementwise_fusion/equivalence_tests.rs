@@ -15,8 +15,6 @@
 //! Run with `cargo test --features cuda --release elementwise_fusion
 //! -- --include-ignored`.
 
-#![cfg(test)]
-
 use std::collections::HashMap;
 
 use crate::attributes::NodeAttributes;

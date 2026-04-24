@@ -2,6 +2,7 @@
 ///
 /// This is the ULTIMATE test - run the complete Kokoro model end-to-end
 #[path = "common/mod.rs"]
+#[allow(clippy::duplicate_mod)] // shared helper loaded via `#[path]` in multiple integration-test binaries
 mod common;
 
 use iconnx::graph_executor::GraphExecutor;

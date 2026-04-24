@@ -32,8 +32,8 @@ pub(crate) fn erf_f32(x: f32) -> f32 {
     let a = x.abs();
     let t = 1.0 / (1.0 + 0.3275911 * a);
     let y = 1.0
-        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
-            + 0.254829592)
+        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
             * t
             * (-a * a).exp();
     sign * y
@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn erf_matches_reference_at_half() {
         // High-precision reference: erf(0.5) ≈ 0.5204998778130465
-        let reference = 0.520_499_88_f32;
+        let reference = 0.520_499_9_f32;
         assert!(
             (erf_f32(0.5) - reference).abs() < 2e-7,
             "erf(0.5) = {} deviates from reference {} beyond 2e-7; \
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn erf_matches_reference_at_two_and_a_half() {
         // High-precision reference: erf(2.5) ≈ 0.9995930479825550
-        let reference = 0.999_593_05_f32;
+        let reference = 0.999_593_1_f32;
         assert!(
             (erf_f32(2.5) - reference).abs() < 2e-7,
             "erf(2.5) = {} deviates from reference {} beyond 2e-7",
@@ -164,9 +164,9 @@ mod tests {
         let out_vals = output.to_array();
         assert_eq!(out_vals.shape(), &[5]);
         assert!((out_vals[[0]] - 0.0_f32).abs() < 1e-6);
-        assert!((out_vals[[1]] - 0.520_499_88).abs() < 2e-7);
+        assert!((out_vals[[1]] - 0.520_499_9).abs() < 2e-7);
         assert!((out_vals[[2]] - 0.842_700_8).abs() < 1e-6);
-        assert!((out_vals[[3]] + 0.520_499_88).abs() < 2e-7);
+        assert!((out_vals[[3]] + 0.520_499_9).abs() < 2e-7);
         assert!((out_vals[[4]] + 0.842_700_8).abs() < 1e-6);
     }
 }

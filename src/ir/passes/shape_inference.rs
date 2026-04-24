@@ -284,7 +284,7 @@ fn infer_reshape(
 
     // Resolve a single `-1` using the known element count — requires
     // every dim of the data tensor to be known.
-    if resolved.iter().any(|&d| d == -1) {
+    if resolved.contains(&-1) {
         let data_shape = match data_shape_opt {
             Some(s) => s,
             None => return Shape::new(),
@@ -395,11 +395,11 @@ fn infer_concat(inputs: &[Shape], attrs: &NodeAttributes) -> Shape {
     let rank = inputs[0].len() as i64;
     let axis = if axis < 0 { axis + rank } else { axis } as usize;
     let mut out = inputs[0].clone();
-    for i in 1..inputs.len() {
-        if inputs[i].len() != out.len() {
+    for input in inputs.iter().skip(1) {
+        if input.len() != out.len() {
             return Shape::new();
         }
-        match (out.get(axis).copied().flatten(), inputs[i].get(axis).copied().flatten()) {
+        match (out.get(axis).copied().flatten(), input.get(axis).copied().flatten()) {
             (Some(a), Some(b)) => out[axis] = Some(a + b),
             _ => out[axis] = None,
         }
@@ -446,7 +446,7 @@ fn infer_gather(inputs: &[Shape], attrs: &NodeAttributes) -> Shape {
     let mut out: Shape = Vec::new();
     out.extend_from_slice(&data_shape[..axis]);
     out.extend_from_slice(indices_shape);
-    if axis + 1 <= data_shape.len() {
+    if axis < data_shape.len() {
         out.extend_from_slice(&data_shape[axis + 1..]);
     }
     out
@@ -594,7 +594,7 @@ fn infer_lstm(inputs: &[Shape], attrs: &NodeAttributes) -> Shape {
     let num_directions = match attrs.get_string("direction") {
         None => Some(1),
         Some(d) if d == "forward" || d == "reverse" => Some(1),
-        Some(d) if d == "bidirectional" => Some(2),
+        Some("bidirectional") => Some(2),
         Some(_) => return Shape::new(),
     };
     vec![seq_len, num_directions, batch, hidden_size.map(Some).unwrap_or(None)]

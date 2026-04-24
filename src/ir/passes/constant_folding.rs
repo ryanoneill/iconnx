@@ -102,7 +102,7 @@ mod tests {
         );
         let g = constant_folding(b.build());
         assert_eq!(g.nodes.len(), 1, "unknown op stays");
-        assert!(g.initializers.get("y").is_none());
+        assert!(!g.initializers.contains_key("y"));
     }
 
     #[test]
