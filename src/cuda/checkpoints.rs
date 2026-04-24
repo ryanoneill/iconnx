@@ -216,7 +216,7 @@ impl CheckpointManager {
 
         // Otherwise, use capture_every_nth
         if self.config.capture_every_nth > 0 {
-            return self.node_count % self.config.capture_every_nth == 0;
+            return self.node_count.is_multiple_of(self.config.capture_every_nth);
         }
 
         true
@@ -285,7 +285,7 @@ impl CheckpointManager {
             fs::create_dir_all(&gpu_dir)
                 .map_err(|e| CheckpointError::IoError(e.to_string()))?;
 
-            let safe_name = name.replace('/', "_").replace('\\', "_");
+            let safe_name = name.replace(['/', '\\'], "_");
             let tensor_path = gpu_dir.join(format!("{}.bin", safe_name));
             save_binary_f32(&tensor_path, &gpu_data)?;
         }

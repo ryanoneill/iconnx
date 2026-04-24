@@ -8,6 +8,7 @@
 /// We'll use Kokoro itself as the test model, but only execute
 /// a small subgraph that uses our implemented operators.
 #[path = "common/mod.rs"]
+#[allow(clippy::duplicate_mod)] // shared helper loaded via `#[path]` in multiple integration-test binaries
 mod common;
 
 use iconnx::graph_executor::GraphExecutor;

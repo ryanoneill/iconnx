@@ -551,7 +551,7 @@ mod tests {
         // iterations; if we had, it would mean the zero-progress early
         // break never fired.
         assert!(
-            iterations_executed < CAP + 1 && iterations_executed >= 1,
+            (1..CAP + 1).contains(&iterations_executed),
             "iterations_executed={} outside expected range [1, {}]",
             iterations_executed,
             CAP,

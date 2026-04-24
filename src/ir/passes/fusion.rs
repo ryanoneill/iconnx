@@ -82,7 +82,7 @@ mod tests {
         );
         b.add_initializer(
             "c_sqrt2pi".into(),
-            Tensor::from_vec_f32(vec![0.7978845608], vec![1]),
+            Tensor::from_vec_f32(vec![0.797_884_6], vec![1]),
         );
         b.add_initializer(
             "c_one".into(),

@@ -7,6 +7,7 @@
 
 #[cfg(feature = "debug-inference")]
 #[path = "common/mod.rs"]
+#[allow(clippy::duplicate_mod)] // shared helper loaded via `#[path]` in multiple integration-test binaries
 mod common;
 
 #[cfg(feature = "debug-inference")]

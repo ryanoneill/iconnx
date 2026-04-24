@@ -3,6 +3,7 @@
 /// TDD: These tests are written FIRST, before implementation.
 /// They define the behavior we expect from the ONNX parser.
 #[path = "common/mod.rs"]
+#[allow(clippy::duplicate_mod)] // shared helper loaded via `#[path]` in multiple integration-test binaries
 mod common;
 
 /// Test 1: Parse kokoro-v1.0.onnx file

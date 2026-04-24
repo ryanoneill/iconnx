@@ -174,11 +174,11 @@ mod tests {
     #[test]
     fn resolve_constant_value_reads_value_float() {
         let mut attrs = NodeAttributes::new();
-        attrs.add_float("value_float".to_string(), 3.14);
+        attrs.add_float("value_float".to_string(), 2.5);
         let t = attrs.resolve_constant_value().expect("value_float present");
         assert_eq!(t.shape(), &[] as &[usize]);
         let vals = t.to_array();
-        assert!((vals.as_slice().unwrap()[0] - 3.14_f32).abs() < 1e-6);
+        assert!((vals.as_slice().unwrap()[0] - 2.5_f32).abs() < 1e-6);
     }
 
     #[test]

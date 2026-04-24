@@ -88,15 +88,18 @@ fn precompute_slice(
     if node.inputs.len() < 3 {
         return None;
     }
-    let mut pre = PrecomputedSlice::default();
-    pre.starts = i64_by_name.get(&node.inputs[1]).cloned();
-    pre.ends = i64_by_name.get(&node.inputs[2]).cloned();
-    if let Some(ax_name) = node.inputs.get(3) {
-        pre.axes = i64_by_name.get(ax_name).cloned();
-    }
-    if let Some(st_name) = node.inputs.get(4) {
-        pre.steps = i64_by_name.get(st_name).cloned();
-    }
+    let pre = PrecomputedSlice {
+        starts: i64_by_name.get(&node.inputs[1]).cloned(),
+        ends: i64_by_name.get(&node.inputs[2]).cloned(),
+        axes: node
+            .inputs
+            .get(3)
+            .and_then(|ax_name| i64_by_name.get(ax_name).cloned()),
+        steps: node
+            .inputs
+            .get(4)
+            .and_then(|st_name| i64_by_name.get(st_name).cloned()),
+    };
     if pre.starts.is_none() && pre.ends.is_none() && pre.axes.is_none() && pre.steps.is_none() {
         None
     } else {
@@ -113,8 +116,8 @@ fn precompute_reshape_shape(
     let raw_shape = node.inputs.get(1).and_then(|n| i64_by_name.get(n)).cloned()?;
 
     // Fast path: no `0` placeholder AND no `-1` → nothing to pre-resolve.
-    let has_zero = raw_shape.iter().any(|&d| d == 0);
-    let has_neg_one = raw_shape.iter().any(|&d| d == -1);
+    let has_zero = raw_shape.contains(&0);
+    let has_neg_one = raw_shape.contains(&-1);
     if !has_zero && !has_neg_one {
         return Some(raw_shape);
     }

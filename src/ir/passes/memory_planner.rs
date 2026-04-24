@@ -2,9 +2,9 @@
 //!
 //! Runs after fusion annotation; consumes tensor_shapes + tensor_last_use
 //! + tensor_first_use + fusion annotations + graph I/O names. Produces a
-//! [`MemoryPlan`] that stamps `arena_offset: Option<usize>` onto each
-//! [`PlannedOp`], plus a summary of allocation decisions exposed via
-//! [`MemoryPlan::classification_counts`].
+//!   [`MemoryPlan`] that stamps `arena_offset: Option<usize>` onto each
+//!   [`PlannedOp`], plus a summary of allocation decisions exposed via
+//!   [`MemoryPlan::classification_counts`].
 //!
 //! Philosophy: coexist with `GpuMemoryPool`. Arena-eligible tensors
 //! (those passing [`is_planner_eligible`] AND not filtered as

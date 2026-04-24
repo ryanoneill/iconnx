@@ -446,7 +446,7 @@ mod tests {
         b.add_input("x".into(), vec![Some(4)]);
         b.add_initializer("exp3".into(), scalar(3.0));
         b.add_initializer("c_inner".into(), scalar(0.044715));
-        b.add_initializer("c_sqrt2pi".into(), scalar(0.7978845608));
+        b.add_initializer("c_sqrt2pi".into(), scalar(0.797_884_6));
         b.add_initializer("c_one".into(), scalar(1.0));
         b.add_initializer("c_half".into(), scalar(0.5));
         b.add_node(

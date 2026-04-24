@@ -102,7 +102,7 @@ impl DivergenceReport {
     /// Format as a human-readable string
     pub fn to_string_detailed(&self) -> String {
         let mut s = String::new();
-        s.push_str(&format!("\n=== Divergence Report ===\n"));
+        s.push_str("\n=== Divergence Report ===\n");
         s.push_str(&format!("Node: {} ({})\n", self.node_name, self.op_type));
         s.push_str(&format!(
             "Nodes executed before divergence: {}\n",
@@ -212,11 +212,13 @@ impl DifferentialRunner {
         output_name: &str,
     ) -> Result<Option<DivergenceReport>, DifferentialError> {
         // Configure checkpoint system
-        let mut config = CheckpointConfig::default();
-        config.base_dir = self.fixture_path.clone();
-        config.compare_to_ort = true;
-        config.correlation_threshold = self.tolerance.correlation_threshold;
-        config.max_diff_threshold = self.tolerance.max_abs_diff;
+        let config = CheckpointConfig {
+            base_dir: self.fixture_path.clone(),
+            compare_to_ort: true,
+            correlation_threshold: self.tolerance.correlation_threshold,
+            max_diff_threshold: self.tolerance.max_abs_diff,
+            ..CheckpointConfig::default()
+        };
 
         // Run with checkpoints
         match self

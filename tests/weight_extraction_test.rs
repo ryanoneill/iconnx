@@ -1,5 +1,6 @@
 /// Test weight extraction from ONNX models
 #[path = "common/mod.rs"]
+#[allow(clippy::duplicate_mod)] // shared helper loaded via `#[path]` in multiple integration-test binaries
 mod common;
 
 use iconnx::onnx_parser::OnnxParser;
