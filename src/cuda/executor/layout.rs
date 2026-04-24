@@ -644,14 +644,78 @@ impl Executor {
             }
 
             // --- Resize with coord/nearest/interp modes ------------------
+            //
+            // ONNX Resize opset 13+: inputs = [X, roi, scales, sizes].
+            // Exactly one of `scales` / `sizes` is populated; the other
+            // is a 0-element placeholder. Older opsets (10/11) take
+            // [X, scales] (2 inputs). When sizes is provided, we derive
+            // `scales[i] = sizes[i] / input.shape[i]` so the kernel
+            // path stays unchanged (all interp math is driven by scale
+            // factors; `round(input_shape * derived_scale)` recovers
+            // `sizes` exactly within f32 ulp).
             "Resize" => {
-                // Inputs: [X, roi, scales] or [X, roi, scales, sizes].
-                // scales_idx depends on how many non-empty inputs survived.
-                let scales_idx = if inputs.len() == 2 { 1 } else { 2 };
-                let scales = inputs[scales_idx].to_host_f32(&self.ctx)?;
+                let inp_shape = inputs[0].shape();
+                let ndim = inp_shape.len();
+
+                // Locate scales / sizes inputs by arity. iconnx preserves
+                // empty-name placeholders as 0-element tensors (WS-1 M1.2
+                // zero-element tensor fix), so the 4-input opset-13 shape
+                // is always visible here when the graph uses it.
+                let (scales_idx, sizes_idx) = match inputs.len() {
+                    2 => (Some(1), None),          // [X, scales]
+                    3 => (Some(2), None),          // [X, roi, scales]
+                    4 => (Some(2), Some(3)),       // [X, roi, scales, sizes]
+                    n => {
+                        return Err(CudaError::Kernel(format!(
+                            "Resize: expected 2-4 inputs, got {}",
+                            n
+                        )));
+                    }
+                };
+
+                let scales_from_input: Vec<f32> = match scales_idx {
+                    Some(i) => inputs[i].to_host_f32(&self.ctx)?,
+                    None => Vec::new(),
+                };
+                let sizes_from_input: Vec<i64> = match sizes_idx {
+                    Some(i) => inputs[i].to_host_i64(&self.ctx)?,
+                    None => Vec::new(),
+                };
+
+                // ONNX spec: exactly one of scales / sizes matches ndim;
+                // the other must be empty. Fail-fast on any deviation
+                // rather than silently picking one.
+                let scales: Vec<f32> = match (scales_from_input.len(), sizes_from_input.len()) {
+                    (s, 0) if s == ndim => scales_from_input,
+                    (0, z) if z == ndim => inp_shape
+                        .iter()
+                        .zip(sizes_from_input.iter())
+                        .map(|(&dim, &size)| size as f32 / dim as f32)
+                        .collect(),
+                    (0, 0) => {
+                        return Err(CudaError::Kernel(
+                            "Resize: both scales and sizes are empty; \
+                             exactly one must be provided per ONNX spec"
+                                .into(),
+                        ));
+                    }
+                    (s, z) if s > 0 && z > 0 => {
+                        return Err(CudaError::Kernel(format!(
+                            "Resize: both scales (len {}) and sizes (len {}) \
+                             are non-empty; exactly one must be per ONNX spec",
+                            s, z
+                        )));
+                    }
+                    (s, z) => {
+                        return Err(CudaError::Kernel(format!(
+                            "Resize: neither scales (len {}) nor sizes (len {}) \
+                             matches input ndim {}",
+                            s, z, ndim
+                        )));
+                    }
+                };
 
                 if std::env::var("DEBUG_RESIZE").is_ok() {
-                    let inp_shape = inputs[0].shape();
                     let out_shape: Vec<usize> = inp_shape
                         .iter()
                         .zip(scales.iter())
