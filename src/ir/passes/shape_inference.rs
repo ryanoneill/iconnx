@@ -107,8 +107,9 @@ fn infer_node_output_shapes(
         }
 
         // Unary pass-through.
-        "Sqrt" | "Exp" | "Erf" | "Sin" | "Cos" | "Tanh" | "Sigmoid" | "LeakyRelu" | "Atan"
-        | "Floor" | "Clip" | "Round" | "Cast" | "Softmax" | "LayerNormalization" | "Not" => {
+        "Sqrt" | "Exp" | "Erf" | "Sin" | "Cos" | "Tanh" | "Sigmoid" | "Relu" | "LeakyRelu"
+        | "Atan" | "Floor" | "Clip" | "Round" | "Cast" | "Softmax" | "LayerNormalization"
+        | "Not" => {
             let s = input_shapes.first().cloned().unwrap_or_default();
             vec![s]
         }
@@ -677,6 +678,25 @@ mod tests {
         let graph = b.build();
         let shapes = tensor_shapes_from_graph(&graph);
         assert_eq!(shapes.get("y").unwrap(), &vec![Some(4), Some(8)]);
+    }
+
+    #[test]
+    fn relu_propagates_shape() {
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("x".into(), vec![Some(1), Some(3), Some(224), Some(224)]);
+        b.add_node(
+            "relu_node",
+            "Relu",
+            vec!["x".into()],
+            vec!["y".into()],
+            NodeAttributes::new(),
+        );
+        let graph = b.build();
+        let shapes = tensor_shapes_from_graph(&graph);
+        assert_eq!(
+            shapes.get("y").unwrap(),
+            &vec![Some(1), Some(3), Some(224), Some(224)]
+        );
     }
 
     #[test]

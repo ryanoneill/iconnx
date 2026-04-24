@@ -81,6 +81,7 @@ fn emit_op(op_type: &str, attrs: &NodeAttributes) -> String {
         "Cos" => "    v = cosf(v);\n".into(),
         "Tanh" => "    v = tanhf(v);\n".into(),
         "Sigmoid" => "    v = 1.0f / (1.0f + expf(-v));\n".into(),
+        "Relu" => "    v = fmaxf(v, 0.0f);\n".into(),
         "Atan" => "    v = atanf(v);\n".into(),
         "Floor" => "    v = floorf(v);\n".into(),
         "Round" => "    v = roundf(v);\n".into(),
@@ -205,5 +206,12 @@ mod tests {
         let attrs = NodeAttributes::new();
         let src = emit_op("Erf", &attrs);
         assert_eq!(src, "    v = erff(v);\n");
+    }
+
+    #[test]
+    fn emit_op_produces_fmaxf_for_relu() {
+        let attrs = NodeAttributes::new();
+        let src = emit_op("Relu", &attrs);
+        assert_eq!(src, "    v = fmaxf(v, 0.0f);\n");
     }
 }

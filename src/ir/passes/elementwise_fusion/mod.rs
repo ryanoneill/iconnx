@@ -37,7 +37,7 @@ const CHAIN_CAP: usize = 8;
 /// match a specialized variant are dropped unfused.
 const ELEMENTWISE_OPS: &[&str] = &[
     "Add", "Sub", "Mul", "Div", "Pow", "Sqrt", "Exp", "Erf", "Sin", "Cos", "Tanh", "Sigmoid",
-    "LeakyRelu", "Atan", "Floor", "Clip", "Round",
+    "Relu", "LeakyRelu", "Atan", "Floor", "Clip", "Round",
 ];
 
 /// Subset of [`ELEMENTWISE_OPS`] that the single-input `GeneralChain`
@@ -45,8 +45,8 @@ const ELEMENTWISE_OPS: &[&str] = &[
 /// eligible for `GeneralChain` fallback; chains with a binary op that
 /// didn't match a specialized variant are dropped unfused.
 const UNARY_ELEMENTWISE_OPS: &[&str] = &[
-    "Sqrt", "Exp", "Erf", "Sin", "Cos", "Tanh", "Sigmoid", "LeakyRelu", "Atan", "Floor", "Clip",
-    "Round",
+    "Sqrt", "Exp", "Erf", "Sin", "Cos", "Tanh", "Sigmoid", "Relu", "LeakyRelu", "Atan", "Floor",
+    "Clip", "Round",
 ];
 
 /// Pure-function pass. Does not mutate `graph.nodes` — annotations are

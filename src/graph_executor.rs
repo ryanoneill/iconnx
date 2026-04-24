@@ -8,7 +8,7 @@ use crate::operators::{
     add, and, atan, cast, clip, concat, constant, constant_of_shape, conv, conv_transpose, cos,
     cumsum, div, equal, erf, exp, expand, floor, gather, gemm, greater, greater_or_equal,
     layer_normalization, leaky_relu, less, lstm, matmul, mul, nonzero, pad, pow, range,
-    reduce_mean, reduce_sum, reshape, resize, round, scatter_nd, shape, sigmoid, sin, slice,
+    reduce_mean, reduce_sum, relu, reshape, resize, round, scatter_nd, shape, sigmoid, sin, slice,
     softmax, sqrt, squeeze, stft, sub, tanh, transpose, unsqueeze, where_op,
 };
 use crate::tensor::Tensor;
@@ -367,6 +367,7 @@ impl GraphExecutor {
             "Sigmoid" => Ok(sigmoid::Sigmoid::forward(inputs, attributes)),
             "Sin" => Ok(sin::Sin::forward(inputs, attributes)),
             "Slice" => Ok(slice::Slice::forward(inputs, attributes)),
+            "Relu" => Ok(relu::Relu::forward(inputs, attributes)),
             "Softmax" => Ok(softmax::Softmax::forward(inputs, attributes)),
             "Sqrt" => Ok(sqrt::Sqrt::forward(inputs, attributes)),
             "Squeeze" => Ok(squeeze::Squeeze::forward(inputs, attributes)),

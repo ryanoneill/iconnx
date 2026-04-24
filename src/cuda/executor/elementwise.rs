@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use crate::cuda::inference::{compute_broadcast_shape, maybe_expand};
 use crate::cuda::kernels::{
     gpu_add, gpu_clip, gpu_cos, gpu_div, gpu_erf, gpu_exp, gpu_floor, gpu_leaky_relu, gpu_mul,
-    gpu_pow, gpu_round, gpu_sigmoid, gpu_sin, gpu_sqrt, gpu_sub, gpu_tanh,
+    gpu_pow, gpu_relu, gpu_round, gpu_sigmoid, gpu_sin, gpu_sqrt, gpu_sub, gpu_tanh,
 };
 use crate::cuda::ops::{
     gpu_atan, gpu_equal, gpu_greater, gpu_greater_or_equal, gpu_less, gpu_less_or_equal,
@@ -257,6 +257,7 @@ impl Executor {
             "Tanh" => gpu_tanh(&self.ctx, &self.elementwise_kernels, &mut pool, inputs[0]),
             "Erf" => gpu_erf(&self.ctx, &self.elementwise_kernels, &mut pool, inputs[0]),
             "Sigmoid" => gpu_sigmoid(&self.ctx, &self.elementwise_kernels, &mut pool, inputs[0]),
+            "Relu" => gpu_relu(&self.ctx, &self.elementwise_kernels, &mut pool, inputs[0]),
             "LeakyRelu" => {
                 let alpha = attrs.get_float("alpha").unwrap_or(0.01);
                 gpu_leaky_relu(

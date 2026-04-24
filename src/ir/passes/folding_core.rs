@@ -129,6 +129,7 @@ fn dispatch_cpu_forward(
         "Cos" => cos::Cos::forward(inputs, attributes),
         "Tanh" => tanh::Tanh::forward(inputs, attributes),
         "Erf" => erf::Erf::forward(inputs, attributes),
+        "Relu" => relu::Relu::forward(inputs, attributes),
         "Sigmoid" => sigmoid::Sigmoid::forward(inputs, attributes),
         "Atan" => atan::Atan::forward(inputs, attributes),
         "Clip" => clip::Clip::forward(inputs, attributes),
