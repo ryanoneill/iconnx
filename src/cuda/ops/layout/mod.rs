@@ -5,26 +5,6 @@ use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::memory_pool::GpuMemoryPool;
 use crate::cuda::tensor::GpuTensor;
 
-/// Prepend an op-name prefix to a dtype-accessor error so the resulting
-/// message reads e.g. `"Transpose: data_f32 called on int64 tensor"`
-/// instead of the accessor's raw
-/// `"data_f32 called on int64 tensor"`. Introduced for WS-2 / YOLOS-tiny
-/// diagnostic narrowing: when a layout op is handed a non-f32 tensor
-/// (typical for shape-info Int64 tensors flowing through Reshape /
-/// Concat / …), the error now tells us *which* op to extend next,
-/// rather than leaving a grep across ~30 `data_f32()` call sites to
-/// figure out where the failure came from.
-///
-/// Only rewrites `CudaError::Kernel` variants; other variants pass
-/// through unchanged so we never mask a non-dtype error behind a
-/// misleading op-name prefix.
-fn op_ctx<T>(op: &str, r: Result<T, CudaError>) -> Result<T, CudaError> {
-    r.map_err(|e| match e {
-        CudaError::Kernel(msg) => CudaError::Kernel(format!("{op}: {msg}")),
-        other => other,
-    })
-}
-
 /// GPU Shape operator: Returns tensor dimensions as Int64 tensor
 ///
 /// Takes any tensor and returns a 1D Int64 tensor containing its shape.
@@ -89,12 +69,11 @@ pub fn gpu_constant_of_shape_direct(
 
     let config = garboard::LaunchConfig::for_num_elems(total_elements as u32);
 
-    let out_slice = op_ctx("ConstantOfShape", output.data_f32_mut())?;
     kernel
         .launch(
             ctx.garboard_stream(),
             &config,
-            (out_slice, value, total_elements),
+            (output.data_f32_mut()?, value, total_elements),
         )
         .map_err(|e| CudaError::Kernel(format!("fill_kernel launch failed: {}", e)))?;
 
@@ -178,13 +157,11 @@ pub fn gpu_transpose_2d(
 
     let config = garboard::LaunchConfig::for_num_elems(total as u32);
 
-    let out_slice = op_ctx("Transpose", output.data_f32_mut())?;
-    let in_slice = op_ctx("Transpose", input.data_f32())?;
     kernel
         .launch(
             ctx.garboard_stream(),
             &config,
-            (out_slice, in_slice, rows, cols),
+            (output.data_f32_mut()?, input.data_f32()?, rows, cols),
         )
         .map_err(|e| CudaError::Kernel(format!("transpose_2d launch failed: {}", e)))?;
 
@@ -292,15 +269,13 @@ pub fn gpu_transpose_nd(
                 )>("transpose_general_kernel")
             }
             .map_err(|e| CudaError::Kernel(format!("transpose_general_kernel lookup: {}", e)))?;
-            let out_slice = op_ctx("Transpose", output.data_f32_mut())?;
-            let in_slice = op_ctx("Transpose", input.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
                     (
-                        out_slice,
-                        in_slice,
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
                         &in_shape_gpu,
                         &in_strides_gpu,
                         &out_strides_gpu,
@@ -441,15 +416,17 @@ pub fn gpu_where(
                 )>("where_kernel")
             }
             .map_err(|e| CudaError::Kernel(format!("where_kernel lookup: {}", e)))?;
-            let out_slice = op_ctx("Where", output.data_f32_mut())?;
-            let cond_slice = op_ctx("Where", condition.data_f32())?;
-            let x_slice = op_ctx("Where", x.data_f32())?;
-            let y_slice = op_ctx("Where", y.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
-                    (out_slice, cond_slice, x_slice, y_slice, n),
+                    (
+                        output.data_f32_mut()?,
+                        condition.data_f32()?,
+                        x.data_f32()?,
+                        y.data_f32()?,
+                        n,
+                    ),
                 )
                 .map_err(|e| CudaError::Kernel(format!("where launch failed: {}", e)))?;
             Ok(output)
@@ -468,14 +445,13 @@ pub fn gpu_where(
                 )>("where_i64_kernel")
             }
             .map_err(|e| CudaError::Kernel(format!("where_i64_kernel lookup: {}", e)))?;
-            let cond_slice = op_ctx("Where", condition.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
                     (
                         output.data_i64_mut()?,
-                        cond_slice,
+                        condition.data_f32()?,
                         x.data_i64()?,
                         y.data_i64()?,
                         n,
@@ -498,14 +474,13 @@ pub fn gpu_where(
                 )>("where_i32_kernel")
             }
             .map_err(|e| CudaError::Kernel(format!("where_i32_kernel lookup: {}", e)))?;
-            let cond_slice = op_ctx("Where", condition.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
                     (
                         output.data_i32_mut()?,
-                        cond_slice,
+                        condition.data_f32()?,
                         x.data_i32()?,
                         y.data_i32()?,
                         n,
@@ -578,15 +553,13 @@ pub fn gpu_gather(
                 )>("gather_kernel")
             }
             .map_err(|e| CudaError::Kernel(format!("gather_kernel lookup: {}", e)))?;
-            let out_slice = op_ctx("Gather", output.data_f32_mut())?;
-            let in_slice = op_ctx("Gather", input.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
                     (
-                        out_slice,
-                        in_slice,
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
                         &indices_gpu,
                         num_indices,
                         slice_size,
@@ -681,15 +654,13 @@ pub fn gpu_gather_from_gpu(
                 )>("gather_kernel")
             }
             .map_err(|e| CudaError::Kernel(format!("gather_kernel lookup: {}", e)))?;
-            let out_slice = op_ctx("Gather", output.data_f32_mut())?;
-            let in_slice = op_ctx("Gather", input.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
                     (
-                        out_slice,
-                        in_slice,
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
                         indices_tensor.data_i64()?,
                         num_indices,
                         slice_size,
@@ -766,13 +737,11 @@ pub fn gpu_slice_contiguous(
 
     let config = garboard::LaunchConfig::for_num_elems(length as u32);
 
-    let out_slice = op_ctx("Slice", output.data_f32_mut())?;
-    let in_slice = op_ctx("Slice", input.data_f32())?;
     kernel
         .launch(
             ctx.garboard_stream(),
             &config,
-            (out_slice, in_slice, start, length),
+            (output.data_f32_mut()?, input.data_f32()?, start, length),
         )
         .map_err(|e| CudaError::Kernel(format!("slice launch failed: {}", e)))?;
 
@@ -802,13 +771,11 @@ pub fn gpu_copy(
 
     let config = garboard::LaunchConfig::for_num_elems(n as u32);
 
-    let out_slice = op_ctx("Copy", output.data_f32_mut())?;
-    let in_slice = op_ctx("Copy", input.data_f32())?;
     kernel
         .launch(
             ctx.garboard_stream(),
             &config,
-            (out_slice, in_slice, n),
+            (output.data_f32_mut()?, input.data_f32()?, n),
         )
         .map_err(|e| CudaError::Kernel(format!("copy launch failed: {}", e)))?;
 
@@ -918,15 +885,13 @@ pub fn gpu_concat(
 
                 let config = garboard::LaunchConfig::for_num_elems(total_inp_elements as u32);
 
-                let out_slice = op_ctx("Concat", output.data_f32_mut())?;
-                let in_slice = op_ctx("Concat", inp.data_f32())?;
                 kernel
                     .launch(
                         ctx.garboard_stream(),
                         &config,
                         (
-                            out_slice,
-                            in_slice,
+                            output.data_f32_mut()?,
+                            inp.data_f32()?,
                             inp_offset,
                             inp_axis_size,
                             outer_size,
@@ -1134,15 +1099,13 @@ pub fn gpu_expand(
                 )>("expand_kernel")
             }
             .map_err(|e| CudaError::Kernel(format!("expand_kernel lookup: {}", e)))?;
-            let out_slice = op_ctx("Expand", output.data_f32_mut())?;
-            let in_slice = op_ctx("Expand", input.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
                     (
-                        out_slice,
-                        in_slice,
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
                         &out_shape_gpu,
                         &out_strides_gpu,
                         &inp_shape_gpu,
@@ -1375,13 +1338,17 @@ fn gpu_pad_constant(
             }
             .map_err(|e| CudaError::Kernel(format!("pad_3d_scalar_kernel lookup: {}", e)))?;
 
-            let out_slice = op_ctx("Pad", output.data_f32_mut())?;
-            let in_slice = op_ctx("Pad", input.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
-                    (out_slice, in_slice, &params_gpu, value, total_out_elements),
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &params_gpu,
+                        value,
+                        total_out_elements,
+                    ),
                 )
                 .map_err(|e| CudaError::Kernel(format!("pad_3d launch failed: {}", e)))?;
         }
@@ -1411,13 +1378,17 @@ fn gpu_pad_constant(
             }
             .map_err(|e| CudaError::Kernel(format!("pad_4d_scalar_kernel lookup: {}", e)))?;
 
-            let out_slice = op_ctx("Pad", output.data_f32_mut())?;
-            let in_slice = op_ctx("Pad", input.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
-                    (out_slice, in_slice, &params_gpu, value, total_out_elements),
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &params_gpu,
+                        value,
+                        total_out_elements,
+                    ),
                 )
                 .map_err(|e| CudaError::Kernel(format!("pad_4d launch failed: {}", e)))?;
         }
@@ -1451,15 +1422,13 @@ fn gpu_pad_constant(
             }
             .map_err(|e| CudaError::Kernel(format!("pad_kernel lookup: {}", e)))?;
 
-            let out_slice = op_ctx("Pad", output.data_f32_mut())?;
-            let in_slice = op_ctx("Pad", input.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
                     (
-                        out_slice,
-                        in_slice,
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
                         &inp_shape_gpu,
                         &out_shape_gpu,
                         &inp_strides_gpu,
@@ -1521,13 +1490,16 @@ fn gpu_pad_reflect(
             }
             .map_err(|e| CudaError::Kernel(format!("pad_reflect_3d_kernel lookup: {}", e)))?;
 
-            let out_slice = op_ctx("Pad", output.data_f32_mut())?;
-            let in_slice = op_ctx("Pad", input.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
-                    (out_slice, in_slice, &params_gpu, total_out_elements),
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        &params_gpu,
+                        total_out_elements,
+                    ),
                 )
                 .map_err(|e| CudaError::Kernel(format!("pad_reflect_3d launch failed: {}", e)))?;
         }
@@ -1560,15 +1532,13 @@ fn gpu_pad_reflect(
             }
             .map_err(|e| CudaError::Kernel(format!("pad_reflect_kernel lookup: {}", e)))?;
 
-            let out_slice = op_ctx("Pad", output.data_f32_mut())?;
-            let in_slice = op_ctx("Pad", input.data_f32())?;
             kernel
                 .launch(
                     ctx.garboard_stream(),
                     &config,
                     (
-                        out_slice,
-                        in_slice,
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
                         &inp_shape_gpu,
                         &out_shape_gpu,
                         &inp_strides_gpu,
@@ -1631,15 +1601,13 @@ fn gpu_pad_edge(
     }
     .map_err(|e| CudaError::Kernel(format!("pad_edge_kernel lookup: {}", e)))?;
 
-    let out_slice = op_ctx("Pad", output.data_f32_mut())?;
-    let in_slice = op_ctx("Pad", input.data_f32())?;
     kernel
         .launch(
             ctx.garboard_stream(),
             &config,
             (
-                out_slice,
-                in_slice,
+                output.data_f32_mut()?,
+                input.data_f32()?,
                 &inp_shape_gpu,
                 &out_shape_gpu,
                 &inp_strides_gpu,
@@ -1701,15 +1669,13 @@ pub fn gpu_scatter_nd(
     let total = num_updates * slice_size;
     let config = garboard::LaunchConfig::for_num_elems(total as u32);
 
-    let out_slice = op_ctx("ScatterND", output.data_f32_mut())?;
-    let upd_slice = op_ctx("ScatterND", updates.data_f32())?;
     kernel
         .launch(
             ctx.garboard_stream(),
             &config,
             (
-                out_slice,
-                upd_slice,
+                output.data_f32_mut()?,
+                updates.data_f32()?,
                 &indices_gpu,
                 &shape_gpu,
                 num_updates,
@@ -1837,8 +1803,8 @@ pub fn gpu_resize(
                             ctx.garboard_stream(),
                             &config,
                             (
-                                op_ctx("Resize", output.data_f32_mut())?,
-                                op_ctx("Resize", input.data_f32())?,
+                                output.data_f32_mut()?,
+                                input.data_f32()?,
                                 inp_shape[0], inp_shape[1], inp_shape[2],
                                 out_shape[0], out_shape[1], out_shape[2],
                                 inp_strides[0], inp_strides[1], inp_strides[2],
@@ -1877,8 +1843,8 @@ pub fn gpu_resize(
                             ctx.garboard_stream(),
                             &config,
                             (
-                                op_ctx("Resize", output.data_f32_mut())?,
-                                op_ctx("Resize", input.data_f32())?,
+                                output.data_f32_mut()?,
+                                input.data_f32()?,
                                 &params_gpu,
                                 scales[0], scales[1], scales[2], scales[3],
                                 total_out_elements,
@@ -1927,8 +1893,8 @@ pub fn gpu_resize(
                             ctx.garboard_stream(),
                             &config,
                             (
-                                op_ctx("Resize", output.data_f32_mut())?,
-                                op_ctx("Resize", input.data_f32())?,
+                                output.data_f32_mut()?,
+                                input.data_f32()?,
                                 &params_gpu,
                                 scales[0], scales[1], scales[2],
                                 total_out_elements,
@@ -1967,8 +1933,8 @@ pub fn gpu_resize(
                             ctx.garboard_stream(),
                             &config,
                             (
-                                op_ctx("Resize", output.data_f32_mut())?,
-                                op_ctx("Resize", input.data_f32())?,
+                                output.data_f32_mut()?,
+                                input.data_f32()?,
                                 &params_gpu,
                                 scales[0], scales[1], scales[2], scales[3],
                                 total_out_elements,
@@ -2012,8 +1978,8 @@ pub fn gpu_resize(
                             ctx.garboard_stream(),
                             &config,
                             (
-                                op_ctx("Resize", output.data_f32_mut())?,
-                                op_ctx("Resize", input.data_f32())?,
+                                output.data_f32_mut()?,
+                                input.data_f32()?,
                                 &inp_shape_gpu,
                                 &out_shape_gpu,
                                 &inp_strides_gpu,
@@ -2259,8 +2225,8 @@ pub fn gpu_slice_nd(
                     ctx.garboard_stream(),
                     &config,
                     (
-                        op_ctx("Slice", output.data_f32_mut())?,
-                        op_ctx("Slice", input.data_f32())?,
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
                         inp_strides[0] as u64,
                         inp_strides[1] as u64,
                         inp_strides[2] as u64,
@@ -2355,8 +2321,8 @@ pub fn gpu_slice_nd(
                     ctx.garboard_stream(),
                     &config,
                     (
-                        op_ctx("Slice", output.data_f32_mut())?,
-                        op_ctx("Slice", input.data_f32())?,
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
                         &strides_gpu,
                         &slice_gpu,
                         total_out_elements,
@@ -2436,8 +2402,8 @@ pub fn gpu_slice_nd(
                     ctx.garboard_stream(),
                     &config,
                     (
-                        op_ctx("Slice", output.data_f32_mut())?,
-                        op_ctx("Slice", input.data_f32())?,
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
                         &inp_strides_gpu,
                         &out_strides_gpu,
                         &starts_gpu,

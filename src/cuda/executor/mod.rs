@@ -157,7 +157,25 @@ impl Executor {
                 continue;
             }
 
-            let output = self.dispatch_op(op, &values, plan)?;
+            // Wrap dispatch_op errors with the failing op's type and first
+            // output name so the raw accessor message — e.g. `"data_f32
+            // called on int64 tensor"` — becomes diagnosable: the message
+            // reads `"Transpose (output=sqrted): data_f32 called on int64
+            // tensor"`. Captures every error from every downstream op
+            // wrapper (~143 `data_f32()` sites across 14 files) at a
+            // single choke point, which scales where per-site
+            // instrumentation doesn't. Only rewrites `CudaError::Kernel`
+            // variants so other error kinds pass through unchanged.
+            let output = self.dispatch_op(op, &values, plan).map_err(|e| match e {
+                CudaError::Kernel(msg) => {
+                    let out_name = op.node.outputs.first().cloned().unwrap_or_default();
+                    CudaError::Kernel(format!(
+                        "{} (output={}): {}",
+                        op.node.op_type, out_name, msg
+                    ))
+                }
+                other => other,
+            })?;
             store_outputs(
                 op,
                 output,
