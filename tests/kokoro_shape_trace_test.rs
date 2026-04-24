@@ -47,7 +47,7 @@ fn build_kokoro_graph_same_as_executor() -> iconnx::ir::OptimizableGraph {
     );
     let model = OnnxParser::parse_file(model_path).expect("parse kokoro-v1.0.onnx");
     let weights = model.extract_weights();
-    let graph = model.computation_graph();
+    let graph = model.computation_graph().expect("parse computation graph");
     let nodes = graph.nodes();
 
     let mut b = OptimizableGraphBuilder::new();

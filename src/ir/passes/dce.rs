@@ -177,7 +177,7 @@ mod tests {
         for name in &graph_outputs {
             builder.add_output(name.clone());
         }
-        let computation_graph = model.computation_graph();
+        let computation_graph = model.computation_graph().expect("parse kokoro graph");
         for (idx, node) in computation_graph.nodes().iter().enumerate() {
             builder.add_node(
                 format!("node_{}", idx),

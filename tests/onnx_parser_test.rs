@@ -92,7 +92,7 @@ fn test_list_unique_operators() {
 fn test_parse_computation_graph() {
     let model_path = common::kokoro_model::kokoro_model_path();
     let model = iconnx::onnx_parser::OnnxParser::parse_file(&model_path).unwrap();
-    let graph = model.computation_graph();
+    let graph = model.computation_graph().expect("parse computation graph");
 
     // Should have many nodes for a complex model like Kokoro
     let node_count = graph.node_count();

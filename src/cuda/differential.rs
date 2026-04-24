@@ -161,7 +161,9 @@ impl DifferentialRunner {
         })?;
 
         let weights = model.extract_weights();
-        let graph = model.computation_graph();
+        let graph = model.computation_graph().map_err(|e| {
+            DifferentialError::ModelLoad(format!("Failed to build computation graph: {}", e))
+        })?;
         let nodes = graph.nodes();
 
         // Create GPU executor

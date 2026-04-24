@@ -26,7 +26,7 @@ fn test_load_full_kokoro_model() {
     println!("✅ Weights extracted: {} tensors", weights.len());
 
     // Step 3: Get computation graph
-    let graph = model.computation_graph();
+    let graph = model.computation_graph().expect("parse computation graph");
     println!("✅ Graph loaded: {} nodes", graph.node_count());
 
     // Step 4: Build executor
@@ -72,7 +72,7 @@ fn test_run_minimal_kokoro_inference() {
     // Load and build executor (same as above)
     let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
     let weights = model.extract_weights();
-    let graph = model.computation_graph();
+    let graph = model.computation_graph().expect("parse computation graph");
 
     let mut executor = GraphExecutor::new();
     for (name, tensor) in weights {

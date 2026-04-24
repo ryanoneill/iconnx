@@ -30,7 +30,7 @@ fn setup_kokoro_executor() -> GpuGraphExecutor {
     let model_path = common::kokoro_model::kokoro_model_path();
     let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
     let weights = model.extract_weights();
-    let graph = model.computation_graph();
+    let graph = model.computation_graph().expect("parse computation graph");
     let nodes = graph.nodes();
 
     let mut executor = GpuGraphExecutor::new().expect("create CUDA executor");

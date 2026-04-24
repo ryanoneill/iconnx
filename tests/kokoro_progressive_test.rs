@@ -14,7 +14,7 @@ fn run_kokoro_first_n_nodes(n: usize) -> Result<(), String> {
     let model_path = common::kokoro_model::kokoro_model_path();
     let model = OnnxParser::parse_file(&model_path).map_err(|e| e.to_string())?;
     let weights = model.extract_weights();
-    let graph = model.computation_graph();
+    let graph = model.computation_graph().expect("parse computation graph");
     let nodes = graph.nodes();
 
     let mut executor = GraphExecutor::new();
@@ -110,7 +110,7 @@ fn test_run_first_100_nodes() {
 fn test_run_full_kokoro() {
     let model_path = common::kokoro_model::kokoro_model_path();
     let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
-    let graph = model.computation_graph();
+    let graph = model.computation_graph().expect("parse computation graph");
     let total_nodes = graph.nodes().len();
 
     println!("\n🚀 Testing FULL Kokoro model: {} nodes...", total_nodes);
