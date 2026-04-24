@@ -160,8 +160,10 @@ impl DifferentialRunner {
             DifferentialError::ModelLoad(format!("Failed to parse ONNX: {:?}", e))
         })?;
 
-        let weights = model.extract_weights();
-        let graph = model.computation_graph();
+        let weights = model.extract_weights().expect("extract weights");
+        let graph = model.computation_graph().map_err(|e| {
+            DifferentialError::ModelLoad(format!("Failed to build computation graph: {}", e))
+        })?;
         let nodes = graph.nodes();
 
         // Create GPU executor

@@ -70,7 +70,7 @@ fn test_find_executable_kokoro_subgraph() {
 
     // Load Kokoro
     let model = OnnxParser::parse_file(&model_path).expect("parse kokoro-v1.0.onnx");
-    let graph = model.computation_graph();
+    let graph = model.computation_graph().expect("parse computation graph");
     let nodes = graph.nodes();
 
     println!("\n=== Kokoro Graph Analysis ===");

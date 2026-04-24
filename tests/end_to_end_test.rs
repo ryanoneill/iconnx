@@ -92,7 +92,7 @@ fn test_load_kokoro_model_structure() {
     let outputs = model.outputs();
     let operators = model.list_unique_operators();
     let weights = model.list_weight_names();
-    let graph = model.computation_graph();
+    let graph = model.computation_graph().expect("parse computation graph");
 
     println!("\n=== Kokoro Model Structure ===");
     println!("Inputs: {:?}", inputs);

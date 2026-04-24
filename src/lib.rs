@@ -29,7 +29,7 @@
 //! let mut executor = GpuGraphExecutor::new()?;
 //!
 //! // Add model weights
-//! for (name, tensor) in model.extract_weights() {
+//! for (name, tensor) in model.extract_weights()? {
 //!     executor.add_initializer(name, &tensor)?;
 //! }
 //!
@@ -69,7 +69,7 @@ pub mod tensor;
 // Re-export commonly used types at crate root
 pub use attributes::NodeAttributes;
 pub use graph_executor::GraphExecutor;
-pub use onnx_parser::{OnnxModel, OnnxParser};
+pub use onnx_parser::{OnnxModel, OnnxParser, ParseError};
 pub use tensor::Tensor;
 
 #[cfg(feature = "cuda")]
