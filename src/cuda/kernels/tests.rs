@@ -86,6 +86,50 @@ fn test_gpu_div() {
 
 #[test]
 #[ignore] // Requires CUDA GPU
+fn test_gpu_div_i64() {
+    let (ctx, kernels, mut pool) = setup();
+
+    // Truncating signed division (matches C / ORT semantics):
+    //   10 / 3 =  3   (10 - 3*3 = 1 remainder, truncated toward zero)
+    //  -10 / 3 = -3   (-10 - 3*(-3) = -1 remainder, truncated toward zero)
+    //    7 / 2 =  3
+    //    8 / 2 =  4
+    let a_data = vec![10i64, -10, 7, 8];
+    let b_data = vec![3i64, 3, 2, 2];
+
+    let a = GpuTensor::from_host_i64(&ctx, &a_data, vec![4]).unwrap();
+    let b = GpuTensor::from_host_i64(&ctx, &b_data, vec![4]).unwrap();
+
+    let c = gpu_div(&ctx, &kernels, &mut pool, &a, &b).unwrap();
+    let result = c.to_host_i64(&ctx).unwrap();
+
+    assert_eq!(result, vec![3, -3, 3, 4]);
+}
+
+#[test]
+#[ignore] // Requires CUDA GPU
+fn test_gpu_div_i64_guards_divide_by_zero() {
+    // Hardware signed-integer div-by-zero is UB on CUDA (may trap and
+    // corrupt the stream). The kernel guards by emitting 0 for those
+    // positions. Shape-arithmetic pipelines never hit this case in
+    // practice, but the guard is load-bearing for safety.
+    let (ctx, kernels, mut pool) = setup();
+
+    let a_data = vec![10i64, 20, 30];
+    let b_data = vec![2i64, 0, 5];
+
+    let a = GpuTensor::from_host_i64(&ctx, &a_data, vec![3]).unwrap();
+    let b = GpuTensor::from_host_i64(&ctx, &b_data, vec![3]).unwrap();
+
+    let c = gpu_div(&ctx, &kernels, &mut pool, &a, &b).unwrap();
+    let result = c.to_host_i64(&ctx).unwrap();
+
+    // Expect: [10/2=5, 20/0=0 (guard), 30/5=6].
+    assert_eq!(result, vec![5, 0, 6]);
+}
+
+#[test]
+#[ignore] // Requires CUDA GPU
 fn test_gpu_sigmoid() {
     let (ctx, kernels, mut pool) = setup();
 
