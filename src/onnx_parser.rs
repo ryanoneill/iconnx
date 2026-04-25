@@ -714,8 +714,8 @@ impl OnnxModel {
                 7 => Ok(crate::tensor::Tensor::from_vec_i64(Vec::new(), shape)),
                 6 => Ok(crate::tensor::Tensor::from_vec_i32(Vec::new(), shape)),
                 9 => Ok(crate::tensor::Tensor::from_vec_bool(Vec::new(), shape)),
-                2 => Ok(crate::tensor::Tensor::from_vec_u8(Vec::new(), shape)),
                 3 => Ok(crate::tensor::Tensor::from_vec_i8(Vec::new(), shape)),
+                2 => Ok(crate::tensor::Tensor::from_vec_u8(Vec::new(), shape)),
                 other => Err(ParseError::UnsupportedDType {
                     name,
                     dtype_id: other,
@@ -1536,14 +1536,15 @@ mod tests {
 
     #[test]
     fn parse_tensor_proto_int8_via_raw_data() {
-        let raw: Vec<u8> = (-128_i8..=127).map(|v| v as u8).collect(); // wraps to two's complement
-        // Take just first 4 bytes for a small tensor.
-        let small: Vec<u8> = vec![0xFF, 0x00, 0x01, 0x7F]; // -1, 0, 1, 127
+        // Each byte is reinterpreted as i8 in two's-complement: 0xFF → -1,
+        // 0x00 → 0, 0x01 → 1, 0x7F → 127. Boundary value -128 (0x80) is
+        // covered separately by parse_tensor_proto_int8_via_int32_data.
+        let bytes: Vec<u8> = vec![0xFF, 0x00, 0x01, 0x7F];
         let proto = onnx_proto::TensorProto {
             name: Some("w".into()),
             data_type: Some(3),
             dims: vec![4],
-            raw_data: Some(small),
+            raw_data: Some(bytes),
             ..Default::default()
         };
         let tensor = OnnxModel::parse_tensor_proto(&proto).expect("INT8 raw_data");
@@ -1552,8 +1553,6 @@ mod tests {
         } else {
             panic!("expected Int8");
         }
-        // Suppress unused warning on raw helper:
-        let _ = raw;
     }
 
     #[test]
