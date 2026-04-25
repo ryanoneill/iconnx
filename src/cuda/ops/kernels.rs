@@ -75,6 +75,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "gather_i64_kernel",
     "fill_kernel",
     "fill_i64_kernel",
+    "max_pool_2d_kernel",
 ];
 
 /// CUDA kernel source code
@@ -1578,5 +1579,53 @@ extern "C" __global__ void fill_i64_kernel(
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;
     out[idx] = value;
+}
+
+// 2-D MaxPool over NCHW input. One thread per output element computes
+// the max over its receptive field. Padding is implemented by
+// out-of-bounds skip rather than zero-fill — `-CUDART_INF_F` would
+// otherwise creep in for fully-padded windows; in practice MaxPool
+// receptive fields always contain at least one in-bounds element for
+// the valid-output formula, but the skip-and-track-any guard is
+// load-bearing for ceil_mode windows that overhang the input edge.
+extern "C" __global__ void max_pool_2d_kernel(
+    float* out,
+    const float* inp,
+    size_t N, size_t C,
+    size_t iH, size_t iW,
+    size_t oH, size_t oW,
+    size_t kH, size_t kW,
+    size_t sH, size_t sW,
+    size_t pT, size_t pL,
+    size_t dH, size_t dW
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = N * C * oH * oW;
+    if (idx >= total) return;
+
+    size_t ow = idx % oW;
+    size_t oh = (idx / oW) % oH;
+    size_t c  = (idx / (oW * oH)) % C;
+    size_t n  =  idx / (oW * oH * C);
+
+    long long ih_start = (long long)(oh * sH) - (long long)pT;
+    long long iw_start = (long long)(ow * sW) - (long long)pL;
+
+    float maxv = -CUDART_INF_F;
+    bool any = false;
+
+    for (size_t ki = 0; ki < kH; ki++) {
+        long long ih = ih_start + (long long)(ki * dH);
+        if (ih < 0 || ih >= (long long)iH) continue;
+        for (size_t kj = 0; kj < kW; kj++) {
+            long long iw = iw_start + (long long)(kj * dW);
+            if (iw < 0 || iw >= (long long)iW) continue;
+            float v = inp[((n * C + c) * iH + (size_t)ih) * iW + (size_t)iw];
+            if (!any || v > maxv) maxv = v;
+            any = true;
+        }
+    }
+
+    out[((n * C + c) * oH + oh) * oW + ow] = any ? maxv : -CUDART_INF_F;
 }
 "#;

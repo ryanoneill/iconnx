@@ -2557,5 +2557,104 @@ pub fn gpu_split(
     Ok(outputs)
 }
 
+/// GPU 2-D MaxPool over a Float32 NCHW input.
+///
+/// Output shape per ONNX MaxPool's standard formula. ResNet-50 / YOLOS
+/// stem use `kernel=3, stride=2, pads=[1,1,1,1]` here. Padding is
+/// implemented as out-of-bounds skip rather than zero-fill (avoids
+/// the false `-inf` from a fully-padded window in ceil_mode edge
+/// cases).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_max_pool_2d(
+    ctx: &IconnxCudaContext,
+    cache: &OpsKernelCache,
+    pool: &mut GpuMemoryPool,
+    input: &GpuTensor,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_top: usize,
+    pad_left: usize,
+    pad_bottom: usize,
+    pad_right: usize,
+    dilation_h: usize,
+    dilation_w: usize,
+    ceil_mode: bool,
+) -> Result<GpuTensor, CudaError> {
+    let shape = input.shape();
+    if shape.len() != 4 {
+        return Err(CudaError::Kernel(format!(
+            "MaxPool: expected 4-D NCHW input, got rank {}",
+            shape.len()
+        )));
+    }
+    let n = shape[0];
+    let c = shape[1];
+    let ih = shape[2];
+    let iw = shape[3];
+
+    let out_dim = |in_dim: usize,
+                   kernel: usize,
+                   stride: usize,
+                   p_lo: usize,
+                   p_hi: usize,
+                   dilation: usize|
+     -> usize {
+        let effective_kernel = dilation * (kernel - 1) + 1;
+        let numerator = (in_dim + p_lo + p_hi).saturating_sub(effective_kernel);
+        if ceil_mode {
+            numerator.div_ceil(stride) + 1
+        } else {
+            numerator / stride + 1
+        }
+    };
+
+    let oh = out_dim(ih, kernel_h, stride_h, pad_top, pad_bottom, dilation_h);
+    let ow = out_dim(iw, kernel_w, stride_w, pad_left, pad_right, dilation_w);
+    let total: usize = n * c * oh * ow;
+
+    let mut output = pool.get_tensor_f32(ctx, vec![n, c, oh, ow])?;
+    if total == 0 {
+        return Ok(output);
+    }
+
+    // SAFETY: max_pool_2d_kernel signature is
+    //   (float* out, const float* inp,
+    //    size_t N, size_t C, size_t iH, size_t iW, size_t oH, size_t oW,
+    //    size_t kH, size_t kW, size_t sH, size_t sW,
+    //    size_t pT, size_t pL, size_t dH, size_t dW).
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, f32>,
+            usize, usize, usize, usize, usize, usize,
+            usize, usize, usize, usize,
+            usize, usize, usize, usize,
+        )>("max_pool_2d_kernel")
+    }
+    .map_err(|e| CudaError::Kernel(format!("max_pool_2d_kernel lookup: {}", e)))?;
+
+    let config = garboard::LaunchConfig::for_num_elems(total as u32);
+    let out_slice = output.data_f32_mut()?;
+    let in_slice = input.data_f32()?;
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (
+                out_slice, in_slice,
+                n, c, ih, iw, oh, ow,
+                kernel_h, kernel_w,
+                stride_h, stride_w,
+                pad_top, pad_left,
+                dilation_h, dilation_w,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("max_pool_2d launch failed: {}", e)))?;
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests;

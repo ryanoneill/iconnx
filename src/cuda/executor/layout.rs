@@ -23,9 +23,9 @@ use std::collections::HashMap;
 use crate::cuda::inference::{compute_broadcast_shape, maybe_expand};
 use crate::cuda::ops::{
     gpu_cast, gpu_concat, gpu_constant_of_shape_direct, gpu_constant_of_shape_direct_i64, gpu_copy,
-    gpu_cumsum, gpu_expand, gpu_gather_from_gpu, gpu_nonzero, gpu_pad, gpu_range, gpu_range_i64,
-    gpu_resize, gpu_scatter_nd, gpu_shape, gpu_slice_nd, gpu_transpose_2d, gpu_transpose_nd,
-    gpu_where, ResizeCoordMode, ResizeMode, ResizeNearestMode,
+    gpu_cumsum, gpu_expand, gpu_gather_from_gpu, gpu_max_pool_2d, gpu_nonzero, gpu_pad, gpu_range,
+    gpu_range_i64, gpu_resize, gpu_scatter_nd, gpu_shape, gpu_slice_nd, gpu_transpose_2d,
+    gpu_transpose_nd, gpu_where, ResizeCoordMode, ResizeMode, ResizeNearestMode,
 };
 use crate::cuda::tensor::DType;
 use crate::cuda::{CudaError, GpuTensor};
@@ -445,6 +445,39 @@ impl Executor {
                     &ends,
                     axes.as_deref(),
                     steps.as_deref(),
+                )
+            }
+
+            // --- MaxPool 2-D ---------------------------------------------
+            //
+            // Resolves attributes into 2-D pooling parameters via the
+            // CPU operator's helper (single source of truth) and
+            // launches the NVRTC `max_pool_2d_kernel`. ResNet-50 stem
+            // uses kernel=3, stride=2, pads=[1,1,1,1].
+            "MaxPool" => {
+                let p = crate::operators::max_pool::MaxPool::params_2d(attributes)
+                    .map_err(CudaError::Kernel)?;
+                if op.node.outputs.len() > 1 {
+                    return Err(CudaError::Kernel(
+                        "MaxPool: optional Indices output not supported".into(),
+                    ));
+                }
+                gpu_max_pool_2d(
+                    &self.ctx,
+                    &self.ops_kernels,
+                    &mut pool,
+                    inputs[0],
+                    p.kernel_h,
+                    p.kernel_w,
+                    p.stride_h,
+                    p.stride_w,
+                    p.pad_top,
+                    p.pad_left,
+                    p.pad_bottom,
+                    p.pad_right,
+                    p.dilation_h,
+                    p.dilation_w,
+                    p.ceil_mode,
                 )
             }
 

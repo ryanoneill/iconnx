@@ -179,6 +179,17 @@ fn infer_node_output_shapes(
         "ReduceMean" | "ReduceSum" => {
             vec![infer_reduce(&input_shapes, attrs)]
         }
+        "MaxPool" => {
+            // Output is [N, C, oH, oW] for 4-D input; spatial dims
+            // computed from kernel/stride/pad/dilation/ceil_mode.
+            // When N or C are unknown, propagate None.
+            let s = input_shapes.first().cloned().unwrap_or_default();
+            if s.len() != 4 {
+                vec![s]
+            } else {
+                vec![infer_max_pool_2d(&s, attrs)]
+            }
+        }
         "GlobalAveragePool" => {
             // Output shape is `[N, C, 1, 1, ...]`: batch and channel
             // preserved, every spatial dim collapsed to 1.
@@ -624,6 +635,35 @@ fn infer_lstm(inputs: &[Shape], attrs: &NodeAttributes) -> Shape {
         Some(_) => return Shape::new(),
     };
     vec![seq_len, num_directions, batch, hidden_size.map(Some).unwrap_or(None)]
+}
+
+/// Infer the output shape for ONNX MaxPool 2-D. Returns None for any
+/// dim that depends on an unknown input dim.
+fn infer_max_pool_2d(input_shape: &Shape, attrs: &NodeAttributes) -> Shape {
+    let kernel = attrs.get_ints("kernel_shape").map(|v| v.to_vec()).unwrap_or_default();
+    if kernel.len() != 2 {
+        return input_shape.clone();
+    }
+    let strides = attrs.get_ints("strides").map(|v| v.to_vec()).unwrap_or_else(|| vec![1, 1]);
+    let pads = attrs.get_ints("pads").map(|v| v.to_vec()).unwrap_or_else(|| vec![0, 0, 0, 0]);
+    let dilations = attrs.get_ints("dilations").map(|v| v.to_vec()).unwrap_or_else(|| vec![1, 1]);
+    let ceil_mode = attrs.get_int("ceil_mode").unwrap_or(0) != 0;
+
+    let out_dim = |d: Option<usize>, k: i64, s: i64, p_lo: i64, p_hi: i64, dil: i64| -> Option<usize> {
+        d.map(|in_dim| {
+            let effective_kernel = (dil * (k - 1) + 1) as usize;
+            let numerator = (in_dim + p_lo as usize + p_hi as usize).saturating_sub(effective_kernel);
+            if ceil_mode {
+                numerator.div_ceil(s as usize) + 1
+            } else {
+                numerator / s as usize + 1
+            }
+        })
+    };
+
+    let oh = out_dim(input_shape[2], kernel[0], strides[0], pads[0], pads[2], dilations[0]);
+    let ow = out_dim(input_shape[3], kernel[1], strides[1], pads[1], pads[3], dilations[1]);
+    vec![input_shape[0], input_shape[1], oh, ow]
 }
 
 /// Infer the 2-D output shape for ONNX Flatten. axis=1 by default;
