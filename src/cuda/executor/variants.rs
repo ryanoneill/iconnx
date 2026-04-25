@@ -114,15 +114,17 @@ impl Executor {
                 continue;
             }
 
-            let output = self
-                .dispatch_op(op, &values, plan)
+            let outputs_vec = self
+                .dispatch_op_multi(op, &values, plan)
                 .map_err(ValidationError::from)?;
 
             // Validate the primary output. For fused heads the "output
             // name" is the fused pattern's output_name (which is also
             // `op.node.outputs[0]` since the pattern head is the node
             // that produces the final output). For regular ops it's
-            // simply `op.node.outputs[0]`.
+            // simply `op.node.outputs[0]`. Multi-output ops (Split)
+            // also validate via their first output — extending the
+            // validator to all outputs is a separate concern.
             let validate_name = op
                 .node
                 .outputs
@@ -130,11 +132,13 @@ impl Executor {
                 .cloned()
                 .unwrap_or_default();
             let label = op_label(op);
-            validator.validate(&validate_name, &label, &output, &self.ctx)?;
+            if let Some(primary) = outputs_vec.first() {
+                validator.validate(&validate_name, &label, primary, &self.ctx)?;
+            }
 
             store_outputs(
                 op,
-                vec![output],
+                outputs_vec,
                 &mut values,
                 &mut tensor_groups,
                 &mut group_remaining,
@@ -217,11 +221,12 @@ impl Executor {
                 continue;
             }
 
-            let output = self.dispatch_op(op, &values, plan)?;
+            let outputs_vec = self.dispatch_op_multi(op, &values, plan)?;
 
             // Capture the checkpoint under the primary output name. For
             // fused heads this is the pattern's output_name; for regular
-            // ops it's simply the node's first output.
+            // ops it's simply the node's first output. Multi-output ops
+            // (Split) capture via their first output.
             let capture_name = op
                 .node
                 .outputs
@@ -229,13 +234,17 @@ impl Executor {
                 .cloned()
                 .unwrap_or_default();
             let label = op_label(op);
-            let _entry = checkpoint_mgr
-                .capture(&capture_name, &label, &output, &self.ctx)
-                .map_err(|e| CudaError::Kernel(format!("Checkpoint capture failed: {}", e)))?;
+            if let Some(primary) = outputs_vec.first() {
+                let _entry = checkpoint_mgr
+                    .capture(&capture_name, &label, primary, &self.ctx)
+                    .map_err(|e| {
+                        CudaError::Kernel(format!("Checkpoint capture failed: {}", e))
+                    })?;
+            }
 
             store_outputs(
                 op,
-                vec![output],
+                outputs_vec,
                 &mut values,
                 &mut tensor_groups,
                 &mut group_remaining,
@@ -326,23 +335,33 @@ impl Executor {
                 }
             }
 
-            let output = self.dispatch_op(op, &values, plan).map_err(|e| {
+            let outputs_vec = self.dispatch_op_multi(op, &values, plan).map_err(|e| {
                 CudaError::Kernel(format!(
                     "Node '{}' ({}): {} | Input shapes: {:?}",
                     op.node.name, op.node.op_type, e, input_shapes
                 ))
             })?;
 
-            // NaN check for Float32 outputs only. Today's path also
+            // NaN check + log of the primary output. Today's path also
             // downloads the data for extensive per-op diagnostic
             // printing; that tracing is debug-only and intentionally
             // elided here to keep the ported executor focused on the
-            // public logging contract.
-            let has_nan = if output.dtype() == DType::Float32 {
-                let data = output.to_host_f32(&self.ctx)?;
-                data.iter().any(|x| x.is_nan())
-            } else {
-                false
+            // public logging contract. Multi-output ops (Split) log
+            // via the first output; per-output logging is a separate
+            // concern.
+            let primary = outputs_vec.first();
+            let (has_nan, output_shape, output_dtype) = match primary {
+                Some(t) => {
+                    let has_nan = if t.dtype() == DType::Float32 {
+                        t.to_host_f32(&self.ctx)?
+                            .iter()
+                            .any(|x| x.is_nan())
+                    } else {
+                        false
+                    };
+                    (has_nan, t.shape().to_vec(), t.dtype().name().to_string())
+                }
+                None => (false, Vec::new(), String::new()),
             };
 
             execution_log.push(NodeExecutionLog {
@@ -350,14 +369,14 @@ impl Executor {
                 op_type: op_label(op),
                 input_shapes,
                 input_dtypes,
-                output_shape: output.shape().to_vec(),
-                output_dtype: output.dtype().name().to_string(),
+                output_shape,
+                output_dtype,
                 has_nan,
             });
 
             store_outputs(
                 op,
-                vec![output],
+                outputs_vec,
                 &mut values,
                 &mut tensor_groups,
                 &mut group_remaining,
@@ -459,7 +478,7 @@ impl Executor {
 
             let label = op_label(op);
             let op_start = Instant::now();
-            let output = self.dispatch_op(op, &values, plan)?;
+            let outputs_vec = self.dispatch_op_multi(op, &values, plan)?;
             let op_us = op_start.elapsed().as_micros() as u64;
 
             let entry = op_times.entry(label.clone()).or_insert((0, 0));
@@ -469,7 +488,7 @@ impl Executor {
 
             store_outputs(
                 op,
-                vec![output],
+                outputs_vec,
                 &mut values,
                 &mut tensor_groups,
                 &mut group_remaining,

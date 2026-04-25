@@ -177,18 +177,13 @@ impl Executor {
                 other => other,
             };
 
-            // Multi-output ops with genuinely distinct output tensors take a
-            // Vec<GpuTensor> path. Single-output and LSTM-style aliased
-            // multi-output (one buffer under multiple names) share the
-            // single-tensor path below.
-            let outputs_vec: Vec<GpuTensor> = match op.node.op_type.as_str() {
-                "Split" => self
-                    .dispatch_split(op, &values, plan)
-                    .map_err(dispatch_diag)?,
-                _ => vec![self
-                    .dispatch_op(op, &values, plan)
-                    .map_err(dispatch_diag)?],
-            };
+            // Multi-output-aware dispatch. `dispatch_op_multi` handles the
+            // Split → Vec<GpuTensor> routing and falls through to the
+            // single-output path for everyone else. Same helper is used
+            // by every variant in `variants.rs`.
+            let outputs_vec = self
+                .dispatch_op_multi(op, &values, plan)
+                .map_err(dispatch_diag)?;
             store_outputs(
                 op,
                 outputs_vec,
@@ -253,6 +248,29 @@ impl Executor {
             } else {
                 self.memory_pool.borrow_mut().return_tensor(tensor);
             }
+        }
+    }
+
+    /// Multi-output-aware dispatch wrapper. Returns `Vec<GpuTensor>`
+    /// with length 1 for single-output ops and length N for ops with
+    /// genuinely distinct multi-output tensors (Split today; future
+    /// TopK / NonMaxSuppression / beam-search ops can extend the
+    /// match). Single source of truth so all execution paths (the
+    /// main `Executor::run`, plus the 4 instrumented variants in
+    /// `variants.rs`) route Split identically — earlier the Split
+    /// arm was inlined only into the main loop, so profiled / logged
+    /// / checkpointed / validated runs fell through to
+    /// `dispatch_layout` and rejected with `"called with non-layout
+    /// op 'Split'"`.
+    pub(super) fn dispatch_op_multi(
+        &self,
+        op: &PlannedOp,
+        values: &HashMap<String, GpuTensor>,
+        plan: &ExecutionPlan,
+    ) -> Result<Vec<GpuTensor>, CudaError> {
+        match op.node.op_type.as_str() {
+            "Split" => self.dispatch_split(op, values, plan),
+            _ => Ok(vec![self.dispatch_op(op, values, plan)?]),
         }
     }
 
