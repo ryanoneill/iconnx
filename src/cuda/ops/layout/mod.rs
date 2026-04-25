@@ -748,7 +748,14 @@ pub fn gpu_slice_contiguous(
     Ok(output)
 }
 
-/// GPU Copy: Simple memory copy (Identity op)
+/// GPU Copy: Simple memory copy (Identity op).
+///
+/// Dtype-polymorphic over Float32 / Int64 / Int32. Identity-class
+/// memcpy with no math — same dispatch shape as the arithmetic ops
+/// (Add/Sub/Mul/Div) that already landed Int64 paths. Closes one
+/// audit L2.1 f32-strictness site: shape-arithmetic graphs that
+/// route Int64 tensors through an Identity node would otherwise
+/// hit `data_f32 called on int64 tensor` rejection.
 pub fn gpu_copy(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
@@ -756,30 +763,71 @@ pub fn gpu_copy(
     input: &GpuTensor,
 ) -> Result<GpuTensor, CudaError> {
     let n = input.len();
-
-    let mut output = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
-
-    // SAFETY: copy_kernel takes (float* out, const float* inp, size_t n).
-    let kernel = unsafe {
-        cache.module().typed_kernel::<(
-            &mut garboard::DeviceSlice<'_, f32>,
-            &garboard::DeviceSlice<'_, f32>,
-            usize,
-        )>("copy_kernel")
-    }
-    .map_err(|e| CudaError::Kernel(format!("copy_kernel lookup: {}", e)))?;
-
+    let shape = input.shape().to_vec();
     let config = garboard::LaunchConfig::for_num_elems(n as u32);
 
-    kernel
-        .launch(
-            ctx.garboard_stream(),
-            &config,
-            (output.data_f32_mut()?, input.data_f32()?, n),
-        )
-        .map_err(|e| CudaError::Kernel(format!("copy launch failed: {}", e)))?;
-
-    Ok(output)
+    match input {
+        GpuTensor::Float32 { .. } => {
+            let mut output = pool.get_tensor_f32(ctx, shape)?;
+            // SAFETY: copy_kernel takes (float* out, const float* inp, size_t n).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, f32>,
+                    usize,
+                )>("copy_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("copy_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (output.data_f32_mut()?, input.data_f32()?, n),
+                )
+                .map_err(|e| CudaError::Kernel(format!("copy launch failed: {}", e)))?;
+            Ok(output)
+        }
+        GpuTensor::Int64 { .. } => {
+            let mut output = pool.get_tensor_i64(ctx, shape)?;
+            // SAFETY: copy_i64_kernel takes (long long* out, const long long* inp, size_t n).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i64>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                )>("copy_i64_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("copy_i64_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (output.data_i64_mut()?, input.data_i64()?, n),
+                )
+                .map_err(|e| CudaError::Kernel(format!("copy_i64 launch failed: {}", e)))?;
+            Ok(output)
+        }
+        GpuTensor::Int32 { .. } => {
+            let mut output = pool.get_tensor_i32(ctx, shape)?;
+            // SAFETY: copy_i32_kernel takes (int* out, const int* inp, size_t n).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, i32>,
+                    &garboard::DeviceSlice<'_, i32>,
+                    usize,
+                )>("copy_i32_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("copy_i32_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (output.data_i32_mut()?, input.data_i32()?, n),
+                )
+                .map_err(|e| CudaError::Kernel(format!("copy_i32 launch failed: {}", e)))?;
+            Ok(output)
+        }
+    }
 }
 
 /// GPU Concat: Concatenate tensors along an axis

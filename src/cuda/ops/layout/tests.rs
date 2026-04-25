@@ -283,6 +283,37 @@ fn test_copy() {
 
 #[test]
 #[ignore = "requires CUDA GPU"]
+fn test_copy_i64_polymorphic() {
+    // gpu_copy must handle Int64 — shape-arithmetic graphs route Int64
+    // tensors through Identity nodes, which used to panic with
+    // `data_f32 called on int64 tensor`.
+    let (ctx, cache, mut pool) = setup();
+    let input_data: Vec<i64> = vec![10, -20, 30, -40, 50];
+    let input = GpuTensor::from_host_i64(&ctx, &input_data, vec![5]).unwrap();
+
+    let output = gpu_copy(&ctx, &cache, &mut pool, &input).unwrap();
+    let result = output.to_host_i64(&ctx).unwrap();
+
+    assert_eq!(result, input_data);
+    assert_eq!(output.shape(), input.shape());
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_copy_i32_polymorphic() {
+    let (ctx, cache, mut pool) = setup();
+    let input_data: Vec<i32> = vec![1, -2, 3, -4, 5];
+    let input = GpuTensor::from_host_i32(&ctx, &input_data, vec![5]).unwrap();
+
+    let output = gpu_copy(&ctx, &cache, &mut pool, &input).unwrap();
+    let result = output.to_host_i32(&ctx).unwrap();
+
+    assert_eq!(result, input_data);
+    assert_eq!(output.shape(), input.shape());
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
 fn test_concat() {
     let (ctx, cache, mut pool) = setup();
 
