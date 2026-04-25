@@ -99,20 +99,30 @@ impl DequantizeLinear {
         let zp_per_elem: Vec<f32> = match zp {
             None => vec![0.0_f32; total],
             Some(zp_tensor) => {
-                let zp_dtype = zp_tensor.dtype();
-                let zp_shape = zp_tensor.shape();
-                let zp_per_tensor =
-                    zp_shape.is_empty() || (zp_shape.len() == 1 && zp_shape == [1]);
-                if !per_tensor && !zp_per_tensor {
-                    assert_eq!(
-                        zp_shape,
-                        scale.shape(),
-                        "DequantizeLinear: zero_point shape {:?} must match \
-                         scale shape {:?}",
-                        zp_shape,
-                        scale.shape()
+                // ONNX DequantizeLinear requires zp.dtype == x.dtype and
+                // zp.shape == scale.shape (mirroring the GPU path's
+                // validation in src/cuda/ops/quantize.rs). Enforce both
+                // unconditionally — silent acceptance of malformed zp
+                // would mask broken graphs that ORT rejects upfront.
+                if zp_tensor.dtype() != x.dtype() {
+                    panic!(
+                        "DequantizeLinear: zero_point dtype {} must match \
+                         input dtype {}",
+                        zp_tensor.dtype(),
+                        x.dtype()
                     );
                 }
+                let zp_shape = zp_tensor.shape();
+                assert_eq!(
+                    zp_shape,
+                    scale.shape(),
+                    "DequantizeLinear: zero_point shape {:?} must match \
+                     scale shape {:?}",
+                    zp_shape,
+                    scale.shape()
+                );
+                let zp_per_tensor =
+                    zp_shape.is_empty() || (zp_shape.len() == 1 && zp_shape == [1]);
 
                 let zp_vec_f32: Vec<f32> = match zp_tensor {
                     Tensor::Int8(_) => zp_tensor
@@ -130,10 +140,9 @@ impl DequantizeLinear {
                         .into_iter()
                         .map(|v| v as f32)
                         .collect(),
-                    _ => panic!(
-                        "DequantizeLinear: zero_point dtype {} unsupported \
-                         (must be Int8, UInt8, or Int32)",
-                        zp_dtype
+                    _ => unreachable!(
+                        "zero_point dtype already validated to match x.dtype \
+                         (Int8/UInt8/Int32) above"
                     ),
                 };
 
@@ -262,5 +271,27 @@ mod tests {
         assert!((v[0] - 1.0).abs() < 1e-6);
         assert!((v[1] - (-0.5)).abs() < 1e-6);
         assert!((v[2] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "zero_point dtype")]
+    fn dequantize_zp_dtype_mismatch_panics() {
+        // ONNX requires zp.dtype == x.dtype. Mismatched dtypes must panic
+        // rather than silently coerce.
+        let x = Tensor::from_vec_i8(vec![1_i8, 2, 3], vec![3]);
+        let scale = Tensor::from_vec_f32(vec![0.1_f32], vec![]);
+        let zp = Tensor::from_vec_u8(vec![5_u8], vec![]); // u8, not i8
+        let _ = DequantizeLinear::forward(&[x, scale, zp], &NodeAttributes::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "zero_point shape")]
+    fn dequantize_zp_shape_mismatch_panics() {
+        // zp.shape must equal scale.shape. Per-tensor scalar scale + 1-D
+        // zp is rejected (not silently broadcast).
+        let x = Tensor::from_vec_i8(vec![1_i8, 2, 3, 4], vec![4]);
+        let scale = Tensor::from_vec_f32(vec![0.1_f32], vec![]); // scalar
+        let zp = Tensor::from_vec_i8(vec![0_i8, 1], vec![2]); // 1-D — mismatch
+        let _ = DequantizeLinear::forward(&[x, scale, zp], &NodeAttributes::new());
     }
 }

@@ -72,7 +72,10 @@ pub fn gpu_dequantize_linear(
         )));
     }
 
-    // `zp` must share dtype with `x` when supplied.
+    // `zp` must share dtype and shape with `scale` when supplied. ONNX
+    // DequantizeLinear requires zp.dtype == x.dtype and zp.shape ==
+    // scale.shape; silently coercing one would let a broken graph slip
+    // past iconnx that ORT would reject.
     if let Some(zp_t) = zp {
         if zp_t.dtype() != x.dtype() {
             return Err(CudaError::Kernel(format!(
@@ -82,16 +85,12 @@ pub fn gpu_dequantize_linear(
                 x.dtype().name()
             )));
         }
-        // Per-axis: zp shape must match scale shape (or be scalar).
-        let zp_shape = zp_t.shape();
-        let zp_per_tensor =
-            zp_shape.is_empty() || (zp_shape.len() == 1 && zp_t.len() == 1);
-        if !per_tensor && !zp_per_tensor && zp_t.len() != axis_size {
+        if zp_t.shape() != scale.shape() {
             return Err(CudaError::Kernel(format!(
-                "DequantizeLinear: per-axis zero_point length {} doesn't \
-                 match axis_size {}",
-                zp_t.len(),
-                axis_size
+                "DequantizeLinear: zero_point shape {:?} must match scale \
+                 shape {:?}",
+                zp_t.shape(),
+                scale.shape()
             )));
         }
     }
@@ -117,7 +116,10 @@ pub fn gpu_dequantize_linear(
                 }
                 None => Some(GpuTensor::zeros_i8(ctx, vec![axis_size])?),
             };
-            let zp_ref: &GpuTensor = zp_owned.as_ref().unwrap_or_else(|| zp.unwrap());
+            // zp_owned is `Some` when we synthesized a zeros buffer (zp = None)
+            // or broadcast a scalar zp to axis_size; `None` means the caller's
+            // zp already has axis_size elements and is used directly.
+            let zp_ref: &GpuTensor = zp_owned.as_ref().or(zp).expect("zp resolved");
             // SAFETY: signature matches `dequantize_linear_i8_kernel`.
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
@@ -165,7 +167,10 @@ pub fn gpu_dequantize_linear(
                 }
                 None => Some(GpuTensor::zeros_u8(ctx, vec![axis_size])?),
             };
-            let zp_ref: &GpuTensor = zp_owned.as_ref().unwrap_or_else(|| zp.unwrap());
+            // zp_owned is `Some` when we synthesized a zeros buffer (zp = None)
+            // or broadcast a scalar zp to axis_size; `None` means the caller's
+            // zp already has axis_size elements and is used directly.
+            let zp_ref: &GpuTensor = zp_owned.as_ref().or(zp).expect("zp resolved");
             // SAFETY: signature matches `dequantize_linear_u8_kernel`.
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
@@ -204,8 +209,7 @@ pub fn gpu_dequantize_linear(
             let zp_owned: Option<GpuTensor> = match zp {
                 Some(t) => {
                     if !per_tensor && t.len() == 1 {
-                        let host = ctx.dtoh(t.data_i32()?)?;
-                        // dtoh may return a bucket-sized vec; keep first elem.
+                        let host = t.to_host_i32(ctx)?;
                         let buf = vec![host[0]; axis_size];
                         Some(GpuTensor::from_host_i32(ctx, &buf, vec![axis_size])?)
                     } else {
@@ -217,7 +221,10 @@ pub fn gpu_dequantize_linear(
                     Some(GpuTensor::new_i32(zeros, vec![axis_size]))
                 }
             };
-            let zp_ref: &GpuTensor = zp_owned.as_ref().unwrap_or_else(|| zp.unwrap());
+            // zp_owned is `Some` when we synthesized a zeros buffer (zp = None)
+            // or broadcast a scalar zp to axis_size; `None` means the caller's
+            // zp already has axis_size elements and is used directly.
+            let zp_ref: &GpuTensor = zp_owned.as_ref().or(zp).expect("zp resolved");
             // SAFETY: signature matches `dequantize_linear_i32_kernel`.
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
