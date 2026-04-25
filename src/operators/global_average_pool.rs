@@ -75,6 +75,14 @@ fn reduce_mean_last_axis(t: Tensor, last_axis: usize) -> Tensor {
         Tensor::Bool(_) => {
             panic!("GlobalAveragePool does not support Bool inputs");
         }
+        Tensor::Int8(_) | Tensor::UInt8(_) => {
+            // ONNX GlobalAveragePool is defined over floating dtypes
+            // only in practice. INT8/UINT8 inputs would require a
+            // dequantize step upstream — which is exactly what the
+            // WS-4 quantization graph does (DequantizeLinear before
+            // any reduction).
+            panic!("GlobalAveragePool does not support {} inputs (dequantize first)", t.dtype());
+        }
     }
 }
 
@@ -95,6 +103,12 @@ fn reshape_preserving_dtype(t: Tensor, new_shape: Vec<usize>) -> Tensor {
         }
         Tensor::Bool(arr) => {
             Tensor::Bool(arr.into_shape_with_order(IxDyn(&new_shape)).expect("reshape bool"))
+        }
+        Tensor::Int8(arr) => {
+            Tensor::Int8(arr.into_shape_with_order(IxDyn(&new_shape)).expect("reshape i8"))
+        }
+        Tensor::UInt8(arr) => {
+            Tensor::UInt8(arr.into_shape_with_order(IxDyn(&new_shape)).expect("reshape u8"))
         }
     }
 }

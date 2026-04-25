@@ -1,7 +1,7 @@
 /// Tensor implementation for Iconnx
 ///
 /// Multi-dtype support for ONNX compatibility
-/// Supports: Float32, Float64, Int64, Int32, Bool
+/// Supports: Float32, Float64, Int64, Int32, Int8, UInt8, Bool
 use ndarray::{ArrayD, IxDyn};
 
 /// N-dimensional tensor with multiple data types
@@ -23,6 +23,10 @@ pub enum Tensor {
     Int32(ArrayD<i32>),
     /// Boolean (bool)
     Bool(ArrayD<bool>),
+    /// 8-bit signed integer (i8) — INT8 quantization weights / inputs.
+    Int8(ArrayD<i8>),
+    /// 8-bit unsigned integer (u8) — UINT8 quantization (DynamicQuantizeLinear output).
+    UInt8(ArrayD<u8>),
 }
 
 impl Tensor {
@@ -149,6 +153,58 @@ impl Tensor {
         Tensor::Bool(array)
     }
 
+    /// Create Int8 tensor from flat vector and shape.
+    ///
+    /// Added in WS-4 M4.1 for INT8 quantization support
+    /// (DistilBERT-INT8 weights / activations).
+    pub fn from_vec_i8(data: Vec<i8>, shape: Vec<usize>) -> Self {
+        let expected_len: usize = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product()
+        };
+
+        if data.len() != expected_len {
+            panic!(
+                "Shape mismatch: data has {} elements but shape {:?} requires {}",
+                data.len(),
+                shape,
+                expected_len
+            );
+        }
+
+        let array = ArrayD::from_shape_vec(IxDyn(&shape), data)
+            .expect("Failed to create array from shape and data");
+
+        Tensor::Int8(array)
+    }
+
+    /// Create UInt8 tensor from flat vector and shape.
+    ///
+    /// Added in WS-4 M4.1 for UINT8 quantization support
+    /// (DynamicQuantizeLinear output / DistilBERT-INT8 activations).
+    pub fn from_vec_u8(data: Vec<u8>, shape: Vec<usize>) -> Self {
+        let expected_len: usize = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product()
+        };
+
+        if data.len() != expected_len {
+            panic!(
+                "Shape mismatch: data has {} elements but shape {:?} requires {}",
+                data.len(),
+                shape,
+                expected_len
+            );
+        }
+
+        let array = ArrayD::from_shape_vec(IxDyn(&shape), data)
+            .expect("Failed to create array from shape and data");
+
+        Tensor::UInt8(array)
+    }
+
     /// Legacy: Create Float32 tensor (backward compatibility)
     pub fn from_vec(data: Vec<f32>, shape: Vec<usize>) -> Self {
         Self::from_vec_f32(data, shape)
@@ -179,6 +235,8 @@ impl Tensor {
             Tensor::Int64(_) => "int64",
             Tensor::Int32(_) => "int32",
             Tensor::Bool(_) => "bool",
+            Tensor::Int8(_) => "int8",
+            Tensor::UInt8(_) => "uint8",
         }
     }
 
@@ -197,6 +255,16 @@ impl Tensor {
         matches!(self, Tensor::Int32(_))
     }
 
+    /// Check if tensor is Int8
+    pub fn is_int8(&self) -> bool {
+        matches!(self, Tensor::Int8(_))
+    }
+
+    /// Check if tensor is UInt8
+    pub fn is_uint8(&self) -> bool {
+        matches!(self, Tensor::UInt8(_))
+    }
+
     // ========== Shape operations ==========
 
     /// Get tensor shape
@@ -207,6 +275,8 @@ impl Tensor {
             Tensor::Int64(a) => a.shape(),
             Tensor::Int32(a) => a.shape(),
             Tensor::Bool(a) => a.shape(),
+            Tensor::Int8(a) => a.shape(),
+            Tensor::UInt8(a) => a.shape(),
         }
     }
 
@@ -218,6 +288,8 @@ impl Tensor {
             Tensor::Int64(a) => a.ndim(),
             Tensor::Int32(a) => a.ndim(),
             Tensor::Bool(a) => a.ndim(),
+            Tensor::Int8(a) => a.ndim(),
+            Tensor::UInt8(a) => a.ndim(),
         }
     }
 
@@ -229,6 +301,8 @@ impl Tensor {
             Tensor::Int64(a) => a.len(),
             Tensor::Int32(a) => a.len(),
             Tensor::Bool(a) => a.len(),
+            Tensor::Int8(a) => a.len(),
+            Tensor::UInt8(a) => a.len(),
         }
     }
 
@@ -331,6 +405,59 @@ impl Tensor {
         }
     }
 
+    /// Get data as flat Int8 slice (panics if wrong type)
+    pub fn as_slice_i8(&self) -> Vec<i8> {
+        match self {
+            Tensor::Int8(a) => {
+                if let Some(slice) = a.as_slice() {
+                    slice.to_vec()
+                } else {
+                    a.iter().copied().collect()
+                }
+            }
+            _ => panic!(
+                "as_slice_i8() called on non-Int8 tensor ({})",
+                self.dtype()
+            ),
+        }
+    }
+
+    /// Get data as flat UInt8 slice (panics if wrong type)
+    pub fn as_slice_u8(&self) -> Vec<u8> {
+        match self {
+            Tensor::UInt8(a) => {
+                if let Some(slice) = a.as_slice() {
+                    slice.to_vec()
+                } else {
+                    a.iter().copied().collect()
+                }
+            }
+            _ => panic!(
+                "as_slice_u8() called on non-UInt8 tensor ({})",
+                self.dtype()
+            ),
+        }
+    }
+
+    /// Get reference to Int8 array (panics if wrong type)
+    pub fn to_array_i8(&self) -> &ArrayD<i8> {
+        match self {
+            Tensor::Int8(a) => a,
+            _ => panic!("to_array_i8() called on non-Int8 tensor ({})", self.dtype()),
+        }
+    }
+
+    /// Get reference to UInt8 array (panics if wrong type)
+    pub fn to_array_u8(&self) -> &ArrayD<u8> {
+        match self {
+            Tensor::UInt8(a) => a,
+            _ => panic!(
+                "to_array_u8() called on non-UInt8 tensor ({})",
+                self.dtype()
+            ),
+        }
+    }
+
     // ========== Type conversions ==========
 
     /// Convert to Float32 (creates copy if needed)
@@ -351,6 +478,14 @@ impl Tensor {
             }
             Tensor::Bool(a) => {
                 let data: Vec<f32> = a.iter().map(|&x| if x { 1.0 } else { 0.0 }).collect();
+                Tensor::from_vec_f32(data, a.shape().to_vec())
+            }
+            Tensor::Int8(a) => {
+                let data: Vec<f32> = a.iter().map(|&x| x as f32).collect();
+                Tensor::from_vec_f32(data, a.shape().to_vec())
+            }
+            Tensor::UInt8(a) => {
+                let data: Vec<f32> = a.iter().map(|&x| x as f32).collect();
                 Tensor::from_vec_f32(data, a.shape().to_vec())
             }
         }
@@ -374,6 +509,14 @@ impl Tensor {
             }
             Tensor::Bool(a) => {
                 let data: Vec<i64> = a.iter().map(|&x| if x { 1 } else { 0 }).collect();
+                Tensor::from_vec_i64(data, a.shape().to_vec())
+            }
+            Tensor::Int8(a) => {
+                let data: Vec<i64> = a.iter().map(|&x| x as i64).collect();
+                Tensor::from_vec_i64(data, a.shape().to_vec())
+            }
+            Tensor::UInt8(a) => {
+                let data: Vec<i64> = a.iter().map(|&x| x as i64).collect();
                 Tensor::from_vec_i64(data, a.shape().to_vec())
             }
         }
@@ -422,6 +565,18 @@ impl Tensor {
                 let result_i64 = i64_op(&as_i64);
                 Tensor::Bool(result_i64.mapv(|x| x != 0))
             }
+            Tensor::Int8(arr) => {
+                // Convert to i64, operate, convert back to i8
+                let as_i64 = arr.mapv(|x| x as i64);
+                let result_i64 = i64_op(&as_i64);
+                Tensor::Int8(result_i64.mapv(|x| x as i8))
+            }
+            Tensor::UInt8(arr) => {
+                // Convert to i64, operate, convert back to u8
+                let as_i64 = arr.mapv(|x| x as i64);
+                let result_i64 = i64_op(&as_i64);
+                Tensor::UInt8(result_i64.mapv(|x| x as u8))
+            }
         }
     }
 
@@ -466,5 +621,44 @@ impl Tensor {
             let arrays: Vec<&ArrayD<f32>> = as_f32.iter().map(|t| t.to_array()).collect();
             Tensor::Float32(f32_op(&arrays))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tensor_int8_constructor_and_accessors() {
+        let t = Tensor::from_vec_i8(vec![-128_i8, 0, 127], vec![3]);
+        assert_eq!(t.dtype(), "int8");
+        assert!(t.is_int8());
+        assert_eq!(t.shape(), &[3]);
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.as_slice_i8(), vec![-128_i8, 0, 127]);
+    }
+
+    #[test]
+    fn tensor_uint8_constructor_and_accessors() {
+        let t = Tensor::from_vec_u8(vec![0_u8, 128, 255], vec![3]);
+        assert_eq!(t.dtype(), "uint8");
+        assert!(t.is_uint8());
+        assert_eq!(t.as_slice_u8(), vec![0_u8, 128, 255]);
+    }
+
+    #[test]
+    fn tensor_int8_uint8_panic_on_wrong_accessor() {
+        let i8t = Tensor::from_vec_i8(vec![0_i8], vec![1]);
+        let result = std::panic::catch_unwind(|| i8t.as_slice_u8());
+        assert!(result.is_err(), "as_slice_u8 on Int8 must panic");
+    }
+
+    #[test]
+    fn tensor_int8_uint8_to_array_roundtrip() {
+        let i8t = Tensor::from_vec_i8(vec![1, -2, 3], vec![3]);
+        let arr = i8t.to_array_i8();
+        assert_eq!(arr.shape(), &[3]);
+        assert_eq!(arr[[0]], 1_i8);
+        assert_eq!(arr[[1]], -2_i8);
     }
 }

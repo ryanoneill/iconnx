@@ -98,6 +98,8 @@ impl Split {
             Tensor::Int64(arr) => slice_into(arr, axis, &sizes, Tensor::Int64),
             Tensor::Int32(arr) => slice_into(arr, axis, &sizes, Tensor::Int32),
             Tensor::Bool(arr) => slice_into(arr, axis, &sizes, Tensor::Bool),
+            Tensor::Int8(arr) => slice_into(arr, axis, &sizes, Tensor::Int8),
+            Tensor::UInt8(arr) => slice_into(arr, axis, &sizes, Tensor::UInt8),
         }
     }
 }
