@@ -60,6 +60,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     "cumsum_i64_kernel",
     "cumsum_i32_kernel",
     "copy_kernel",
+    "copy_i64_kernel",
+    "copy_i32_kernel",
     "resize_nearest_kernel",
     "resize_3d_scalar_kernel",
     "resize_4d_scalar_kernel",
@@ -994,6 +996,22 @@ extern "C" __global__ void cumsum_i32_kernel(
 
 // Copy: Simple memory copy
 extern "C" __global__ void copy_kernel(float* out, const float* inp, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = inp[idx];
+}
+
+// Int64 / Int32 variants. Identity-class memcpy on integer tensors —
+// shape-arithmetic graphs propagate Int64 indices through Identity
+// nodes, which would have hit data_f32's "called on int64 tensor"
+// rejection pre-fix.
+extern "C" __global__ void copy_i64_kernel(long long* out, const long long* inp, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = inp[idx];
+}
+
+extern "C" __global__ void copy_i32_kernel(int* out, const int* inp, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     out[idx] = inp[idx];
