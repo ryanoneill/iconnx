@@ -196,6 +196,12 @@ fn infer_node_output_shapes(
             vec![infer_lstm(&input_shapes, attrs)]
         }
 
+        // Split — N outputs, each same as input except along `axis` where
+        // the dim is the corresponding split size. Sizes resolution
+        // mirrors the executor: explicit `split` initializer if present,
+        // else `num_outputs` attribute, else node.outputs.len().
+        "Split" => infer_split(&input_shapes, node, attrs, initializers),
+
         _ => vec![Shape::new(); node.outputs.len().max(1)],
     }
 }
@@ -601,6 +607,98 @@ fn infer_lstm(inputs: &[Shape], attrs: &NodeAttributes) -> Shape {
     vec![seq_len, num_directions, batch, hidden_size.map(Some).unwrap_or(None)]
 }
 
+/// Infer per-output shapes for ONNX Split.
+///
+/// Returns one Shape per declared output. Each output shape matches the
+/// input on every axis except `attrs.axis`, where the dim takes the
+/// corresponding split size. Sizes resolution mirrors the executor's
+/// `dispatch_split` precisely:
+///   * `inputs[1]` is an Int64 initializer `split` — use those values.
+///   * Else `num_outputs` attribute (opset 18+).
+///   * Else `node.outputs.len()`.
+///
+/// When `axis` is unknown (None) the output is rank-preserving with
+/// every dim None — same fallback as Slice.
+fn infer_split(
+    input_shapes: &[Shape],
+    node: &GraphNode,
+    attrs: &NodeAttributes,
+    initializers: &HashMap<String, Tensor>,
+) -> Vec<Shape> {
+    let input_shape = input_shapes.first().cloned().unwrap_or_default();
+    let ndim = input_shape.len();
+    let n_outputs = node.outputs.len().max(1);
+
+    if input_shape.is_empty() {
+        return vec![Shape::new(); n_outputs];
+    }
+
+    let axis_attr = attrs.get_int("axis").unwrap_or(0);
+    let axis = if axis_attr < 0 {
+        (ndim as i64 + axis_attr).max(0) as usize
+    } else {
+        (axis_attr as usize).min(ndim.saturating_sub(1))
+    };
+
+    // Resolve split sizes.
+    let split_sizes: Vec<usize> = node
+        .inputs
+        .get(1)
+        .and_then(|name| {
+            if name.is_empty() {
+                None
+            } else {
+                initializers.get(name)
+            }
+        })
+        .map(|t| {
+            t.as_slice_i64()
+                .into_iter()
+                .map(|s| s as usize)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| {
+            let n = attrs
+                .get_int("num_outputs")
+                .map(|v| v as usize)
+                .unwrap_or(n_outputs)
+                .max(1);
+            // Use the input's axis dim if it is statically known to derive
+            // even chunks; otherwise fall back to N rank-preserving
+            // unknown-axis-dim shapes.
+            match input_shape.get(axis).copied().flatten() {
+                Some(axis_size) => {
+                    let chunk = axis_size / n;
+                    let remainder = axis_size % n;
+                    let mut sizes = vec![chunk; n];
+                    if let Some(last) = sizes.last_mut() {
+                        *last += remainder;
+                    }
+                    sizes
+                }
+                None => Vec::new(),
+            }
+        });
+
+    if split_sizes.is_empty() {
+        // Couldn't resolve sizes statically. Preserve rank but mark the
+        // axis dim as unknown for each declared output.
+        let mut s = input_shape.clone();
+        s[axis] = None;
+        return vec![s; n_outputs];
+    }
+
+    split_sizes
+        .into_iter()
+        .map(|size| {
+            let mut s = input_shape.clone();
+            s[axis] = Some(size);
+            s
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +776,50 @@ mod tests {
         let graph = b.build();
         let shapes = tensor_shapes_from_graph(&graph);
         assert_eq!(shapes.get("y").unwrap(), &vec![Some(4), Some(8)]);
+    }
+
+    #[test]
+    fn split_with_explicit_split_initializer_returns_per_output_shapes() {
+        // Split([6, 2]) along axis 0 with sizes [1, 3, 2] → outputs of
+        // shape [1,2], [3,2], [2,2].
+        use crate::tensor::Tensor;
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("x".into(), vec![Some(6), Some(2)]);
+        b.add_initializer("split_sizes".into(), Tensor::from_vec_i64(vec![1, 3, 2], vec![3]));
+        let mut attrs = NodeAttributes::new();
+        attrs.add_int("axis".into(), 0);
+        b.add_node(
+            "split",
+            "Split",
+            vec!["x".into(), "split_sizes".into()],
+            vec!["o0".into(), "o1".into(), "o2".into()],
+            attrs,
+        );
+        let shapes = tensor_shapes_from_graph(&b.build());
+        assert_eq!(shapes.get("o0").unwrap(), &vec![Some(1), Some(2)]);
+        assert_eq!(shapes.get("o1").unwrap(), &vec![Some(3), Some(2)]);
+        assert_eq!(shapes.get("o2").unwrap(), &vec![Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn split_via_num_outputs_attribute_returns_even_shapes() {
+        // Split([6]) with num_outputs=3 → three [2] outputs.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("x".into(), vec![Some(6)]);
+        let mut attrs = NodeAttributes::new();
+        attrs.add_int("axis".into(), 0);
+        attrs.add_int("num_outputs".into(), 3);
+        b.add_node(
+            "split",
+            "Split",
+            vec!["x".into()],
+            vec!["a".into(), "b".into(), "c".into()],
+            attrs,
+        );
+        let shapes = tensor_shapes_from_graph(&b.build());
+        assert_eq!(shapes.get("a").unwrap(), &vec![Some(2)]);
+        assert_eq!(shapes.get("b").unwrap(), &vec![Some(2)]);
+        assert_eq!(shapes.get("c").unwrap(), &vec![Some(2)]);
     }
 
     #[test]

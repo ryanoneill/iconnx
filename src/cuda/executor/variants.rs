@@ -134,7 +134,7 @@ impl Executor {
 
             store_outputs(
                 op,
-                output,
+                vec![output],
                 &mut values,
                 &mut tensor_groups,
                 &mut group_remaining,
@@ -235,7 +235,7 @@ impl Executor {
 
             store_outputs(
                 op,
-                output,
+                vec![output],
                 &mut values,
                 &mut tensor_groups,
                 &mut group_remaining,
@@ -357,7 +357,7 @@ impl Executor {
 
             store_outputs(
                 op,
-                output,
+                vec![output],
                 &mut values,
                 &mut tensor_groups,
                 &mut group_remaining,
@@ -469,7 +469,7 @@ impl Executor {
 
             store_outputs(
                 op,
-                output,
+                vec![output],
                 &mut values,
                 &mut tensor_groups,
                 &mut group_remaining,

@@ -2502,5 +2502,60 @@ pub fn gpu_slice_nd(
     }
 }
 
+/// GPU Split: split `input` along `axis` into N tensors with the given
+/// `sizes`. Implementation is N parallel `gpu_slice_nd` calls — Split is
+/// a memcpy-class op with no math, so reusing the slice primitive
+/// inherits its dtype-polymorphic dispatch (Float32 / Int64 / Int32) for
+/// free.
+///
+/// `axis` is normalized (negative values count from the rear). `sizes`
+/// must sum to `input.shape[axis]`; the caller is responsible for
+/// resolving sizes from either an ONNX `split` initializer or the
+/// `num_outputs` attribute. Returns one `GpuTensor` per entry in
+/// `sizes`.
+pub fn gpu_split(
+    ctx: &IconnxCudaContext,
+    cache: &OpsKernelCache,
+    pool: &mut GpuMemoryPool,
+    input: &GpuTensor,
+    axis: i64,
+    sizes: &[usize],
+) -> Result<Vec<GpuTensor>, CudaError> {
+    let ndim = input.ndim();
+    let axis_norm = if axis < 0 {
+        (ndim as i64 + axis) as usize
+    } else {
+        axis as usize
+    };
+    if axis_norm >= ndim {
+        return Err(CudaError::Kernel(format!(
+            "Split: axis {} out of bounds for ndim {}",
+            axis, ndim
+        )));
+    }
+    let axis_size = input.shape()[axis_norm];
+    let total: usize = sizes.iter().sum();
+    if total != axis_size {
+        return Err(CudaError::Kernel(format!(
+            "Split: sizes sum {} != input axis {} size {}",
+            total, axis_norm, axis_size
+        )));
+    }
+
+    let mut outputs = Vec::with_capacity(sizes.len());
+    let mut start: i64 = 0;
+    for &size in sizes {
+        let end = start + size as i64;
+        let starts = [start];
+        let ends = [end];
+        let axes = [axis_norm as i64];
+        let out =
+            gpu_slice_nd(ctx, cache, pool, input, &starts, &ends, Some(&axes), None)?;
+        outputs.push(out);
+        start = end;
+    }
+    Ok(outputs)
+}
+
 #[cfg(test)]
 mod tests;

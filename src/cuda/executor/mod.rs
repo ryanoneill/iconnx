@@ -157,7 +157,7 @@ impl Executor {
                 continue;
             }
 
-            // Wrap dispatch_op errors with the failing op's type and first
+            // Wrap dispatch errors with the failing op's type and first
             // output name so the raw accessor message — e.g. `"data_f32
             // called on int64 tensor"` — becomes diagnosable: the message
             // reads `"Transpose (output=sqrted): data_f32 called on int64
@@ -166,7 +166,7 @@ impl Executor {
             // single choke point, which scales where per-site
             // instrumentation doesn't. Only rewrites `CudaError::Kernel`
             // variants so other error kinds pass through unchanged.
-            let output = self.dispatch_op(op, &values, plan).map_err(|e| match e {
+            let dispatch_diag = |e: CudaError| match e {
                 CudaError::Kernel(msg) => {
                     let out_name = op.node.outputs.first().cloned().unwrap_or_default();
                     CudaError::Kernel(format!(
@@ -175,10 +175,23 @@ impl Executor {
                     ))
                 }
                 other => other,
-            })?;
+            };
+
+            // Multi-output ops with genuinely distinct output tensors take a
+            // Vec<GpuTensor> path. Single-output and LSTM-style aliased
+            // multi-output (one buffer under multiple names) share the
+            // single-tensor path below.
+            let outputs_vec: Vec<GpuTensor> = match op.node.op_type.as_str() {
+                "Split" => self
+                    .dispatch_split(op, &values, plan)
+                    .map_err(dispatch_diag)?,
+                _ => vec![self
+                    .dispatch_op(op, &values, plan)
+                    .map_err(dispatch_diag)?],
+            };
             store_outputs(
                 op,
-                output,
+                outputs_vec,
                 &mut values,
                 &mut tensor_groups,
                 &mut group_remaining,
@@ -287,21 +300,32 @@ impl Executor {
 
 }
 
-/// Insert `output` into `values` under every non-empty output name of the
-/// planned op's node.
+/// Insert each tensor in `outputs_vec` into `values` under the matching
+/// output name on the planned op's node.
 ///
-/// Single-output (common case): one insert. Multi-output: track used
-/// outputs as a group so the memory pool only returns the tensor when ALL
-/// group members have been freed (see `return_dead_inputs`). An output is
-/// considered "used" iff it appears in `tensor_last_use` (consumed by a
-/// downstream op) OR is a final graph output. Unused outputs aren't
-/// stored — otherwise their Arc clones would keep the tensor pinned
-/// beyond its real last use.
+/// Three shapes are supported, distinguished by `outputs_vec.len()` vs.
+/// `op.node.outputs.len()`:
 ///
-/// Port of today's logic in `src/cuda/inference/mod.rs::run` (~line 3234).
+///   * **Single-output (common case):** one tensor in, one insert.
+///   * **Aliased multi-output (LSTM-style):** one tensor in, multiple
+///     output names; the same tensor is Arc-cloned under every name and
+///     tracked as a group so the memory pool only returns it once ALL
+///     group members are freed (see `return_dead_inputs`).
+///   * **Distinct multi-output (Split-style):** N tensors in, N output
+///     names; each tensor is inserted under its own name with no Arc
+///     sharing and no group tracking — independent pool lifetimes via
+///     `tensor_last_use`.
+///
+/// An output is considered "used" iff it appears in `tensor_last_use`
+/// (consumed by a downstream op) OR is a final graph output. Unused
+/// outputs aren't stored — otherwise their Arc clones would keep the
+/// tensor pinned beyond its real last use.
+///
+/// Port of today's logic in `src/cuda/inference/mod.rs::run` (~line 3234),
+/// extended in WS-2 M2.5 for genuine multi-output ops (Split).
 pub(super) fn store_outputs(
     op: &PlannedOp,
-    output: GpuTensor,
+    outputs_vec: Vec<GpuTensor>,
     values: &mut HashMap<String, GpuTensor>,
     tensor_groups: &mut HashMap<String, String>,
     group_remaining: &mut HashMap<String, usize>,
@@ -327,9 +351,34 @@ pub(super) fn store_outputs(
             | FusedPattern::MulSinPowMulAdd { output_name, .. }
             | FusedPattern::GeneralChain { output_name, .. } => output_name,
         };
+        let output = outputs_vec
+            .into_iter()
+            .next()
+            .expect("FusedHead dispatch must produce one tensor");
         values.insert(fused_output_name.clone(), output);
         return;
     }
+
+    // Distinct multi-output (Split-style): each tensor is independent.
+    // No Arc sharing, no group tracking — each output's pool lifetime is
+    // governed by `tensor_last_use` like any other intermediate tensor.
+    if outputs_vec.len() > 1 {
+        let names = &op.node.outputs;
+        for (name, tensor) in names.iter().zip(outputs_vec.into_iter()) {
+            if !name.is_empty() {
+                values.insert(name.clone(), tensor);
+            }
+        }
+        return;
+    }
+
+    // Single-tensor return path (everything else, including LSTM-style
+    // aliased multi-output where one buffer surfaces under multiple
+    // output names with shared Arc + group tracking).
+    let output = outputs_vec
+        .into_iter()
+        .next()
+        .expect("dispatch must produce at least one tensor");
 
     let outputs = &op.node.outputs;
     if outputs.len() == 1 {

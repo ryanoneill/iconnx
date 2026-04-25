@@ -4,6 +4,7 @@
 
 #![allow(clippy::needless_range_loop)] // Explicit indexing is clearer for graph operations
 
+use crate::operators;
 use crate::operators::{
     add, and, atan, cast, clip, concat, constant, constant_of_shape, conv, conv_transpose, cos,
     cumsum, div, equal, erf, exp, expand, floor, gather, gemm, greater, greater_or_equal,
@@ -177,6 +178,24 @@ impl GraphExecutor {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
+            // Split is the only true multi-output op iconnx supports today.
+            // Other multi-output ops (LSTM) are aliased — single tensor
+            // under multiple names — and are handled via the single-output
+            // path below with the LSTM-style Arc-share fallback.
+            if node.op_type == "Split" {
+                let split_outputs = operators::split::Split::forward(
+                    &input_tensors,
+                    &node.attributes,
+                    node.outputs.len(),
+                );
+                for (name, tensor) in node.outputs.iter().zip(split_outputs.into_iter()) {
+                    if !name.is_empty() {
+                        values.insert(name.clone(), tensor);
+                    }
+                }
+                continue;
+            }
+
             // Execute operator with attributes
             let output = self
                 .execute_operator(&node.op_type, &input_tensors, &node.attributes)
@@ -210,12 +229,14 @@ impl GraphExecutor {
             }
 
             // Store outputs
-            // Most nodes have 1 output, but some (like LSTM, Split) have multiple
+            // Most nodes have 1 output; aliased multi-output (LSTM) shares
+            // one tensor under multiple names. Genuine multi-output ops
+            // are handled above by the per-op-type branch (e.g. Split).
             if node.outputs.len() == 1 {
                 values.insert(node.outputs[0].clone(), output);
             } else {
-                // Multi-output node - for now, store the output for all output names
-                // TODO: Update operators to return Vec<Tensor> for true multi-output support
+                // Aliased multi-output node — store the shared output under
+                // each name (LSTM Y/Y_h/Y_c precedent).
                 for output_name in &node.outputs {
                     if !output_name.is_empty() {
                         values.insert(output_name.clone(), output.clone());
@@ -441,6 +462,22 @@ impl GraphExecutor {
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
+
+            // Split: genuine multi-output. Bypass execute_operator's
+            // single-output signature and store each slice independently.
+            if node.op_type == "Split" {
+                let split_outputs = operators::split::Split::forward(
+                    &input_tensors,
+                    &node.attributes,
+                    node.outputs.len(),
+                );
+                for (name, tensor) in node.outputs.iter().zip(split_outputs.into_iter()) {
+                    if !name.is_empty() {
+                        values.insert(name.clone(), tensor);
+                    }
+                }
+                continue;
+            }
 
             // Execute operator
             let output = self

@@ -921,4 +921,101 @@ impl Executor {
         let ptr = tensor.device_ptr(&self.ctx);
         self.i64_cache.borrow_mut().insert(ptr, values);
     }
+
+    /// Dispatch ONNX Split: produce N distinct output tensors from one
+    /// input. Split is the first true multi-output op iconnx supports —
+    /// the LSTM "multi-output" case is single-tensor-aliased — so this
+    /// returns `Vec<GpuTensor>`, one entry per `node.outputs` slot.
+    ///
+    /// Resolves split sizes by the ONNX-spec priority: (1) explicit
+    /// `split` Int64 input at slot 1 if non-empty; (2) `num_outputs`
+    /// attribute (opset 18+); (3) the count of `node.outputs`. Sizes are
+    /// then handed to `gpu_split` which performs N parallel
+    /// `gpu_slice_nd` operations along the resolved axis.
+    pub(crate) fn dispatch_split(
+        &self,
+        op: &PlannedOp,
+        values: &HashMap<String, GpuTensor>,
+        plan: &ExecutionPlan,
+    ) -> Result<Vec<GpuTensor>, CudaError> {
+        let weights = &plan.weights;
+        let inputs = resolve_inputs(&op.node.inputs, values, weights)?;
+        let attributes = &op.node.attributes;
+
+        if inputs.is_empty() {
+            return Err(CudaError::Kernel("Split: missing input tensor".into()));
+        }
+        let input = inputs[0];
+        let ndim = input.ndim();
+        let axis_attr = attributes.get_int("axis").unwrap_or(0);
+        let axis = if axis_attr < 0 {
+            (ndim as i64 + axis_attr).max(0) as usize
+        } else {
+            (axis_attr as usize).min(ndim.saturating_sub(1))
+        };
+        let axis_size = input.shape()[axis];
+
+        // ONNX-spec resolution order for split sizes.
+        let sizes: Vec<usize> = if let Some(split_tensor) = inputs.get(1) {
+            // Explicit split input. Empty placeholder (length 0) means
+            // "fall through to num_outputs / hint" per the same
+            // empty-placeholder convention as Resize's scales/sizes.
+            let raw = split_tensor.to_host_i64(&self.ctx)?;
+            if !raw.is_empty() {
+                raw.into_iter().map(|s| s as usize).collect()
+            } else {
+                self.split_sizes_from_count_hint(attributes, axis_size, op)
+            }
+        } else {
+            self.split_sizes_from_count_hint(attributes, axis_size, op)
+        };
+
+        let total: usize = sizes.iter().sum();
+        if total != axis_size {
+            return Err(CudaError::Kernel(format!(
+                "Split: split sizes sum {} != input axis {} size {}",
+                total, axis, axis_size
+            )));
+        }
+
+        let mut pool = self.memory_pool.borrow_mut();
+        crate::cuda::ops::gpu_split(
+            &self.ctx,
+            &self.ops_kernels,
+            &mut pool,
+            input,
+            axis as i64,
+            &sizes,
+        )
+    }
+
+    /// Resolve split sizes when no explicit `split` input was provided.
+    /// Falls back to `num_outputs` (opset 18+) then to the number of
+    /// declared graph outputs. Even split with the remainder appended to
+    /// the last chunk — matches ONNX Reference op semantics.
+    fn split_sizes_from_count_hint(
+        &self,
+        attributes: &crate::attributes::NodeAttributes,
+        axis_size: usize,
+        op: &PlannedOp,
+    ) -> Vec<usize> {
+        let n = attributes
+            .get_int("num_outputs")
+            .map(|v| v as usize)
+            .unwrap_or_else(|| {
+                op.node
+                    .outputs
+                    .iter()
+                    .filter(|name| !name.is_empty())
+                    .count()
+            })
+            .max(1);
+        let chunk = axis_size / n;
+        let remainder = axis_size % n;
+        let mut sizes = vec![chunk; n];
+        if let Some(last) = sizes.last_mut() {
+            *last += remainder;
+        }
+        sizes
+    }
 }
