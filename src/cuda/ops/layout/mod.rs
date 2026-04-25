@@ -370,6 +370,12 @@ pub fn gpu_transpose_nd(
                 })?;
             Ok(output)
         }
+        GpuTensor::Int8 { .. } | GpuTensor::UInt8 { .. } => {
+            Err(CudaError::Kernel(format!(
+                "Transpose does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Transpose)",
+                input.dtype().name()
+            )))
+        }
     }
 }
 
@@ -488,6 +494,12 @@ pub fn gpu_where(
                 )
                 .map_err(|e| CudaError::Kernel(format!("where_i32 launch failed: {}", e)))?;
             Ok(output)
+        }
+        crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
+            Err(CudaError::Kernel(format!(
+                "Where does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Where)",
+                dtype.name()
+            )))
         }
     }
 }
@@ -827,6 +839,12 @@ pub fn gpu_copy(
                 .map_err(|e| CudaError::Kernel(format!("copy_i32 launch failed: {}", e)))?;
             Ok(output)
         }
+        GpuTensor::Int8 { .. } | GpuTensor::UInt8 { .. } => {
+            Err(CudaError::Kernel(format!(
+                "gpu_copy does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through gpu_copy)",
+                input.dtype().name()
+            )))
+        }
     }
 }
 
@@ -1058,6 +1076,12 @@ pub fn gpu_concat(
             }
             Ok(output)
         }
+        crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
+            Err(CudaError::Kernel(format!(
+                "Concat does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Concat)",
+                dtype.name()
+            )))
+        }
     }
 }
 
@@ -1234,6 +1258,12 @@ pub fn gpu_expand(
                 )
                 .map_err(|e| CudaError::Kernel(format!("expand_i32 launch failed: {}", e)))?;
             Ok(output)
+        }
+        crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
+            Err(CudaError::Kernel(format!(
+                "Expand does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Expand)",
+                dtype.name()
+            )))
         }
     }
 }
@@ -2233,6 +2263,12 @@ pub fn gpu_slice_nd(
             crate::cuda::tensor::DType::Float32 => pool.get_tensor_f32(ctx, out_shape),
             crate::cuda::tensor::DType::Int64 => pool.get_tensor_i64(ctx, out_shape),
             crate::cuda::tensor::DType::Int32 => pool.get_tensor_i32(ctx, out_shape),
+            crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
+                Err(CudaError::Kernel(format!(
+                    "Slice does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Slice)",
+                    dtype.name()
+                )))
+            }
         };
     }
 
@@ -2546,6 +2582,12 @@ pub fn gpu_slice_nd(
                 )
                 .map_err(|e| CudaError::Kernel(format!("slice_nd_i32 launch failed: {}", e)))?;
             Ok(output)
+        }
+        (_, crate::cuda::tensor::DType::Int8) | (_, crate::cuda::tensor::DType::UInt8) => {
+            Err(CudaError::Kernel(format!(
+                "Slice does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Slice)",
+                dtype.name()
+            )))
         }
     }
 }

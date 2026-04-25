@@ -225,6 +225,16 @@ impl IconnxCudaContext {
         self.zero_slice(slice)
     }
 
+    /// Zero out an i8 slice in place.
+    pub fn zero_i8(&self, slice: &mut GbDeviceSlice<'static, i8>) -> Result<(), CudaError> {
+        self.zero_slice(slice)
+    }
+
+    /// Zero out a u8 slice in place.
+    pub fn zero_u8(&self, slice: &mut GbDeviceSlice<'static, u8>) -> Result<(), CudaError> {
+        self.zero_slice(slice)
+    }
+
     /// Internal helper: zero a garboard slice on the garboard user stream.
     ///
     /// Uses garboard's `Stream::memset_zero`, which enqueues

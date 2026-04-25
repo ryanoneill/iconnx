@@ -51,6 +51,10 @@ pub struct GpuMemoryPool {
     i64_pool: HashMap<usize, Vec<DeviceSlice<'static, i64>>>,
     /// Pool of i32 slices, keyed by size-class bucket.
     i32_pool: HashMap<usize, Vec<DeviceSlice<'static, i32>>>,
+    /// Pool of i8 slices, keyed by size-class bucket.
+    i8_pool: HashMap<usize, Vec<DeviceSlice<'static, i8>>>,
+    /// Pool of u8 slices, keyed by size-class bucket.
+    u8_pool: HashMap<usize, Vec<DeviceSlice<'static, u8>>>,
     /// Number of successful pool hits.
     hits: usize,
     /// Number of pool misses (fresh allocations).
@@ -72,6 +76,8 @@ impl GpuMemoryPool {
             f32_pool: HashMap::new(),
             i64_pool: HashMap::new(),
             i32_pool: HashMap::new(),
+            i8_pool: HashMap::new(),
+            u8_pool: HashMap::new(),
             hits: 0,
             misses: 0,
             max_per_bucket: 8, // Keep up to 8 slices per size.
@@ -210,6 +216,88 @@ impl GpuMemoryPool {
         })
     }
 
+    /// Get or allocate an Int8 `DeviceSlice`.
+    ///
+    /// Note: The returned slice may be larger than `len` due to
+    /// size-class bucketing. Pooled slices are zeroed before being
+    /// returned to ensure consistent behavior.
+    pub fn get_i8(
+        &mut self,
+        ctx: &IconnxCudaContext,
+        len: usize,
+    ) -> Result<DeviceSlice<'static, i8>, CudaError> {
+        let bucket = size_class(len);
+        if let Some(slices) = self.i8_pool.get_mut(&bucket) {
+            // Find a slice that has at least `len` elements.
+            if let Some(idx) = slices.iter().position(|s| s.len() >= len) {
+                let mut slice = slices.swap_remove(idx);
+                self.hits += 1;
+                // Zero the slice to ensure consistent behavior with
+                // fresh allocations.
+                ctx.zero_i8(&mut slice)?;
+                return Ok(slice);
+            }
+        }
+        self.misses += 1;
+        // Allocate bucket size to ensure consistency with return_i8.
+        ctx.alloc_zeros::<i8>(bucket)
+    }
+
+    /// Get or allocate an Int8 `GpuTensor` (convenience method).
+    pub fn get_tensor_i8(
+        &mut self,
+        ctx: &IconnxCudaContext,
+        shape: Vec<usize>,
+    ) -> Result<GpuTensor, CudaError> {
+        let len: usize = shape.iter().product();
+        let slice = self.get_i8(ctx, len)?;
+        Ok(GpuTensor::Int8 {
+            data: Arc::new(slice),
+            shape,
+        })
+    }
+
+    /// Get or allocate a UInt8 `DeviceSlice`.
+    ///
+    /// Note: The returned slice may be larger than `len` due to
+    /// size-class bucketing. Pooled slices are zeroed before being
+    /// returned to ensure consistent behavior.
+    pub fn get_u8(
+        &mut self,
+        ctx: &IconnxCudaContext,
+        len: usize,
+    ) -> Result<DeviceSlice<'static, u8>, CudaError> {
+        let bucket = size_class(len);
+        if let Some(slices) = self.u8_pool.get_mut(&bucket) {
+            // Find a slice that has at least `len` elements.
+            if let Some(idx) = slices.iter().position(|s| s.len() >= len) {
+                let mut slice = slices.swap_remove(idx);
+                self.hits += 1;
+                // Zero the slice to ensure consistent behavior with
+                // fresh allocations.
+                ctx.zero_u8(&mut slice)?;
+                return Ok(slice);
+            }
+        }
+        self.misses += 1;
+        // Allocate bucket size to ensure consistency with return_u8.
+        ctx.alloc_zeros::<u8>(bucket)
+    }
+
+    /// Get or allocate a UInt8 `GpuTensor` (convenience method).
+    pub fn get_tensor_u8(
+        &mut self,
+        ctx: &IconnxCudaContext,
+        shape: Vec<usize>,
+    ) -> Result<GpuTensor, CudaError> {
+        let len: usize = shape.iter().product();
+        let slice = self.get_u8(ctx, len)?;
+        Ok(GpuTensor::UInt8 {
+            data: Arc::new(slice),
+            shape,
+        })
+    }
+
     /// Return a Float32 slice to the pool.
     pub fn return_f32(&mut self, slice: DeviceSlice<'static, f32>) {
         let len = slice.len();
@@ -245,6 +333,28 @@ impl GpuMemoryPool {
         }
     }
 
+    /// Return an Int8 slice to the pool.
+    pub fn return_i8(&mut self, slice: DeviceSlice<'static, i8>) {
+        let len = slice.len();
+        // Use size_class for bucket key to match get_i8.
+        let bucket_key = size_class(len);
+        let bucket = self.i8_pool.entry(bucket_key).or_default();
+        if bucket.len() < self.max_per_bucket {
+            bucket.push(slice);
+        }
+    }
+
+    /// Return a UInt8 slice to the pool.
+    pub fn return_u8(&mut self, slice: DeviceSlice<'static, u8>) {
+        let len = slice.len();
+        // Use size_class for bucket key to match get_u8.
+        let bucket_key = size_class(len);
+        let bucket = self.u8_pool.entry(bucket_key).or_default();
+        if bucket.len() < self.max_per_bucket {
+            bucket.push(slice);
+        }
+    }
+
     /// Return a `GpuTensor` to the pool (extracts slice if possible).
     ///
     /// Returns true if the tensor was successfully returned to the pool.
@@ -261,6 +371,14 @@ impl GpuMemoryPool {
             }
             Some(TypedSlice::Int32(slice)) => {
                 self.return_i32(slice);
+                true
+            }
+            Some(TypedSlice::Int8(slice)) => {
+                self.return_i8(slice);
+                true
+            }
+            Some(TypedSlice::UInt8(slice)) => {
+                self.return_u8(slice);
                 true
             }
             None => {
@@ -290,6 +408,8 @@ impl GpuMemoryPool {
         self.f32_pool.values().map(|v| v.len()).sum::<usize>()
             + self.i64_pool.values().map(|v| v.len()).sum::<usize>()
             + self.i32_pool.values().map(|v| v.len()).sum::<usize>()
+            + self.i8_pool.values().map(|v| v.len()).sum::<usize>()
+            + self.u8_pool.values().map(|v| v.len()).sum::<usize>()
     }
 
     /// Clear all pooled memory (frees GPU memory).
@@ -297,6 +417,8 @@ impl GpuMemoryPool {
         self.f32_pool.clear();
         self.i64_pool.clear();
         self.i32_pool.clear();
+        self.i8_pool.clear();
+        self.u8_pool.clear();
     }
 
     /// Reset statistics.
