@@ -270,6 +270,7 @@ impl Executor {
     ) -> Result<Vec<GpuTensor>, CudaError> {
         match op.node.op_type.as_str() {
             "Split" => self.dispatch_split(op, values, plan),
+            "DynamicQuantizeLinear" => self.dispatch_dynamic_quantize_linear(op, values, plan),
             _ => Ok(vec![self.dispatch_op(op, values, plan)?]),
         }
     }

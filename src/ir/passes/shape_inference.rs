@@ -239,6 +239,14 @@ fn infer_node_output_shapes(
         // else `num_outputs` attribute, else node.outputs.len().
         "Split" => infer_split(&input_shapes, node, attrs, initializers),
 
+        // DynamicQuantizeLinear — 3 outputs: (y, y_scale, y_zero_point).
+        // y has the same shape as the input; y_scale and y_zero_point
+        // are scalars (rank-0 shapes).
+        "DynamicQuantizeLinear" => {
+            let input_shape = input_shapes.first().cloned().unwrap_or_default();
+            vec![input_shape, Shape::new(), Shape::new()]
+        }
+
         _ => vec![Shape::new(); node.outputs.len().max(1)],
     }
 }

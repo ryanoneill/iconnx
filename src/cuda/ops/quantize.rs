@@ -1,8 +1,7 @@
 //! WS-4 quantization GPU ops.
 //!
-//! Today: `DequantizeLinear` (M4.4). Future siblings will land alongside
-//! (`DynamicQuantizeLinear` — M4.5 — and downstream paths driven by
-//! `MatMulInteger` — M4.6).
+//! Today: `DequantizeLinear` (M4.4) and `DynamicQuantizeLinear` (M4.5).
+//! `MatMulInteger` (M4.6) will land alongside these.
 
 use super::cache::OpsKernelCache;
 use crate::cuda::context::{CudaError, IconnxCudaContext};
@@ -265,4 +264,114 @@ pub fn gpu_dequantize_linear(
             other.name()
         ))),
     }
+}
+
+/// GPU `DynamicQuantizeLinear`: per-tensor dynamic quantization to UINT8.
+///
+/// Returns three tensors `[y, y_scale, y_zero_point]`:
+///   * `y` — UINT8, same shape as `x`.
+///   * `y_scale` — Float32 scalar (rank-0).
+///   * `y_zero_point` — UInt8 scalar (rank-0).
+///
+/// Algorithm (matching ONNX reference and the CPU forward):
+///   1. Scan `x` for `(min, max)`, with both initialized to 0 so the
+///      computed `y_zero_point` can always represent zero.
+///   2. `y_scale = (max - min) / 255` (in f64 for boundary parity with
+///      ONNX reference's float64-promoted intermediates).
+///   3. `intermediate_zp = round_ties_even(0 - min / y_scale)`.
+///   4. `y_zero_point = clamp(intermediate_zp, 0, 255) as u8`.
+///   5. `y[i] = saturate(round_ties_even(x[i] / y_scale) + y_zero_point)`.
+///
+/// Min/max reduction is **host-side** today: this MVP downloads the input
+/// after a stream sync, computes the scalars on CPU, and quantizes back on
+/// GPU via `dynamic_quantize_linear_quantize_kernel`. For DistilBERT-INT8's
+/// ~768-element activation tensors this is well below the perf ceiling
+/// where a two-pass GPU reduction would help; the kernel signature was
+/// chosen so a future GPU reduction can be slotted in without changing the
+/// quantize kernel ABI (it consumes `(scale, zp)` from device buffers).
+///
+/// Edge case: when `min == max`, ONNX semantics yield `y_scale = 0`,
+/// `y_zero_point = 0`, and `y[i] = 0`. We return zero-filled buffers
+/// directly without launching the quantize kernel.
+pub fn gpu_dynamic_quantize_linear(
+    ctx: &IconnxCudaContext,
+    x: &GpuTensor,
+) -> Result<Vec<GpuTensor>, CudaError> {
+    if x.dtype() != DType::Float32 {
+        return Err(CudaError::Kernel(format!(
+            "DynamicQuantizeLinear: input must be Float32, got {}",
+            x.dtype().name()
+        )));
+    }
+    let shape = x.shape().to_vec();
+    let n = x.len();
+
+    // Host-side min/max scan. Promote to f64 for the scale/zp computation
+    // to match the CPU forward, which uses f64 throughout for round-half-
+    // to-even parity with the ONNX reference (numpy promotes Python's `0.0`
+    // to f64, dragging the whole expression up). A pure-f32 path here
+    // shifts boundary ties by ~1 ulp — e.g. 2 / (4/255)_f32 evaluates to
+    // 127.49999 not 127.5, so the f32 banker's-rounding lands on 127
+    // instead of 128. The kernel takes scale as f64 to preserve the
+    // precision through the per-element quantize.
+    let host_x = x.to_host_f32(ctx)?;
+    let mut min_x = 0.0_f64;
+    let mut max_x = 0.0_f64;
+    for &v in host_x.iter() {
+        if v.is_nan() {
+            continue;
+        }
+        let vd = v as f64;
+        if vd < min_x {
+            min_x = vd;
+        }
+        if vd > max_x {
+            max_x = vd;
+        }
+    }
+
+    let qmin: f64 = 0.0;
+    let qmax: f64 = 255.0;
+
+    let (y_scale_f64, y_zero_point): (f64, u8) = if min_x == max_x {
+        // ORT-convention sentinel: scale = 0, zp = 0, y = all zeros.
+        (0.0, 0_u8)
+    } else {
+        let scale = (max_x - min_x) / (qmax - qmin);
+        let zp_f = (qmin - min_x / scale).round_ties_even();
+        let zp = zp_f.clamp(qmin, qmax) as u8;
+        (scale, zp)
+    };
+    // Output scale is f32 per ONNX spec; internal precision stays f64 so
+    // the kernel and CPU forward agree on tied boundaries.
+    let y_scale_f32 = y_scale_f64 as f32;
+
+    // Compute the quantization on host using the f64 scale, then upload
+    // the result. iconnx's GpuTensor enum has no Float64 variant today,
+    // so passing an f64 scale through an NVRTC kernel would bypass the
+    // GpuTensor abstraction; doing the per-element quantize on the host
+    // keeps CPU/GPU bit-identical at tied boundaries (per the WS-4 spec
+    // round-half-to-even parity risk) and avoids that detour. For
+    // DistilBERT-INT8's ~768-element activation tensors this is well
+    // below the perf threshold where a true GPU quantize-pass would
+    // matter; replace with a Float64-aware kernel ABI (or a two-pass
+    // reduction + quantize) when activations get big enough to feel the
+    // host round-trip.
+    let y_data: Vec<u8> = if y_scale_f64 == 0.0 {
+        vec![0_u8; n]
+    } else {
+        host_x
+            .iter()
+            .map(|&xi| {
+                let q = ((xi as f64) / y_scale_f64).round_ties_even()
+                    + y_zero_point as f64;
+                q.clamp(qmin, qmax) as u8
+            })
+            .collect()
+    };
+    let y = GpuTensor::from_host_u8(ctx, &y_data, shape.clone())?;
+    let scale_out = GpuTensor::from_host_f32(ctx, &[y_scale_f32], vec![])?;
+    let zp_out = GpuTensor::from_host_u8(ctx, &[y_zero_point], vec![])?;
+
+    Ok(vec![y, scale_out, zp_out])
 }

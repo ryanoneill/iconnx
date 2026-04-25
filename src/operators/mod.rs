@@ -22,6 +22,7 @@ pub mod cos;
 pub mod cumsum;
 pub mod dequantize_linear;
 pub mod div;
+pub mod dynamic_quantize_linear;
 pub mod equal;
 pub mod erf;
 pub mod exp;

@@ -1088,6 +1088,30 @@ impl Executor {
         )
     }
 
+    /// GPU dispatch for `DynamicQuantizeLinear` (WS-4 M4.5). Multi-output
+    /// op like `Split` — returns three tensors `(y, y_scale, y_zero_point)`
+    /// stored under their own names by `store_outputs`'s distinct-multi
+    /// path. Routed through `dispatch_op_multi`, never single-output
+    /// `dispatch_op`.
+    pub(crate) fn dispatch_dynamic_quantize_linear(
+        &self,
+        op: &PlannedOp,
+        values: &HashMap<String, GpuTensor>,
+        plan: &ExecutionPlan,
+    ) -> Result<Vec<GpuTensor>, CudaError> {
+        let weights = &plan.weights;
+        let inputs = resolve_inputs(&op.node.inputs, values, weights)?;
+        if inputs.is_empty() {
+            return Err(CudaError::Kernel(
+                "DynamicQuantizeLinear: missing input tensor".into(),
+            ));
+        }
+        // Host-quantize MVP — wrapper neither launches a kernel nor touches
+        // the pool, so we don't borrow either. See gpu_dynamic_quantize_linear
+        // for the f64-parity rationale.
+        crate::cuda::ops::gpu_dynamic_quantize_linear(&self.ctx, inputs[0])
+    }
+
     /// Resolve split sizes when no explicit `split` input was provided.
     /// Falls back to `num_outputs` (opset 18+) then to the number of
     /// declared graph outputs. Even split with the remainder appended to

@@ -93,6 +93,7 @@ pub use ops::{
     gpu_cumsum,
     // Quantization ops (WS-4)
     gpu_dequantize_linear,
+    gpu_dynamic_quantize_linear,
     // Comparison ops
     gpu_equal,
     gpu_gather,

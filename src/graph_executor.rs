@@ -180,7 +180,8 @@ impl GraphExecutor {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            // Split is the only true multi-output op iconnx supports today.
+            // Split is one of two true multi-output ops iconnx supports
+            // today (the other is DynamicQuantizeLinear, handled below).
             // Other multi-output ops (LSTM) are aliased — single tensor
             // under multiple names — and are handled via the single-output
             // path below with the LSTM-style Arc-share fallback.
@@ -191,6 +192,21 @@ impl GraphExecutor {
                     node.outputs.len(),
                 );
                 for (name, tensor) in node.outputs.iter().zip(split_outputs.into_iter()) {
+                    if !name.is_empty() {
+                        values.insert(name.clone(), tensor);
+                    }
+                }
+                continue;
+            }
+
+            // DynamicQuantizeLinear: 3 distinct outputs (y, y_scale,
+            // y_zero_point). Same multi-output handling as Split.
+            if node.op_type == "DynamicQuantizeLinear" {
+                let outs = operators::dynamic_quantize_linear::DynamicQuantizeLinear::forward(
+                    &input_tensors,
+                    &node.attributes,
+                );
+                for (name, tensor) in node.outputs.iter().zip(outs.into_iter()) {
                     if !name.is_empty() {
                         values.insert(name.clone(), tensor);
                     }
@@ -482,6 +498,21 @@ impl GraphExecutor {
                     node.outputs.len(),
                 );
                 for (name, tensor) in node.outputs.iter().zip(split_outputs.into_iter()) {
+                    if !name.is_empty() {
+                        values.insert(name.clone(), tensor);
+                    }
+                }
+                continue;
+            }
+
+            // DynamicQuantizeLinear: 3 distinct outputs (y, y_scale,
+            // y_zero_point). Same multi-output handling as Split.
+            if node.op_type == "DynamicQuantizeLinear" {
+                let outs = operators::dynamic_quantize_linear::DynamicQuantizeLinear::forward(
+                    &input_tensors,
+                    &node.attributes,
+                );
+                for (name, tensor) in node.outputs.iter().zip(outs.into_iter()) {
                     if !name.is_empty() {
                         values.insert(name.clone(), tensor);
                     }
