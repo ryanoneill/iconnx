@@ -53,6 +53,7 @@ pub mod sigmoid;
 pub mod sin;
 pub mod slice;
 pub mod softmax;
+pub mod split;
 pub mod sqrt;
 pub mod squeeze;
 pub mod stft;

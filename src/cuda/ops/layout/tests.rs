@@ -81,6 +81,68 @@ fn test_constant_of_shape() {
 
 #[test]
 #[ignore = "requires CUDA GPU"]
+fn test_gpu_split_axis0_unequal_f32() {
+    // Split a 6x2 Float32 input along axis 0 into [1, 3, 2] rows.
+    let (ctx, cache, mut pool) = setup();
+    let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+    let input = GpuTensor::from_host_f32(&ctx, &data, vec![6, 2]).expect("input");
+
+    let outs = gpu_split(&ctx, &cache, &mut pool, &input, 0, &[1, 3, 2])
+        .expect("gpu_split");
+    assert_eq!(outs.len(), 3);
+    assert_eq!(outs[0].shape(), &[1, 2]);
+    assert_eq!(outs[1].shape(), &[3, 2]);
+    assert_eq!(outs[2].shape(), &[2, 2]);
+
+    let r0 = outs[0].to_host_f32(&ctx).unwrap();
+    let r1 = outs[1].to_host_f32(&ctx).unwrap();
+    let r2 = outs[2].to_host_f32(&ctx).unwrap();
+    assert_eq!(r0, vec![0.0, 1.0]);
+    assert_eq!(r1, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    assert_eq!(r2, vec![8.0, 9.0, 10.0, 11.0]);
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_split_negative_axis_int64() {
+    // Split a 2x6 Int64 input along axis -1 into [2, 2, 2] cols.
+    let (ctx, cache, mut pool) = setup();
+    let data: Vec<i64> = (0..12).collect();
+    let input = GpuTensor::from_host_i64(&ctx, &data, vec![2, 6]).expect("input");
+
+    let outs = gpu_split(&ctx, &cache, &mut pool, &input, -1, &[2, 2, 2])
+        .expect("gpu_split");
+    assert_eq!(outs.len(), 3);
+    for out in &outs {
+        assert_eq!(out.shape(), &[2, 2]);
+    }
+    assert_eq!(outs[0].to_host_i64(&ctx).unwrap(), vec![0, 1, 6, 7]);
+    assert_eq!(outs[1].to_host_i64(&ctx).unwrap(), vec![2, 3, 8, 9]);
+    assert_eq!(outs[2].to_host_i64(&ctx).unwrap(), vec![4, 5, 10, 11]);
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_split_size_sum_mismatch_errors() {
+    let (ctx, cache, mut pool) = setup();
+    let input = GpuTensor::from_host_f32(&ctx, &[0.0_f32; 6], vec![6]).expect("input");
+
+    // Sizes sum to 5, not 6 — should error.
+    match gpu_split(&ctx, &cache, &mut pool, &input, 0, &[2, 3]) {
+        Err(CudaError::Kernel(msg)) => {
+            assert!(
+                msg.contains("Split") && msg.contains("sizes"),
+                "expected Split sizes-sum error, got: {}",
+                msg
+            );
+        }
+        Err(other) => panic!("expected Kernel error, got: {}", other),
+        Ok(_) => panic!("expected error for sizes-sum mismatch, got Ok"),
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
 fn test_constant_of_shape_direct_i64_fills_with_int64_scalar() {
     let (ctx, cache, mut pool) = setup();
 
