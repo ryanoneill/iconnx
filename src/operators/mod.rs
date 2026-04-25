@@ -26,6 +26,7 @@ pub mod erf;
 pub mod exp;
 pub mod expand;
 pub mod fftw_stft;
+pub mod flatten;
 pub mod floor;
 pub mod gather;
 pub mod gemm;

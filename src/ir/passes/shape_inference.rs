@@ -148,6 +148,9 @@ fn infer_node_output_shapes(
         "Reshape" => {
             vec![infer_reshape(&input_shapes, node, initializers)]
         }
+        "Flatten" => {
+            vec![infer_flatten(&input_shapes, attrs)]
+        }
         "Unsqueeze" => {
             vec![infer_unsqueeze(&input_shapes, attrs)]
         }
@@ -605,6 +608,33 @@ fn infer_lstm(inputs: &[Shape], attrs: &NodeAttributes) -> Shape {
         Some(_) => return Shape::new(),
     };
     vec![seq_len, num_directions, batch, hidden_size.map(Some).unwrap_or(None)]
+}
+
+/// Infer the 2-D output shape for ONNX Flatten. axis=1 by default;
+/// negative axes count from the rear. Output is `[product(0..axis),
+/// product(axis..ndim)]`. When any input dim is unknown (None) the
+/// resulting product becomes None.
+fn infer_flatten(inputs: &[Shape], attrs: &NodeAttributes) -> Shape {
+    let input_shape = inputs.first().cloned().unwrap_or_default();
+    if input_shape.is_empty() {
+        return vec![None, None];
+    }
+    let ndim = input_shape.len();
+    let axis_attr = attrs.get_int("axis").unwrap_or(1);
+    let axis = if axis_attr < 0 {
+        ((ndim as i64 + axis_attr).max(0) as usize).min(ndim)
+    } else {
+        (axis_attr as usize).min(ndim)
+    };
+
+    let prod = |dims: &[Option<usize>]| -> Option<usize> {
+        if dims.is_empty() {
+            return Some(1);
+        }
+        dims.iter().try_fold(1usize, |acc, &d| d.map(|v| acc * v))
+    };
+
+    vec![prod(&input_shape[..axis]), prod(&input_shape[axis..])]
 }
 
 /// Infer per-output shapes for ONNX Split.

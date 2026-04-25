@@ -448,6 +448,33 @@ impl Executor {
                 )
             }
 
+            // --- Flatten: pure shape relabel into 2-D --------------------
+            //
+            // axis=1 by default; negative values count from the rear.
+            // Output shape is `[product(0..axis), product(axis..ndim)]`.
+            // No data movement — same memcpy-class semantics as Reshape,
+            // implemented as a `GpuTensor::reshape` clone of the input.
+            "Flatten" => {
+                let input = inputs[0];
+                let input_shape = input.shape();
+                let ndim = input_shape.len();
+                let axis_attr = attributes.get_int("axis").unwrap_or(1);
+                let axis = if axis_attr < 0 {
+                    ((ndim as i64 + axis_attr).max(0) as usize).min(ndim)
+                } else {
+                    (axis_attr as usize).min(ndim)
+                };
+                let outer: usize = input_shape[..axis].iter().product::<usize>().max(1);
+                let inner: usize = input_shape[axis..].iter().product::<usize>().max(1);
+                let target = vec![outer, inner];
+                input.clone().reshape(target.clone()).ok_or_else(|| {
+                    CudaError::Kernel(format!(
+                        "Flatten: element count mismatch. Input shape {:?} cannot reshape to {:?}",
+                        input_shape, target
+                    ))
+                })
+            }
+
             // --- Reshape with 0/-1 resolution ----------------------------
             "Reshape" => {
                 let input_shape = inputs[0].shape();

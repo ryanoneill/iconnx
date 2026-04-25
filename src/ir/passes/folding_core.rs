@@ -139,6 +139,7 @@ fn dispatch_cpu_forward(
 
         // Shape / layout.
         "Reshape" => reshape::Reshape::forward(inputs, attributes),
+        "Flatten" => flatten::Flatten::forward(inputs, attributes),
         "Unsqueeze" => unsqueeze::Unsqueeze::forward(inputs, attributes),
         "Squeeze" => squeeze::Squeeze::forward(inputs, attributes),
         "Transpose" => transpose::Transpose::forward(inputs, attributes),
