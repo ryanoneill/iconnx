@@ -23,7 +23,8 @@ use std::collections::HashMap;
 use crate::cuda::inference::{compute_broadcast_shape, maybe_expand};
 use crate::cuda::ops::{
     gpu_cast, gpu_concat, gpu_constant_of_shape_direct, gpu_constant_of_shape_direct_i64, gpu_copy,
-    gpu_cumsum, gpu_dequantize_linear, gpu_expand, gpu_gather_from_gpu, gpu_max_pool_2d,
+    gpu_cumsum, gpu_dequantize_linear, gpu_expand, gpu_gather_from_gpu, gpu_matmul_integer,
+    gpu_max_pool_2d,
     gpu_nonzero, gpu_pad, gpu_range, gpu_range_i64, gpu_resize, gpu_scatter_nd, gpu_shape,
     gpu_slice_nd, gpu_transpose_2d, gpu_transpose_nd, gpu_where, ResizeCoordMode, ResizeMode,
     ResizeNearestMode,
@@ -979,6 +980,35 @@ impl Executor {
                 let axis = resolved as usize;
 
                 gpu_dequantize_linear(&self.ctx, &self.ops_kernels, &mut pool, x, scale, zp, axis)
+            }
+
+            // --- MatMulInteger (WS-4 M4.6) -------------------------------
+            //
+            // out = matmul((a - a_zp), (b - b_zp)), output Int32. 2-D
+            // inputs only; `a` is `[M, K]`, `b` is `[K, N]`; each operand
+            // is Int8 or UInt8 (4 sign-combination kernel variants).
+            // `a_zero_point` (input 2) and `b_zero_point` (input 3) are
+            // optional and must be scalar (rank 0 or single-element 1-D).
+            // Per-axis zp is rejected — DistilBERT does not exercise that
+            // path and the M4.6 GPU kernel ABI is scalar-zp only.
+            //
+            // Routed through `dispatch_layout` rather than `dispatch_matmul`
+            // because every other quantization op (DequantizeLinear,
+            // DynamicQuantizeLinear) lives here, and the wrapper boundary
+            // is `gpu_matmul_integer` in `src/cuda/ops/quantize.rs` —
+            // consistent with the rest of the WS-4 op family.
+            "MatMulInteger" => {
+                if inputs.len() < 2 || inputs.len() > 4 {
+                    return Err(CudaError::Kernel(format!(
+                        "MatMulInteger requires 2, 3, or 4 inputs, got {}",
+                        inputs.len()
+                    )));
+                }
+                let a = inputs[0];
+                let b = inputs[1];
+                let a_zp = inputs.get(2).copied();
+                let b_zp = inputs.get(3).copied();
+                gpu_matmul_integer(&self.ctx, &self.ops_kernels, &mut pool, a, b, a_zp, b_zp)
             }
 
             other => Err(CudaError::Kernel(format!(

@@ -224,6 +224,12 @@ fn infer_node_output_shapes(
         "MatMul" => {
             vec![infer_matmul(&input_shapes)]
         }
+        // MatMulInteger: standard MatMul shape rules ([M, K] @ [K, N] →
+        // [M, N]); zp inputs (slots 2/3) are scalar/per-axis metadata
+        // and don't enter the output shape. WS-4 M4.6.
+        "MatMulInteger" => {
+            vec![infer_matmul(&input_shapes)]
+        }
         "Gemm" => {
             vec![infer_gemm(&input_shapes, attrs)]
         }

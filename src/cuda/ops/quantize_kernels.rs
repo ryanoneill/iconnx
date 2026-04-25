@@ -14,6 +14,11 @@ pub const QUANTIZE_KERNEL_NAMES: &[&str] = &[
     "dequantize_linear_i8_kernel",
     "dequantize_linear_u8_kernel",
     "dequantize_linear_i32_kernel",
+    // M4.6 MatMulInteger: 4 sign-combination variants.
+    "matmul_integer_s8s8_kernel",
+    "matmul_integer_u8s8_kernel",
+    "matmul_integer_s8u8_kernel",
+    "matmul_integer_u8u8_kernel",
 ];
 
 /// CUDA kernel source for the WS-4 quantization op family.
@@ -62,5 +67,118 @@ extern "C" __global__ void dequantize_linear_i32_kernel(
     size_t a = (i / inner) % axis_size;
     // Promote to long long before subtracting to avoid INT_MIN-INT_MIN UB.
     out[i] = (float)((long long)x[i] - (long long)zp[a]) * scale[a];
+}
+
+// ============================================================================
+// WS-4 M4.6 MatMulInteger: integer GEMM with optional zero-point subtraction.
+//
+// Four sign-combination variants — s8s8, u8s8, s8u8, u8u8 — to cover every
+// (a, b) dtype pairing the ONNX spec admits. DistilBERT-INT8 specifically
+// uses the u8s8 variant (UINT8 activations × INT8 weights).
+//
+// Naive one-thread-per-output GEMM. Each thread computes a single
+// `out[m, n]` cell over the full inner dim. Shared-memory tiling is a
+// perf-workstream follow-up; correctness is the gate for M4.6.
+//
+// Per-tensor scalar zps are passed as 1-element device buffers; the kernel
+// reads `zp[0]`. zero-pointers for absent zp are NOT supported by the
+// typed_kernel ABI — the wrapper synthesizes 1-element zero buffers when
+// the ONNX node omits zp (matches the M4.4 DequantizeLinear convention).
+//
+// Shape layout: `a` is row-major `[M, K]`, `b` is row-major `[K, N]`,
+// `out` is row-major `[M, N]`. Output is always Int32 — no scale is
+// applied here; that's a separate downstream op (Mul or fused
+// DequantizeLinear).
+//
+// Worst-case accumulator: K * 127 * 127 ≈ K * 16k. K=3072 (DistilBERT FFN)
+// → ~50M, well within INT32_MAX (2.1e9). Input range bounds verified by
+// the matmul_integer_k_3072_overflow_safety_distilbert_ffn test on the
+// CPU forward (the GPU oracle).
+//
+// All four kernels share an identical signature shape:
+//   (int* out, const T_a* a, const T_b* b, const T_a* a_zp,
+//    const T_b* b_zp, size_t m, size_t k_dim, size_t n)
+// so the wrapper's typed_kernel tuple structure changes only the operand
+// element types. Promotion to `int` happens explicitly per-element so
+// signed/unsigned extension is unambiguous.
+// ============================================================================
+extern "C" __global__ void matmul_integer_s8s8_kernel(
+    int* out, const signed char* a, const signed char* b,
+    const signed char* a_zp, const signed char* b_zp,
+    size_t m, size_t k_dim, size_t n
+) {
+    size_t mn = blockIdx.x * blockDim.x + threadIdx.x;
+    if (mn >= m * n) return;
+    size_t row = mn / n;
+    size_t col = mn % n;
+    int azp = (int)a_zp[0];
+    int bzp = (int)b_zp[0];
+    int acc = 0;
+    for (size_t kk = 0; kk < k_dim; ++kk) {
+        int av = (int)a[row * k_dim + kk] - azp;
+        int bv = (int)b[kk * n + col] - bzp;
+        acc += av * bv;
+    }
+    out[mn] = acc;
+}
+
+extern "C" __global__ void matmul_integer_u8s8_kernel(
+    int* out, const unsigned char* a, const signed char* b,
+    const unsigned char* a_zp, const signed char* b_zp,
+    size_t m, size_t k_dim, size_t n
+) {
+    size_t mn = blockIdx.x * blockDim.x + threadIdx.x;
+    if (mn >= m * n) return;
+    size_t row = mn / n;
+    size_t col = mn % n;
+    int azp = (int)a_zp[0];
+    int bzp = (int)b_zp[0];
+    int acc = 0;
+    for (size_t kk = 0; kk < k_dim; ++kk) {
+        int av = (int)a[row * k_dim + kk] - azp;
+        int bv = (int)b[kk * n + col] - bzp;
+        acc += av * bv;
+    }
+    out[mn] = acc;
+}
+
+extern "C" __global__ void matmul_integer_s8u8_kernel(
+    int* out, const signed char* a, const unsigned char* b,
+    const signed char* a_zp, const unsigned char* b_zp,
+    size_t m, size_t k_dim, size_t n
+) {
+    size_t mn = blockIdx.x * blockDim.x + threadIdx.x;
+    if (mn >= m * n) return;
+    size_t row = mn / n;
+    size_t col = mn % n;
+    int azp = (int)a_zp[0];
+    int bzp = (int)b_zp[0];
+    int acc = 0;
+    for (size_t kk = 0; kk < k_dim; ++kk) {
+        int av = (int)a[row * k_dim + kk] - azp;
+        int bv = (int)b[kk * n + col] - bzp;
+        acc += av * bv;
+    }
+    out[mn] = acc;
+}
+
+extern "C" __global__ void matmul_integer_u8u8_kernel(
+    int* out, const unsigned char* a, const unsigned char* b,
+    const unsigned char* a_zp, const unsigned char* b_zp,
+    size_t m, size_t k_dim, size_t n
+) {
+    size_t mn = blockIdx.x * blockDim.x + threadIdx.x;
+    if (mn >= m * n) return;
+    size_t row = mn / n;
+    size_t col = mn % n;
+    int azp = (int)a_zp[0];
+    int bzp = (int)b_zp[0];
+    int acc = 0;
+    for (size_t kk = 0; kk < k_dim; ++kk) {
+        int av = (int)a[row * k_dim + kk] - azp;
+        int bv = (int)b[kk * n + col] - bzp;
+        acc += av * bv;
+    }
+    out[mn] = acc;
 }
 "#;

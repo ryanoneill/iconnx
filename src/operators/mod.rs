@@ -40,6 +40,7 @@ pub mod leaky_relu;
 pub mod less;
 pub mod lstm;
 pub mod matmul;
+pub mod matmul_integer;
 pub mod max_pool;
 pub mod mul;
 pub mod nonzero;

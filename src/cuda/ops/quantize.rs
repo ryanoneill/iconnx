@@ -375,3 +375,305 @@ pub fn gpu_dynamic_quantize_linear(
 
     Ok(vec![y, scale_out, zp_out])
 }
+
+/// GPU `MatMulInteger`: integer GEMM, output `Int32`.
+///
+/// 2-D inputs only (M4.6 MVP — batched MatMul is out of scope, since
+/// DistilBERT-INT8 unrolls batches at the IR level). `a` is `[M, K]`,
+/// `b` is `[K, N]`, output is `[M, N]`. Each operand can be `Int8` or
+/// `UInt8`; the wrapper dispatches to one of the four NVRTC kernel
+/// variants — `s8s8`, `u8s8`, `s8u8`, `u8u8`.
+///
+/// `a_zp` / `b_zp` are optional. When `None`, a 1-element zero buffer in
+/// the operand's dtype is synthesized so the kernel signature stays
+/// uniform (matches the M4.4 `DequantizeLinear` convention; nullable
+/// device pointers are not part of the typed_kernel ABI). When
+/// `Some(t)`, the wrapper validates dtype matches the operand and shape
+/// is scalar (rank 0 or single-element rank-1). Per-axis zp is rejected
+/// — the CPU forward enforces the same restriction.
+///
+/// Returns `Err(CudaError::Kernel(...))` for any invalid input —
+/// non-2-D shapes, mismatched K, unsupported dtype combo, malformed zp.
+/// No silent fallbacks.
+pub fn gpu_matmul_integer(
+    ctx: &IconnxCudaContext,
+    cache: &OpsKernelCache,
+    pool: &mut GpuMemoryPool,
+    a: &GpuTensor,
+    b: &GpuTensor,
+    a_zp: Option<&GpuTensor>,
+    b_zp: Option<&GpuTensor>,
+) -> Result<GpuTensor, CudaError> {
+    // Shape validation — 2-D only.
+    if a.shape().len() != 2 || b.shape().len() != 2 {
+        return Err(CudaError::Kernel(format!(
+            "MatMulInteger: 2-D inputs required (got a:{:?}, b:{:?}); \
+             batched is M4.7+ scope",
+            a.shape(),
+            b.shape()
+        )));
+    }
+    let m = a.shape()[0];
+    let k_dim = a.shape()[1];
+    if b.shape()[0] != k_dim {
+        return Err(CudaError::Kernel(format!(
+            "MatMulInteger: K mismatch — a is [{},{}], b is [{},{}]",
+            m,
+            k_dim,
+            b.shape()[0],
+            b.shape()[1]
+        )));
+    }
+    let n = b.shape()[1];
+    let out_n = m * n;
+
+    // Validate operand dtypes.
+    if !matches!(a.dtype(), DType::Int8 | DType::UInt8) {
+        return Err(CudaError::Kernel(format!(
+            "MatMulInteger: a dtype {} unsupported (must be Int8 or UInt8)",
+            a.dtype().name()
+        )));
+    }
+    if !matches!(b.dtype(), DType::Int8 | DType::UInt8) {
+        return Err(CudaError::Kernel(format!(
+            "MatMulInteger: b dtype {} unsupported (must be Int8 or UInt8)",
+            b.dtype().name()
+        )));
+    }
+
+    // Materialize zps as 1-element device buffers in the operand dtype.
+    // Mirror DequantizeLinear's "no nullable pointers in typed_kernel
+    // signatures" stance: synthesize a 1-element zero buffer when zp is
+    // absent. When zp is present, validate dtype/shape and reject
+    // multi-element (per-axis) zp — DistilBERT does not exercise that
+    // path, and CPU forward enforces the same scalar-only restriction.
+    let a_zp_owned = resolve_scalar_zp(ctx, a_zp, a.dtype(), "a")?;
+    let b_zp_owned = resolve_scalar_zp(ctx, b_zp, b.dtype(), "b")?;
+
+    let mut output = pool.get_tensor_i32(ctx, vec![m, n])?;
+    let config = LaunchConfig::for_num_elems(out_n as u32);
+
+    match (a.dtype(), b.dtype()) {
+        (DType::Int8, DType::Int8) => {
+            // SAFETY: signature matches `matmul_integer_s8s8_kernel`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, i32>,
+                    &DeviceSlice<'_, i8>,
+                    &DeviceSlice<'_, i8>,
+                    &DeviceSlice<'_, i8>,
+                    &DeviceSlice<'_, i8>,
+                    usize,
+                    usize,
+                    usize,
+                )>("matmul_integer_s8s8_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("matmul_integer_s8s8_kernel lookup: {}", e))
+            })?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i32_mut()?,
+                        a.data_i8()?,
+                        b.data_i8()?,
+                        a_zp_owned.data_i8()?,
+                        b_zp_owned.data_i8()?,
+                        m,
+                        k_dim,
+                        n,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("matmul_integer_s8s8_kernel launch: {}", e))
+                })?;
+        }
+        (DType::UInt8, DType::Int8) => {
+            // SAFETY: signature matches `matmul_integer_u8s8_kernel`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, i32>,
+                    &DeviceSlice<'_, u8>,
+                    &DeviceSlice<'_, i8>,
+                    &DeviceSlice<'_, u8>,
+                    &DeviceSlice<'_, i8>,
+                    usize,
+                    usize,
+                    usize,
+                )>("matmul_integer_u8s8_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("matmul_integer_u8s8_kernel lookup: {}", e))
+            })?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i32_mut()?,
+                        a.data_u8()?,
+                        b.data_i8()?,
+                        a_zp_owned.data_u8()?,
+                        b_zp_owned.data_i8()?,
+                        m,
+                        k_dim,
+                        n,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("matmul_integer_u8s8_kernel launch: {}", e))
+                })?;
+        }
+        (DType::Int8, DType::UInt8) => {
+            // SAFETY: signature matches `matmul_integer_s8u8_kernel`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, i32>,
+                    &DeviceSlice<'_, i8>,
+                    &DeviceSlice<'_, u8>,
+                    &DeviceSlice<'_, i8>,
+                    &DeviceSlice<'_, u8>,
+                    usize,
+                    usize,
+                    usize,
+                )>("matmul_integer_s8u8_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("matmul_integer_s8u8_kernel lookup: {}", e))
+            })?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i32_mut()?,
+                        a.data_i8()?,
+                        b.data_u8()?,
+                        a_zp_owned.data_i8()?,
+                        b_zp_owned.data_u8()?,
+                        m,
+                        k_dim,
+                        n,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("matmul_integer_s8u8_kernel launch: {}", e))
+                })?;
+        }
+        (DType::UInt8, DType::UInt8) => {
+            // SAFETY: signature matches `matmul_integer_u8u8_kernel`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, i32>,
+                    &DeviceSlice<'_, u8>,
+                    &DeviceSlice<'_, u8>,
+                    &DeviceSlice<'_, u8>,
+                    &DeviceSlice<'_, u8>,
+                    usize,
+                    usize,
+                    usize,
+                )>("matmul_integer_u8u8_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("matmul_integer_u8u8_kernel lookup: {}", e))
+            })?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_i32_mut()?,
+                        a.data_u8()?,
+                        b.data_u8()?,
+                        a_zp_owned.data_u8()?,
+                        b_zp_owned.data_u8()?,
+                        m,
+                        k_dim,
+                        n,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("matmul_integer_u8u8_kernel launch: {}", e))
+                })?;
+        }
+        // The dtype validation at the top of the function rejects every
+        // non-Int8/UInt8 pairing before we get here, so this branch is
+        // unreachable.
+        (a_dt, b_dt) => {
+            return Err(CudaError::Kernel(format!(
+                "MatMulInteger: unsupported dtype combo a={}, b={} (must be \
+                 Int8 or UInt8)",
+                a_dt.name(),
+                b_dt.name()
+            )));
+        }
+    }
+
+    Ok(output)
+}
+
+/// Resolve an optional scalar zp to a 1-element device buffer in the
+/// operand's dtype.
+///
+/// When `zp` is `None`, allocates a 1-element zeros buffer. When
+/// `Some(t)`, validates dtype matches `operand_dtype` and shape is
+/// scalar (rank 0 or single-element rank-1) — per-axis zp is rejected
+/// to keep the M4.6 GPU kernel ABI simple. Returns the zp buffer ready
+/// for direct kernel consumption.
+fn resolve_scalar_zp(
+    ctx: &IconnxCudaContext,
+    zp: Option<&GpuTensor>,
+    operand_dtype: DType,
+    label: &str,
+) -> Result<GpuTensor, CudaError> {
+    match zp {
+        None => match operand_dtype {
+            DType::Int8 => GpuTensor::zeros_i8(ctx, vec![1]),
+            DType::UInt8 => GpuTensor::zeros_u8(ctx, vec![1]),
+            other => Err(CudaError::Kernel(format!(
+                "MatMulInteger: cannot synthesize zp for operand dtype {}",
+                other.name()
+            ))),
+        },
+        Some(t) => {
+            if t.dtype() != operand_dtype {
+                return Err(CudaError::Kernel(format!(
+                    "MatMulInteger: {}_zero_point dtype {} must match \
+                     operand dtype {}",
+                    label,
+                    t.dtype().name(),
+                    operand_dtype.name()
+                )));
+            }
+            let shape = t.shape();
+            let is_scalar = shape.is_empty() || (shape.len() == 1 && shape[0] == 1);
+            if !is_scalar {
+                return Err(CudaError::Kernel(format!(
+                    "MatMulInteger: {}_zero_point must be scalar (got shape \
+                     {:?}); per-axis zp is not supported in M4.6",
+                    label, shape
+                )));
+            }
+            // Caller's zp is already a 1-element buffer in the right
+            // dtype; rematerialize to a fresh contiguous 1-element buffer
+            // so the kernel always sees a length-1 device slice. Cheaper
+            // than threading shape-aware indexing through the kernel ABI.
+            match operand_dtype {
+                DType::Int8 => {
+                    let host = t.to_host_i8(ctx)?;
+                    GpuTensor::from_host_i8(ctx, &host[..1], vec![1])
+                }
+                DType::UInt8 => {
+                    let host = t.to_host_u8(ctx)?;
+                    GpuTensor::from_host_u8(ctx, &host[..1], vec![1])
+                }
+                other => Err(CudaError::Kernel(format!(
+                    "MatMulInteger: cannot rematerialize zp for operand dtype {}",
+                    other.name()
+                ))),
+            }
+        }
+    }
+}

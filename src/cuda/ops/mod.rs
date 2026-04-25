@@ -44,4 +44,4 @@ pub use comparison::{gpu_and, gpu_not, gpu_or};
 pub use sequence::{gpu_atan, gpu_cumsum, gpu_range, gpu_range_i64};
 
 // Quantization operations (WS-4)
-pub use quantize::{gpu_dequantize_linear, gpu_dynamic_quantize_linear};
+pub use quantize::{gpu_dequantize_linear, gpu_dynamic_quantize_linear, gpu_matmul_integer};

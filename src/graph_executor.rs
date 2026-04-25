@@ -10,7 +10,8 @@ use crate::operators::{
     cumsum, dequantize_linear, div, equal, erf, exp, expand, flatten, floor, gather, gemm,
     global_average_pool,
     greater, greater_or_equal,
-    layer_normalization, leaky_relu, less, lstm, matmul, max_pool, mul, nonzero, pad, pow, range,
+    layer_normalization, leaky_relu, less, lstm, matmul, matmul_integer, max_pool, mul, nonzero,
+    pad, pow, range,
     reduce_mean, reduce_sum, relu, reshape, resize, round, scatter_nd, shape, sigmoid, sin, slice,
     softmax, sqrt, squeeze, stft, sub, tanh, transpose, unsqueeze, where_op,
 };
@@ -391,6 +392,7 @@ impl GraphExecutor {
             "Less" => Ok(less::Less::forward(inputs, attributes)),
             "LSTM" => Ok(lstm::LSTM::forward(inputs, attributes)),
             "MatMul" => Ok(matmul::MatMul::forward(inputs, attributes)),
+            "MatMulInteger" => Ok(matmul_integer::MatMulInteger::forward(inputs, attributes)),
             "Mul" => Ok(mul::Mul::forward(inputs, attributes)),
             "NonZero" => Ok(nonzero::NonZero::forward(inputs, attributes)),
             "Pad" => Ok(pad::Pad::forward(inputs, attributes)),

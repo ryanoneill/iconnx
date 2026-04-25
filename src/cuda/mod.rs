@@ -94,6 +94,7 @@ pub use ops::{
     // Quantization ops (WS-4)
     gpu_dequantize_linear,
     gpu_dynamic_quantize_linear,
+    gpu_matmul_integer,
     // Comparison ops
     gpu_equal,
     gpu_gather,
