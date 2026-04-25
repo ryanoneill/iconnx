@@ -91,6 +91,8 @@ pub use ops::{
     gpu_atan,
     gpu_copy,
     gpu_cumsum,
+    // Quantization ops (WS-4)
+    gpu_dequantize_linear,
     // Comparison ops
     gpu_equal,
     gpu_gather,

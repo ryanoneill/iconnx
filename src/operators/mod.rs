@@ -20,6 +20,7 @@ pub mod conv;
 pub mod conv_transpose;
 pub mod cos;
 pub mod cumsum;
+pub mod dequantize_linear;
 pub mod div;
 pub mod equal;
 pub mod erf;

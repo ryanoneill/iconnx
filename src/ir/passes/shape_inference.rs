@@ -114,6 +114,13 @@ fn infer_node_output_shapes(
             vec![s]
         }
 
+        // DequantizeLinear: output shape == input[0] shape (scale/zp are
+        // not part of the data shape — they parameterize the conversion).
+        "DequantizeLinear" => {
+            let s = input_shapes.first().cloned().unwrap_or_default();
+            vec![s]
+        }
+
         // Shape family.
         "Shape" => {
             let rank = input_shapes.first().map(|s| s.len()).unwrap_or(0);

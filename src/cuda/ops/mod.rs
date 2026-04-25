@@ -13,6 +13,7 @@ mod cast;
 mod comparison;
 mod kernels;
 mod layout;
+mod quantize;
 mod sequence;
 
 pub use cache::OpsKernelCache;
@@ -40,3 +41,6 @@ pub use comparison::{gpu_and, gpu_not, gpu_or};
 
 // Sequence and math operations
 pub use sequence::{gpu_atan, gpu_cumsum, gpu_range, gpu_range_i64};
+
+// Quantization operations (WS-4)
+pub use quantize::gpu_dequantize_linear;

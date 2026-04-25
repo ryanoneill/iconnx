@@ -7,7 +7,8 @@
 use crate::operators;
 use crate::operators::{
     add, and, atan, cast, clip, concat, constant, constant_of_shape, conv, conv_transpose, cos,
-    cumsum, div, equal, erf, exp, expand, flatten, floor, gather, gemm, global_average_pool,
+    cumsum, dequantize_linear, div, equal, erf, exp, expand, flatten, floor, gather, gemm,
+    global_average_pool,
     greater, greater_or_equal,
     layer_normalization, leaky_relu, less, lstm, matmul, max_pool, mul, nonzero, pad, pow, range,
     reduce_mean, reduce_sum, relu, reshape, resize, round, scatter_nd, shape, sigmoid, sin, slice,
@@ -395,6 +396,9 @@ impl GraphExecutor {
             "Squeeze" => Ok(squeeze::Squeeze::forward(inputs, attributes)),
             "STFT" => Ok(stft::Stft::forward(inputs, attributes)),
             "Sub" => Ok(sub::Sub::forward(inputs, attributes)),
+            "DequantizeLinear" => Ok(dequantize_linear::DequantizeLinear::forward(
+                inputs, attributes,
+            )),
             "Erf" => Ok(erf::Erf::forward(inputs, attributes)),
             "Flatten" => Ok(flatten::Flatten::forward(inputs, attributes)),
             "GlobalAveragePool" => Ok(global_average_pool::GlobalAveragePool::forward(

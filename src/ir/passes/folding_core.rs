@@ -137,6 +137,11 @@ fn dispatch_cpu_forward(
         "Round" => round::Round::forward(inputs, attributes),
         "Cast" => cast::Cast::forward(inputs, attributes),
 
+        // Quantization. The integer→f32 conversion is cheap; folding it
+        // turns an inference-time op into a parse-time tensor when its
+        // x/scale/zp inputs are all initializers.
+        "DequantizeLinear" => dequantize_linear::DequantizeLinear::forward(inputs, attributes),
+
         // Shape / layout.
         "Reshape" => reshape::Reshape::forward(inputs, attributes),
         "Flatten" => flatten::Flatten::forward(inputs, attributes),

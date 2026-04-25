@@ -23,9 +23,10 @@ use std::collections::HashMap;
 use crate::cuda::inference::{compute_broadcast_shape, maybe_expand};
 use crate::cuda::ops::{
     gpu_cast, gpu_concat, gpu_constant_of_shape_direct, gpu_constant_of_shape_direct_i64, gpu_copy,
-    gpu_cumsum, gpu_expand, gpu_gather_from_gpu, gpu_max_pool_2d, gpu_nonzero, gpu_pad, gpu_range,
-    gpu_range_i64, gpu_resize, gpu_scatter_nd, gpu_shape, gpu_slice_nd, gpu_transpose_2d,
-    gpu_transpose_nd, gpu_where, ResizeCoordMode, ResizeMode, ResizeNearestMode,
+    gpu_cumsum, gpu_dequantize_linear, gpu_expand, gpu_gather_from_gpu, gpu_max_pool_2d,
+    gpu_nonzero, gpu_pad, gpu_range, gpu_range_i64, gpu_resize, gpu_scatter_nd, gpu_shape,
+    gpu_slice_nd, gpu_transpose_2d, gpu_transpose_nd, gpu_where, ResizeCoordMode, ResizeMode,
+    ResizeNearestMode,
 };
 use crate::cuda::tensor::DType;
 use crate::cuda::{CudaError, GpuTensor};
@@ -940,6 +941,44 @@ impl Executor {
                     exclusive,
                     reverse,
                 )
+            }
+
+            // --- DequantizeLinear (WS-4 M4.4) ----------------------------
+            //
+            // y = (x - zero_point) * scale; output is FP32. `scale` is FP32
+            // (scalar = per-tensor; 1-D = per-axis). `zero_point` (input 2)
+            // is optional and shares dtype with `x`. `axis` defaults to 1
+            // and is ignored when `scale` is scalar.
+            "DequantizeLinear" => {
+                if inputs.len() < 2 || inputs.len() > 3 {
+                    return Err(CudaError::Kernel(format!(
+                        "DequantizeLinear requires 2 or 3 inputs, got {}",
+                        inputs.len()
+                    )));
+                }
+                let x = inputs[0];
+                let scale = inputs[1];
+                let zp = inputs.get(2).copied();
+
+                // Resolve `axis` — default 1, normalize negatives modulo
+                // ndim. Only meaningful in the per-axis case; the wrapper
+                // ignores it when `scale` is scalar.
+                let raw_axis = attributes.get_int("axis").unwrap_or(1);
+                let ndim = x.ndim() as i64;
+                let resolved = if raw_axis < 0 {
+                    raw_axis + ndim
+                } else {
+                    raw_axis
+                };
+                if !(0..ndim).contains(&resolved) {
+                    return Err(CudaError::Kernel(format!(
+                        "DequantizeLinear: axis {} out of range for ndim {}",
+                        raw_axis, ndim
+                    )));
+                }
+                let axis = resolved as usize;
+
+                gpu_dequantize_linear(&self.ctx, &self.ops_kernels, &mut pool, x, scale, zp, axis)
             }
 
             other => Err(CudaError::Kernel(format!(
