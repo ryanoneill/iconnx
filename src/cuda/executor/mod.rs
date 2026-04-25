@@ -451,8 +451,21 @@ pub(super) fn resolve_inputs<'a>(
 }
 
 /// Upload a CPU `Tensor` to the GPU, preserving its dtype where possible.
-/// Bool / Float64 fall back to Float32 upload (matching today's behavior
-/// in `cuda::inference::mod.rs::run`).
+///
+/// Bool tensors are cast to Float32 on upload (false → 0.0, true → 1.0)
+/// to match iconnx's existing **f32-as-bool** convention — comparison
+/// ops (Equal, Less, Greater, …) already produce Float32 outputs that
+/// downstream Where consumes as condition. Encoding Bool initializers
+/// as Float32 keeps every "bool-shaped" tensor on GPU under one
+/// representation; the alternative (Int32-as-bool, or a true GPU Bool
+/// dtype) would either fork the encoding or kick off the broader audit
+/// L2.1 / L3.5 sweep, which belongs in its own scoped phase. GPT-2's
+/// 1×1×1024×1024 causal-mask Constant is the M2.7.c first surface for
+/// this path.
+///
+/// Float64 has no GPU representation today and reaches the catchall
+/// `_ => as_slice()` path, which panics — match the audit L2.1 status
+/// quo, fix when a roster model surfaces it.
 pub(super) fn upload_tensor(
     ctx: &IconnxCudaContext,
     tensor: &Tensor,
@@ -470,8 +483,18 @@ pub(super) fn upload_tensor(
             let data = tensor.as_slice_i32();
             GpuTensor::from_host_i32(ctx, &data, tensor.shape().to_vec())
         }
+        Tensor::Bool(arr) => {
+            // Bool → Float32 with `false` mapping to 0.0 and `true` to
+            // 1.0. Explicit conversion — `tensor.as_slice()` panics on
+            // non-Float32 (tensor.rs:296), which the prior fallback hit.
+            let data: Vec<f32> = arr.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
+            GpuTensor::from_host_f32(ctx, &data, tensor.shape().to_vec())
+        }
         _ => {
-            // Bool and Float64: convert to Float32 on upload.
+            // Float64: not yet representable on GPU; falls through to the
+            // panicking accessor as before. Replace with explicit Float64
+            // → Float32 cast (or a true Float64 GPU path) when a roster
+            // model surfaces it.
             let data = tensor.as_slice();
             GpuTensor::from_host_f32(ctx, &data, tensor.shape().to_vec())
         }
