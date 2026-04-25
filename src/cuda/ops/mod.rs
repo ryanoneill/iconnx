@@ -25,9 +25,9 @@ pub use cast::gpu_cast;
 pub use layout::{
     gpu_concat, gpu_constant_of_shape, gpu_constant_of_shape_direct,
     gpu_constant_of_shape_direct_i64, gpu_copy, gpu_expand,
-    gpu_gather, gpu_gather_from_gpu, gpu_nonzero, gpu_pad, gpu_resize, gpu_scatter_nd, gpu_shape,
-    gpu_slice_contiguous, gpu_slice_nd, gpu_split, gpu_transpose_2d, gpu_transpose_nd, gpu_where,
-    ResizeCoordMode, ResizeMode, ResizeNearestMode,
+    gpu_gather, gpu_gather_from_gpu, gpu_max_pool_2d, gpu_nonzero, gpu_pad, gpu_resize,
+    gpu_scatter_nd, gpu_shape, gpu_slice_contiguous, gpu_slice_nd, gpu_split, gpu_transpose_2d,
+    gpu_transpose_nd, gpu_where, ResizeCoordMode, ResizeMode, ResizeNearestMode,
 };
 
 // Comparison operations

@@ -104,6 +104,50 @@ impl Executor {
                 }
             }
 
+            "GlobalAveragePool" => {
+                // Reduce all spatial dims (everything past dim 1) by
+                // peeling the last axis ndim-2 times via the existing
+                // single-axis kernel, then keepdims-reshape so the
+                // output is `[N, C, 1, 1, ...]`. iconnx's
+                // `gpu_reduce_mean_axis` only handles the last axis;
+                // iterating reuses tested infrastructure rather than
+                // adding a new multi-axis kernel for one consumer.
+                let input = inputs[0];
+                let ndim = input.ndim();
+                if ndim < 3 {
+                    return Err(CudaError::Kernel(format!(
+                        "GlobalAveragePool requires at least 3 dims, got {}",
+                        ndim
+                    )));
+                }
+                // First reduction borrows `input`; subsequent
+                // reductions own their result tensor.
+                let mut owned: Option<GpuTensor> = None;
+                for _ in 2..ndim {
+                    let src: &GpuTensor = match owned.as_ref() {
+                        Some(t) => t,
+                        None => input,
+                    };
+                    let next = gpu_reduce_mean_axis(
+                        &self.ctx,
+                        &self.reduction_kernels,
+                        &mut pool,
+                        src,
+                    )?;
+                    owned = Some(next);
+                }
+
+                let reduced = owned.unwrap_or_else(|| input.clone());
+                // Output is currently [N, C]; restore spatial slots as 1s.
+                let mut keepdims_shape = vec![input.shape()[0], input.shape()[1]];
+                keepdims_shape.extend(std::iter::repeat_n(1usize, ndim - 2));
+                reduced.reshape(keepdims_shape).ok_or_else(|| {
+                    CudaError::Kernel(
+                        "GlobalAveragePool: failed to restore keepdims spatial dims".into(),
+                    )
+                })
+            }
+
             "LayerNormalization" => {
                 let epsilon = attributes.get_float("epsilon").unwrap_or(1e-5);
                 if inputs.len() < 3 {
