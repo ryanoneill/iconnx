@@ -617,10 +617,10 @@ impl OnnxModel {
 
     /// Parse a TensorProto into a Tensor.
     ///
-    /// Supports ONNX dtypes FLOAT(1), INT64(7), INT32(6). Every
-    /// failure path — unsupported dtype, empty/misaligned payload,
-    /// shape/length mismatch — returns a typed [`ParseError`] so
-    /// callers can decide what to do instead of silently dropping
+    /// Supports ONNX dtypes FLOAT(1), INT64(7), INT32(6), BOOL(9).
+    /// Every failure path — unsupported dtype, empty/misaligned
+    /// payload, shape/length mismatch — returns a typed [`ParseError`]
+    /// so callers can decide what to do instead of silently dropping
     /// the attribute (the pre-WS-1 behaviour).
     fn parse_tensor_proto(
         tensor_proto: &onnx_proto::TensorProto,
@@ -645,6 +645,7 @@ impl OnnxModel {
                 1 => Ok(crate::tensor::Tensor::from_vec_f32(Vec::new(), shape)),
                 7 => Ok(crate::tensor::Tensor::from_vec_i64(Vec::new(), shape)),
                 6 => Ok(crate::tensor::Tensor::from_vec_i32(Vec::new(), shape)),
+                9 => Ok(crate::tensor::Tensor::from_vec_bool(Vec::new(), shape)),
                 other => Err(ParseError::UnsupportedDType {
                     name,
                     dtype_id: other,
@@ -776,6 +777,42 @@ impl OnnxModel {
                     });
                 }
                 Ok(crate::tensor::Tensor::from_vec_i32(data, shape))
+            }
+            9 => {
+                // BOOL — ONNX wire format: int32_data carries one i32
+                // per bool (nonzero = true); raw_data carries one byte
+                // per bool. Mirrors `extract_weights`'s
+                // `decode_bool_payload` semantics so attribute-level
+                // and initializer-level Bool tensors decode identically.
+                // GPT-2's causal mask Constant (1×1×1024×1024 lower
+                // triangular) is the M2.7.c first-attempt blocker that
+                // motivated this dispatch arm.
+                let data: Vec<bool> = if !tensor_proto.int32_data.is_empty() {
+                    tensor_proto.int32_data.iter().map(|&v| v != 0).collect()
+                } else if let Some(raw) = &tensor_proto.raw_data {
+                    if raw.is_empty() {
+                        return Err(ParseError::InvalidTensorData {
+                            name,
+                            reason: "empty raw_data for BOOL tensor".to_string(),
+                        });
+                    }
+                    raw.iter().map(|&b| b != 0).collect()
+                } else {
+                    return Err(ParseError::InvalidTensorData {
+                        name,
+                        reason: "no int32_data and no raw_data".to_string(),
+                    });
+                };
+
+                if data.len() != expected_len {
+                    return Err(ParseError::ShapeMismatch {
+                        name,
+                        declared: shape,
+                        declared_len: expected_len,
+                        actual_len: data.len(),
+                    });
+                }
+                Ok(crate::tensor::Tensor::from_vec_bool(data, shape))
             }
             other => Err(ParseError::UnsupportedDType {
                 name,
@@ -1214,6 +1251,86 @@ mod tests {
                 assert_eq!(name, "corrupted");
             }
             other => panic!("expected InvalidTensorData, got {:?}", other),
+        }
+    }
+
+    // ---- BOOL parse coverage (GPT-2 M2.7.c blocker) ----------------
+    //
+    // Causal masks in decoder transformers are Constant attribute
+    // tensors with dtype=BOOL. WS-1 M1.2 added BOOL to extract_weights
+    // (initializer path), but parse_tensor_proto (attribute path) was
+    // FLOAT/INT64/INT32-only. The fix mirrors decode_bool_payload's
+    // semantics: int32_data → one i32 per bool (nonzero = true);
+    // raw_data → one byte per bool.
+
+    #[test]
+    fn parse_tensor_proto_bool_via_int32_data() {
+        // 2x2 BOOL via int32_data — the typed-data wire format.
+        let proto = onnx_proto::TensorProto {
+            name: Some("mask_int32".to_string()),
+            data_type: Some(9),
+            dims: vec![2, 2],
+            int32_data: vec![1, 0, 1, 0],
+            ..Default::default()
+        };
+        let tensor =
+            OnnxModel::parse_tensor_proto(&proto).expect("BOOL via int32_data should parse");
+        match tensor {
+            Tensor::Bool(arr) => {
+                assert_eq!(arr.shape(), &[2, 2]);
+                assert_eq!(
+                    arr.iter().copied().collect::<Vec<_>>(),
+                    vec![true, false, true, false]
+                );
+            }
+            other => panic!("expected Tensor::Bool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_bool_via_raw_data() {
+        // 2x2 BOOL via raw_data — one byte per bool. Use mixed
+        // nonzero values (255, 1) to confirm "any nonzero = true".
+        let proto = onnx_proto::TensorProto {
+            name: Some("mask_raw".to_string()),
+            data_type: Some(9),
+            dims: vec![2, 2],
+            raw_data: Some(vec![1u8, 0u8, 0xFFu8, 0u8]),
+            ..Default::default()
+        };
+        let tensor =
+            OnnxModel::parse_tensor_proto(&proto).expect("BOOL via raw_data should parse");
+        match tensor {
+            Tensor::Bool(arr) => {
+                assert_eq!(arr.shape(), &[2, 2]);
+                assert_eq!(
+                    arr.iter().copied().collect::<Vec<_>>(),
+                    vec![true, false, true, false]
+                );
+            }
+            other => panic!("expected Tensor::Bool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_bool_zero_element() {
+        // dims=[0] + empty data → empty Bool tensor (zero-element
+        // fast path). Covers the symmetric extension to the
+        // expected_len == 0 branch.
+        let proto = onnx_proto::TensorProto {
+            name: Some("empty_mask".to_string()),
+            data_type: Some(9),
+            dims: vec![0],
+            ..Default::default()
+        };
+        let tensor =
+            OnnxModel::parse_tensor_proto(&proto).expect("zero-element BOOL should parse");
+        match tensor {
+            Tensor::Bool(arr) => {
+                assert_eq!(arr.shape(), &[0]);
+                assert_eq!(arr.len(), 0);
+            }
+            other => panic!("expected Tensor::Bool, got {:?}", other),
         }
     }
 
