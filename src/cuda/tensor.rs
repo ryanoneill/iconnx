@@ -893,6 +893,19 @@ mod tests {
         // Trying to get i64 data should fail.
         assert!(tensor_f32.data_i64().is_err());
         assert!(tensor_f32.to_host_i64(&ctx).is_err());
+
+        // INT8 / UINT8 (WS-4 M4.3): same wrong-variant contract.
+        let tensor_i8 = GpuTensor::from_host_i8(&ctx, &[-1_i8, 0, 1], vec![3])
+            .expect("Failed to create i8 tensor");
+        assert!(tensor_i8.data_u8().is_err());
+        assert!(tensor_i8.to_host_u8(&ctx).is_err());
+        assert!(tensor_i8.data_f32().is_err());
+
+        let tensor_u8 = GpuTensor::from_host_u8(&ctx, &[0_u8, 128, 255], vec![3])
+            .expect("Failed to create u8 tensor");
+        assert!(tensor_u8.data_i8().is_err());
+        assert!(tensor_u8.to_host_i8(&ctx).is_err());
+        assert!(tensor_u8.data_i32().is_err());
     }
 
     #[test]
@@ -908,5 +921,12 @@ mod tests {
 
         let tensor_i32 = GpuTensor::zeros_i32(&ctx, vec![100]).unwrap();
         assert_eq!(tensor_i32.size_bytes(), 400); // 100 * 4 bytes.
+
+        // INT8 / UINT8 (WS-4 M4.3): 1 byte per element.
+        let tensor_i8 = GpuTensor::zeros_i8(&ctx, vec![100]).unwrap();
+        assert_eq!(tensor_i8.size_bytes(), 100);
+
+        let tensor_u8 = GpuTensor::zeros_u8(&ctx, vec![100]).unwrap();
+        assert_eq!(tensor_u8.size_bytes(), 100);
     }
 }

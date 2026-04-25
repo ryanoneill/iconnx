@@ -44,7 +44,11 @@ where
 }
 
 /// GPU Cast: convert tensor from one dtype to another.
-/// Supports conversions between Float32, Int64, and Int32.
+///
+/// Supports conversions between Float32, Int64, and Int32. INT8/UINT8 are
+/// not handled here — those cross the float/int boundary via
+/// `DequantizeLinear` (M4.4) and `DynamicQuantizeLinear` (M4.5); plain
+/// Cast on those dtypes returns `CudaError::Kernel`.
 pub fn gpu_cast(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
