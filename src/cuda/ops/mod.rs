@@ -14,6 +14,7 @@ mod comparison;
 mod kernels;
 mod layout;
 mod quantize;
+mod quantize_kernels;
 mod sequence;
 
 pub use cache::OpsKernelCache;
