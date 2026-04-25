@@ -280,6 +280,13 @@ fn mul_add_fused_matches_hand_computed_within_1e_5() {
         .map(|((a, b), c)| a * b + c)
         .collect();
 
+    // `b` is a static initializer (matching `c`'s shape) so the matcher
+    // recognizes the MulAdd pattern. Path 1 of the wrapper handles the
+    // [8] x [8] x [8] case; the math is unchanged from when `b` was a
+    // runtime input.
+    executor
+        .add_initializer("b".into(), &Tensor::from_vec_f32(b_host, vec![8]))
+        .expect("b");
     executor
         .add_initializer("c".into(), &Tensor::from_vec_f32(c_host, vec![8]))
         .expect("c");
@@ -291,7 +298,6 @@ fn mul_add_fused_matches_hand_computed_within_1e_5() {
 
     let mut inputs = HashMap::new();
     inputs.insert("a".to_string(), Tensor::from_vec_f32(a_host, vec![8]));
-    inputs.insert("b".to_string(), Tensor::from_vec_f32(b_host, vec![8]));
     let outputs = executor.run(inputs, vec!["y"]).expect("run");
     assert_approx_eq(
         "MulAdd",

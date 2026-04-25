@@ -982,15 +982,24 @@ impl Executor {
                 gpu_dequantize_linear(&self.ctx, &self.ops_kernels, &mut pool, x, scale, zp, axis)
             }
 
-            // --- MatMulInteger (WS-4 M4.6) -------------------------------
+            // --- MatMulInteger (WS-4 M4.6 + M4.7 batched) ----------------
             //
-            // out = matmul((a - a_zp), (b - b_zp)), output Int32. 2-D
-            // inputs only; `a` is `[M, K]`, `b` is `[K, N]`; each operand
-            // is Int8 or UInt8 (4 sign-combination kernel variants).
-            // `a_zero_point` (input 2) and `b_zero_point` (input 3) are
-            // optional and must be scalar (rank 0 or single-element 1-D).
-            // Per-axis zp is rejected — DistilBERT does not exercise that
-            // path and the M4.6 GPU kernel ABI is scalar-zp only.
+            // out = matmul((a - a_zp), (b - b_zp)), output Int32. The
+            // backing kernel is 2-D only; `a` is `[M, K]`, `b` is `[K, N]`;
+            // each operand is Int8 or UInt8 (4 sign-combination kernel
+            // variants). `a_zero_point` (input 2) and `b_zero_point` (input
+            // 3) are optional and must be scalar (rank 0 or single-element
+            // 1-D). Per-axis zp is rejected — DistilBERT does not exercise
+            // that path and the M4.6 GPU kernel ABI is scalar-zp only.
+            //
+            // M4.7 surfaced 3-D × 2-D inputs from DistilBERT-INT8
+            // (`[B, M, K] × [K, N] → [B, M, N]`). Mirrors the regular
+            // `MatMul` executor's 3-D × 2-D handling in
+            // `src/cuda/executor/matmul.rs`: reshape A `[B, M, K]` →
+            // `[B*M, K]` (metadata-only on `GpuTensor`), run the existing
+            // 2-D kernel, reshape result `[B*M, N]` → `[B, M, N]`. No new
+            // kernel, no new math — just dimension flatten/restore at the
+            // wrapper boundary.
             //
             // Routed through `dispatch_layout` rather than `dispatch_matmul`
             // because every other quantization op (DequantizeLinear,
@@ -1008,7 +1017,58 @@ impl Executor {
                 let b = inputs[1];
                 let a_zp = inputs.get(2).copied();
                 let b_zp = inputs.get(3).copied();
-                gpu_matmul_integer(&self.ctx, &self.ops_kernels, &mut pool, a, b, a_zp, b_zp)
+
+                let a_ndim = a.ndim();
+                let b_ndim = b.ndim();
+                match (a_ndim, b_ndim) {
+                    (2, 2) => gpu_matmul_integer(
+                        &self.ctx,
+                        &self.ops_kernels,
+                        &mut pool,
+                        a,
+                        b,
+                        a_zp,
+                        b_zp,
+                    ),
+                    (3, 2) => {
+                        // [B, M, K] × [K, N] → [B, M, N]. Reshape A to
+                        // [B*M, K], 2-D matmul, reshape result back.
+                        let a_shape = a.shape();
+                        let b_shape = b.shape();
+                        let batch = a_shape[0];
+                        let m = a_shape[1];
+                        let k = a_shape[2];
+                        let n = b_shape[1];
+
+                        let a_reshaped =
+                            a.clone().reshape(vec![batch * m, k]).ok_or_else(|| {
+                                CudaError::Kernel(
+                                    "MatMulInteger: failed to reshape A to 2-D".into(),
+                                )
+                            })?;
+
+                        let result_2d = gpu_matmul_integer(
+                            &self.ctx,
+                            &self.ops_kernels,
+                            &mut pool,
+                            &a_reshaped,
+                            b,
+                            a_zp,
+                            b_zp,
+                        )?;
+
+                        result_2d.reshape(vec![batch, m, n]).ok_or_else(|| {
+                            CudaError::Kernel(
+                                "MatMulInteger: failed to reshape result to 3-D".into(),
+                            )
+                        })
+                    }
+                    _ => Err(CudaError::Kernel(format!(
+                        "MatMulInteger: unsupported ranks A={}D, B={}D \
+                         (M4.7 supports 2×2 and 3×2)",
+                        a_ndim, b_ndim
+                    ))),
+                }
             }
 
             other => Err(CudaError::Kernel(format!(

@@ -19,6 +19,17 @@ pub const QUANTIZE_KERNEL_NAMES: &[&str] = &[
     "matmul_integer_u8s8_kernel",
     "matmul_integer_s8u8_kernel",
     "matmul_integer_u8u8_kernel",
+    // M4.7 surfaced: Gather over UINT8 token-embedding tables — the
+    // standard quantization graph for DistilBERT-INT8 dequantizes the
+    // weight initializer downstream of the embedding lookup, so the
+    // gather has to fly UINT8.
+    "gather_u8_kernel",
+    // M4.7 surfaced: Transpose over UINT8 weight initializers. The
+    // DistilBERT-INT8 graph emits `<weight>_transposed_quantized`
+    // Transpose nodes that fly UINT8 before the downstream
+    // DequantizeLinear restores f32. Memcpy-class — mirrors
+    // `transpose_general_kernel` byte-for-byte with `unsigned char`.
+    "transpose_general_u8_kernel",
 ];
 
 /// CUDA kernel source for the WS-4 quantization op family.
@@ -180,5 +191,64 @@ extern "C" __global__ void matmul_integer_u8u8_kernel(
         acc += av * bv;
     }
     out[mn] = acc;
+}
+
+// ============================================================================
+// WS-4 M4.7 Gather (UINT8 input). Surfaced by DistilBERT-INT8 — the model's
+// `word_embeddings.weight_quantized` table is UINT8, so the embedding
+// Gather op flies UINT8 before downstream DequantizeLinear restores f32.
+// Mirrors `gather_kernel` / `gather_i64_kernel` in `kernels.rs` exactly,
+// only the data dtype differs. Indices stay i64 (ONNX spec). Negative
+// indices are wrapped via the standard Python/ONNX convention.
+// ============================================================================
+extern "C" __global__ void gather_u8_kernel(
+    unsigned char* out, const unsigned char* inp, const long long* indices,
+    size_t num_indices, size_t slice_size, size_t dim0_size
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_indices * slice_size) return;
+    size_t which_index = idx / slice_size;
+    size_t offset_in_slice = idx % slice_size;
+    long long raw_index = indices[which_index];
+    long long adjusted = (raw_index < 0) ? (raw_index + (long long)dim0_size) : raw_index;
+    size_t actual_index;
+    if (adjusted < 0) {
+        actual_index = 0;
+    } else if ((size_t)adjusted >= dim0_size) {
+        actual_index = dim0_size - 1;
+    } else {
+        actual_index = (size_t)adjusted;
+    }
+    size_t in_idx = actual_index * slice_size + offset_in_slice;
+    out[idx] = inp[in_idx];
+}
+
+// ============================================================================
+// WS-4 M4.7 Transpose (UINT8 input). Surfaced by DistilBERT-INT8 — the
+// graph applies a Transpose to the UINT8 weight initializer before the
+// downstream DequantizeLinear restores f32 (`<weight>_transposed_quantized`).
+// Mirrors `transpose_general_kernel` in `kernels.rs` byte-for-byte; only
+// the data dtype changes to `unsigned char`. Up to 6 dims, matches the
+// f32 / i64 / i32 variants.
+// ============================================================================
+extern "C" __global__ void transpose_general_u8_kernel(
+    unsigned char* out, const unsigned char* inp,
+    const size_t* in_shape, const size_t* in_strides,
+    const size_t* out_strides, const size_t* perm,
+    size_t ndim, size_t total_elements
+) {
+    size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out_idx >= total_elements) return;
+    size_t out_coords[6];
+    size_t remaining = out_idx;
+    for (size_t d = 0; d < ndim; d++) {
+        out_coords[d] = remaining / out_strides[d];
+        remaining = remaining % out_strides[d];
+    }
+    size_t in_idx = 0;
+    for (size_t d = 0; d < ndim; d++) {
+        in_idx += out_coords[d] * in_strides[perm[d]];
+    }
+    out[out_idx] = inp[in_idx];
 }
 "#;

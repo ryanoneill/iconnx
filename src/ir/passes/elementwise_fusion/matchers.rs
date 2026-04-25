@@ -343,12 +343,23 @@ fn match_mul_sin_pow_mul_add(
     }))
 }
 
-/// MulAdd: Mul -> Add — `y = a * b + c`. Matched only when `c` is an
-/// initializer (not just any static value). The fused kernel supports
-/// two shape layouts: all-same-shape, or `b` and `c` broadcast along
-/// `a`'s last dim (`[last_dim]`, `[1, last_dim]`, …). Shape compat is
-/// validated at dispatch time in `gpu_fused_mul_add`; the matcher
-/// accepts any shape and lets the wrapper reject incompatible cases.
+/// MulAdd: Mul -> Add — `y = a * b + c`. The fused kernel
+/// `gpu_fused_mul_add` supports two shape layouts and BOTH require
+/// `b.shape == c.shape`:
+///
+/// 1. All-same-shape: `a.shape == b.shape == c.shape`.
+/// 2. Per-channel broadcast: `b.shape == c.shape && b.numel == a.last`.
+///
+/// The matcher therefore must (a) require `c` to be a static initializer
+/// so we know its shape, (b) identify which `Mul` input is the static
+/// side that matches `c`'s shape — that's `b`, the bias-paired scale —
+/// and (c) refuse to fuse when neither `Mul` input is a static
+/// initializer with a shape matching `c`. Without this, DistilBERT-INT8
+/// (and any graph that pairs a per-tensor scale with a per-channel bias)
+/// hits a runtime panic in the wrapper because the optimistic fusion
+/// claims a shape contract the wrapper can't honor; the unfused Mul +
+/// Add fall back to separate elementwise ops, which broadcast correctly
+/// via the standard binary-op kernels.
 fn match_mul_add(
     chain: &[usize],
     nodes: &[GraphNode],
@@ -371,12 +382,27 @@ fn match_mul_add(
     } else {
         add.inputs[0].clone()
     };
-    if !initializers.contains_key(&c_input) {
+    let c_shape = initializers.get(&c_input)?.shape();
+
+    // Identify which Mul input is the static side matching c's shape; the
+    // other is the dynamic activation `a`. Both wrapper paths require the
+    // static `b` to share `c`'s shape, so refuse fusion if neither input
+    // qualifies. This intentionally also skips the all-dynamic Path 1
+    // case — the unfused fallback handles it without a runtime risk.
+    let in0 = &mul.inputs[0];
+    let in1 = &mul.inputs[1];
+    let in0_matches = initializers.get(in0).is_some_and(|t| t.shape() == c_shape);
+    let in1_matches = initializers.get(in1).is_some_and(|t| t.shape() == c_shape);
+    let (a_input, b_input) = if in1_matches {
+        (in0.clone(), in1.clone())
+    } else if in0_matches {
+        (in1.clone(), in0.clone())
+    } else {
         return None;
-    }
+    };
     Some(MatchResult::new(FusedPattern::MulAdd {
-        a_input: mul.inputs[0].clone(),
-        b_input: mul.inputs[1].clone(),
+        a_input,
+        b_input,
         c_input,
         output_name: add.outputs[0].clone(),
     }))

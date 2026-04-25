@@ -233,11 +233,18 @@ fn merge_fusion_annotations(
     merged
 }
 
-/// Upload every initializer tensor to the GPU, mirroring today's
-/// `GpuGraphExecutor::add_initializer` behaviour: Float32, Int64, and
-/// Int32 are uploaded; all other dtypes (Float64, Bool) are skipped so
-/// the downstream dispatch raises a runtime error that matches the
-/// existing executor.
+/// Upload every initializer tensor to the GPU. Float32, Int64, Int32,
+/// Int8, and UInt8 have GPU representations and are uploaded directly.
+/// Float64 and Bool have no GPU storage today and are skipped — those
+/// rare cases surface as a clear "Input '<name>' not found" error at
+/// the first dispatch site rather than being silently coerced.
+///
+/// WS-4: Int8/UInt8 added so DistilBERT-INT8's quantized weight
+/// initializers (pre-dequantized, used as MatMulInteger inputs) flow
+/// through to the GPU. Pre-WS-4 they fell through the `_ => continue`
+/// arm and the executor's first Gather/MatMulInteger op then errored
+/// with "Input '...' not found" — a silent-drop pattern WS-1 was
+/// supposed to eliminate but had been re-introduced here.
 fn upload_initializers(
     graph: &OptimizableGraph,
     ctx: &IconnxCudaContext,
@@ -254,9 +261,15 @@ fn upload_initializers(
             Tensor::Int32(_) => {
                 GpuTensor::from_host_i32(ctx, &tensor.as_slice_i32(), tensor.shape().to_vec())?
             }
-            // Matches today's GpuGraphExecutor::add_initializer: any other
-            // dtype is simply not added to the weights map.
-            _ => continue,
+            Tensor::Int8(_) => {
+                GpuTensor::from_host_i8(ctx, &tensor.as_slice_i8(), tensor.shape().to_vec())?
+            }
+            Tensor::UInt8(_) => {
+                GpuTensor::from_host_u8(ctx, &tensor.as_slice_u8(), tensor.shape().to_vec())?
+            }
+            // Float64 and Bool have no GPU dtype today; skip and let
+            // the first downstream consumer error explicitly.
+            Tensor::Float64(_) | Tensor::Bool(_) => continue,
         };
         out.insert(name.clone(), gpu);
     }

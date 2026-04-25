@@ -526,12 +526,12 @@ mod tests {
     fn matches_mul_add_on_known_pattern() {
         let mut b = OptimizableGraphBuilder::new();
         b.add_input("a".into(), vec![Some(4)]);
-        b.add_input("bi".into(), vec![Some(4)]);
+        b.add_initializer("bw".into(), Tensor::from_vec_f32(vec![2.0; 4], vec![4]));
         b.add_initializer("cw".into(), Tensor::from_vec_f32(vec![3.0; 4], vec![4]));
         b.add_node(
             "mul",
             "Mul",
-            vec!["a".into(), "bi".into()],
+            vec!["a".into(), "bw".into()],
             vec!["t".into()],
             NodeAttributes::new(),
         );
@@ -548,6 +548,81 @@ mod tests {
             matches!(head.pattern, FusedPattern::MulAdd { .. }),
             "expected MulAdd, got {:?}",
             head.pattern
+        );
+    }
+
+    /// WS-4 M4.7 regression: when `Mul`'s static side has a different shape
+    /// than the bias initializer, the fused `gpu_fused_mul_add` wrapper has
+    /// no path that fits — both supported layouts require `b.shape == c.shape`.
+    /// Exercising fusion in that case panics at runtime (DistilBERT-INT8
+    /// surfaces this when a per-tensor scalar scale meets a per-channel
+    /// bias). The matcher must refuse fusion so the unfused Mul + Add fall
+    /// back to separate elementwise ops.
+    #[test]
+    fn refuses_mul_add_when_static_b_shape_differs_from_c() {
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("a".into(), vec![Some(1), Some(5), Some(768)]);
+        // Scalar scale (DistilBERT-INT8 combined dequant scale) vs.
+        // per-channel bias [768]. Wrapper has no path for (a=[1,5,768],
+        // b=[], c=[768]).
+        b.add_initializer("scale".into(), Tensor::from_vec_f32(vec![0.001], vec![]));
+        b.add_initializer(
+            "bias".into(),
+            Tensor::from_vec_f32(vec![0.0; 768], vec![768]),
+        );
+        b.add_node(
+            "mul",
+            "Mul",
+            vec!["a".into(), "scale".into()],
+            vec!["t".into()],
+            NodeAttributes::new(),
+        );
+        b.add_node(
+            "add",
+            "Add",
+            vec!["t".into(), "bias".into()],
+            vec!["y".into()],
+            NodeAttributes::new(),
+        );
+        let a = fusion_annotations_from_graph(&b.build());
+        assert!(
+            !a.heads.contains_key("mul"),
+            "Mul→Add must not fuse when static-side shape ({:?}) doesn't \
+             match the bias shape ({:?}); unfused fallback is required",
+            vec![] as Vec<usize>,
+            vec![768usize]
+        );
+    }
+
+    /// MulAdd matcher must also refuse fusion when neither `Mul` input is
+    /// a static initializer — Path 1 (a==b==c) requires runtime shape
+    /// agreement that the matcher cannot verify, and Path 2 requires `b`
+    /// to be the static side. Letting it through gambles a runtime panic.
+    #[test]
+    fn refuses_mul_add_when_both_mul_inputs_dynamic() {
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_input("a".into(), vec![Some(4)]);
+        b.add_input("b_dyn".into(), vec![Some(4)]);
+        b.add_initializer("cw".into(), Tensor::from_vec_f32(vec![3.0; 4], vec![4]));
+        b.add_node(
+            "mul",
+            "Mul",
+            vec!["a".into(), "b_dyn".into()],
+            vec!["t".into()],
+            NodeAttributes::new(),
+        );
+        b.add_node(
+            "add",
+            "Add",
+            vec!["t".into(), "cw".into()],
+            vec!["y".into()],
+            NodeAttributes::new(),
+        );
+        let a = fusion_annotations_from_graph(&b.build());
+        assert!(
+            !a.heads.contains_key("mul"),
+            "Mul→Add must not fuse when both Mul inputs are dynamic — \
+             matcher cannot verify the wrapper's b/c shape contract"
         );
     }
 
