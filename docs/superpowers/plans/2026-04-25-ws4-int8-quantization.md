@@ -844,13 +844,14 @@ git commit -S -m "feat(ops): add MatMulInteger (WS-4 M4.6)"
 ## Milestone M4.7 — DistilBERT-INT8 end-to-end
 
 **Files:**
-- Modify: `rust-ai-explorations/leadline-bench/src/{compare.rs, model_profiles.rs}` — new `DistilBertInt8` ModelProfile variant. (Out-of-iconnx-repo work; pair with leadline-bench commit.)
+- Modify: `rust-ai-explorations/leadline-bench/src/model.rs` — new `DistilBertInt8` ModelProfile variant. (Out-of-iconnx-repo work; pair with leadline-bench commit.)
+- Modify: `rust-ai-explorations/leadline-bench/src/bin/compare.rs` — add `--tolerance` CLI flag for programmatic gating.
 - Modify: `rust-ai-explorations/leadline-bench/src/bin/probe_ops.rs` — register the 3 new ops in `ICONNX_SUPPORTED_OPS`.
 - Create: `tests/distilbert_int8_test.rs` (in iconnx) — full integration test against the model file.
 
 - [ ] **Step 1: Add DistilBertInt8 ModelProfile to leadline-bench**
 
-In `leadline-bench/src/model_profiles.rs`, add `ModelProfile::DistilBertInt8` variant. Define:
+In `leadline-bench/src/model.rs`, add `ModelProfile::DistilBertInt8` variant. Define:
 - `iconnx_inputs()` → `[("input_ids", Int64 vector), ("attention_mask", Int64 vector)]` matching DistilBERT's tokenizer outputs.
 - `iconnx_output_names()` → `["last_hidden_state"]` (or whatever the model's primary output is — verify via `OnnxParser::list_unique_operators` + manual graph inspection of the model).
 - ORT input builder arm: same shape, fed via tract or onnxruntime crate.
@@ -860,6 +861,17 @@ Mirror the existing `BertBase` and `Whisper` variants exactly.
 Commit on the `rust-ai-explorations` repo:
 ```
 git commit -S -m "feat(leadline-bench): DistilBertInt8 ModelProfile (WS-4 M4.7)"
+```
+
+- [ ] **Step 1b: Add `--tolerance` CLI flag to compare binary**
+
+In `leadline-bench/src/bin/compare.rs`, extend the existing `parse_arg_*` infrastructure to read `--tolerance <f32>` (default: `1e-4` to preserve existing behavior). After the `ComparisonReport` is generated, check the `max_abs_diff` against the tolerance; on violation exit with non-zero status and a clear message naming the offending output tensor.
+
+Mirror the existing `--seq-len` arg parsing pattern. ~10 LOC extension. The flag becomes a permanent addition useful for any future quantized / lower-precision model — quantized models have intrinsically wider numerical bands than f32 reference.
+
+Commit alongside the ModelProfile addition (Step 1):
+```
+git commit -S -m "feat(leadline-bench): --tolerance flag on compare for quantized models (WS-4 M4.7)"
 ```
 
 - [ ] **Step 2: Update probe-ops `ICONNX_SUPPORTED_OPS`**
@@ -925,7 +937,7 @@ cargo run -p leadline-bench --bin compare -- \
     --tolerance 1e-2
 ```
 
-Acceptance: outputs match ORT within 1e-2 absolute. **Performance is not gated** — see "Performance non-gate" in the plan header.
+The `--tolerance` flag was added in Step 1b. Acceptance: outputs match ORT within 1e-2 absolute (compare exits 0). **Performance is not gated** — see "Performance non-gate" in the plan header.
 
 - [ ] **Step 5: Commit**
 
