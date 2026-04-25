@@ -228,7 +228,13 @@ fn extract_scalar_zp(
 /// `out` is row-major `[M, N]`; `a` is row-major `[M, K]`; `b` is row-
 /// major `[K, N]`. The accumulator stays in i32 throughout — for the
 /// MVP DistilBERT shapes (K ≤ 3072, INT8 inputs) the worst-case sum is
-/// well within `INT32_MAX`.
+/// well within `INT32_MAX` (~50M ≪ 2.1e9), so the `checked_*` path
+/// never trips on a real model. We use checked arithmetic anyway so a
+/// pathological future input (or a malformed graph) panics with a clear
+/// diagnostic instead of silently wrapping — matches the project's
+/// "no silent fallbacks" rule. The GPU kernels can't easily detect
+/// per-thread overflow at scale, so they wrap per CUDA C semantics; the
+/// CPU forward (this oracle) treats overflow as the bug it is.
 #[allow(clippy::too_many_arguments)]
 fn gemm_i32_into(
     out: &mut [i32],
@@ -246,7 +252,14 @@ fn gemm_i32_into(
             for kk in 0..k_dim {
                 let av = a_at(row * k_dim + kk) - a_zp;
                 let bv = b_at(kk * n + col) - b_zp;
-                acc = acc.wrapping_add(av.wrapping_mul(bv));
+                let prod = av.checked_mul(bv).expect(
+                    "MatMulInteger: i32 overflow in (a-a_zp) * (b-b_zp); \
+                     input range exceeds INT32 bounds",
+                );
+                acc = acc.checked_add(prod).expect(
+                    "MatMulInteger: i32 overflow in K-summation; \
+                     K * (a*b) range exceeds INT32 bounds",
+                );
             }
             out[row * n + col] = acc;
         }
@@ -326,5 +339,45 @@ mod tests {
         } else {
             panic!()
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "MatMulInteger")]
+    fn matmul_integer_rejects_one_d_input() {
+        // ONNX MatMulInteger requires 2-D inputs in M4.6 MVP scope.
+        // 1-D input must panic, not silently coerce.
+        let a = Tensor::from_vec_i8(vec![1_i8, 2, 3], vec![3]);
+        let b = Tensor::from_vec_i8(vec![1_i8, 2, 3], vec![3]);
+        let _ = MatMulInteger::forward(&[a, b], &NodeAttributes::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "MatMulInteger")]
+    fn matmul_integer_rejects_per_axis_zero_point() {
+        // Scalar zp only in M4.6 MVP. 1-D zp (per-axis) must panic.
+        let a = Tensor::from_vec_i8(vec![1_i8, 2, 3, 4], vec![2, 2]);
+        let b = Tensor::from_vec_i8(vec![1_i8, 2, 3, 4], vec![2, 2]);
+        let a_zp = Tensor::from_vec_i8(vec![0_i8, 0], vec![2]); // per-axis
+        let _ = MatMulInteger::forward(&[a, b, a_zp], &NodeAttributes::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "MatMulInteger")]
+    fn matmul_integer_rejects_zp_dtype_mismatch() {
+        // ONNX requires zp.dtype == operand.dtype. Mismatched dtype must
+        // panic rather than silently coerce.
+        let a = Tensor::from_vec_i8(vec![1_i8, 2, 3, 4], vec![2, 2]);
+        let b = Tensor::from_vec_i8(vec![1_i8, 2, 3, 4], vec![2, 2]);
+        let a_zp = Tensor::from_vec_u8(vec![0_u8], vec![]); // u8, not i8
+        let _ = MatMulInteger::forward(&[a, b, a_zp], &NodeAttributes::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "MatMulInteger")]
+    fn matmul_integer_rejects_k_mismatch() {
+        // K dim must match between a.shape()[1] and b.shape()[0].
+        let a = Tensor::from_vec_i8(vec![1_i8; 6], vec![2, 3]);
+        let b = Tensor::from_vec_i8(vec![1_i8; 8], vec![4, 2]); // 4 != 3
+        let _ = MatMulInteger::forward(&[a, b], &NodeAttributes::new());
     }
 }
