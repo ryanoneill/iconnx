@@ -179,6 +179,22 @@ fn infer_node_output_shapes(
         "ReduceMean" | "ReduceSum" => {
             vec![infer_reduce(&input_shapes, attrs)]
         }
+        "GlobalAveragePool" => {
+            // Output shape is `[N, C, 1, 1, ...]`: batch and channel
+            // preserved, every spatial dim collapsed to 1.
+            let s = input_shapes.first().cloned().unwrap_or_default();
+            if s.len() < 2 {
+                vec![s]
+            } else {
+                let mut out = Vec::with_capacity(s.len());
+                out.push(s[0]);
+                out.push(s[1]);
+                for _ in 2..s.len() {
+                    out.push(Some(1));
+                }
+                vec![out]
+            }
+        }
 
         // Conv / matmul.
         "Conv" => {

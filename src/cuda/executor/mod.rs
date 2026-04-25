@@ -297,7 +297,7 @@ impl Executor {
 
             "Conv" | "ConvTranspose" => self.dispatch_conv(op, values, &plan.weights),
 
-            "ReduceMean" | "ReduceSum" | "LayerNormalization" => {
+            "ReduceMean" | "ReduceSum" | "LayerNormalization" | "GlobalAveragePool" => {
                 self.dispatch_reduction(op, values, &plan.weights)
             }
 

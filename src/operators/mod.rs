@@ -30,6 +30,7 @@ pub mod flatten;
 pub mod floor;
 pub mod gather;
 pub mod gemm;
+pub mod global_average_pool;
 pub mod greater;
 pub mod greater_or_equal;
 pub mod layer_normalization;
