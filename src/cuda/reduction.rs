@@ -47,13 +47,22 @@ const KERNEL_NAMES: &[&str] = &[
     "reduce_max_kernel",
     "softmax_kernel",
     "layer_norm_kernel",
+    // WS-3 M3.4 sub-3: FP16 IO with f32 accumulator. Pure-FP16
+    // accumulation would overflow on Whisper attention's K=1500
+    // reduction; the f32 accumulator pattern matches gemm_fp16_acc32.
+    "reduce_mean_f16_kernel",
+    "softmax_f16_kernel",
 ];
 
 /// Reduction CUDA kernel source code.
 ///
 /// `CUDART_INF_F` comes from `math_constants.h`, auto-included by
-/// garboard's `compile_for_device`.
+/// garboard's `compile_for_device`. `<cuda_fp16.h>` is needed for the
+/// WS-3 M3.4 sub-3 FP16 reductions and is supplied by NVRTC's default
+/// include path.
 const REDUCTION_KERNELS: &str = r#"
+#include <cuda_fp16.h>
+
 // Block-level reduction using shared memory
 // Each block reduces its portion, then atomically adds to output
 
@@ -220,6 +229,78 @@ extern "C" __global__ void layer_norm_kernel(
         }
     }
 }
+
+// =============================================================================
+// WS-3 M3.4 sub-3 FP16 reductions: FP16 IO with f32 accumulator.
+//
+// The reduction loop accumulates in float to avoid f16 overflow on long
+// axes (Whisper attention reduces over K=1500 keys; the worst-case
+// activation magnitude * sequence length easily exceeds f16's 65504
+// max). Inputs are loaded via `__half2float`, intermediates stay in
+// float, only the final per-element write rounds back via
+// `__float2half`. This mirrors the gemm_fp16_acc32 precision strategy.
+// =============================================================================
+
+extern "C" __global__ void reduce_mean_f16_kernel(
+    __half* out,
+    const __half* inp,
+    size_t outer_size,
+    size_t axis_size
+) {
+    size_t outer_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (outer_idx < outer_size) {
+        float sum = 0.0f;
+        const __half* row = inp + outer_idx * axis_size;
+        for (size_t i = 0; i < axis_size; i++) {
+            sum += __half2float(row[i]);
+        }
+        out[outer_idx] = __float2half(sum / (float)axis_size);
+    }
+}
+
+// Numerically stable softmax along last axis, FP16 IO + f32 accumulator.
+//   softmax(x)_i = exp(x_i - max(x)) / sum(exp(x - max(x)))
+// The exp + sum pass and the normalize pass both use `out_row` as a
+// scratch buffer, so we keep an inner f32 store and only convert back
+// at the final divide — minimizes f16 round-trip ULP.
+extern "C" __global__ void softmax_f16_kernel(
+    __half* out,
+    const __half* inp,
+    size_t outer_size,
+    size_t axis_size
+) {
+    size_t outer_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (outer_idx < outer_size) {
+        const __half* in_row = inp + outer_idx * axis_size;
+        __half* out_row = out + outer_idx * axis_size;
+
+        // Find max (in float — comparing in float is faster than __hgt
+        // and avoids any sNaN propagation issues with Whisper's logits).
+        float max_val = -CUDART_INF_F;
+        for (size_t i = 0; i < axis_size; i++) {
+            float v = __half2float(in_row[i]);
+            if (v > max_val) max_val = v;
+        }
+
+        // Exp(x - max) — stage the f32 result into out_row (round-trip
+        // through f16 once so the value survives the second pass; this
+        // costs ULP but avoids a second device-memory scratch).
+        float sum = 0.0f;
+        for (size_t i = 0; i < axis_size; i++) {
+            float e = expf(__half2float(in_row[i]) - max_val);
+            out_row[i] = __float2half(e);
+            sum += e;
+        }
+
+        // Normalize. Read the staged f16, divide in f32, round once.
+        for (size_t i = 0; i < axis_size; i++) {
+            float e = __half2float(out_row[i]);
+            out_row[i] = __float2half(e / sum);
+        }
+    }
+}
 "#;
 
 // =============================================================================
@@ -243,6 +324,39 @@ fn launch_axis_reduction(
         kernels.module().typed_kernel::<(
             &mut DeviceSlice<'_, f32>,
             &DeviceSlice<'_, f32>,
+            usize,
+            usize,
+        )>(name)
+    }
+    .map_err(|e| CudaError::Kernel(format!("{} lookup failed: {}", name, e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(outer_size as u32),
+            (out, inp, outer_size, axis_size),
+        )
+        .map_err(|e| CudaError::Kernel(format!("{} launch failed: {}", name, e)))
+}
+
+/// Unary FP16 axis reduction: `(out, in, outer_size, axis_size)`.
+/// Covers reduce_mean_f16 and softmax_f16. The C kernel parameter type
+/// is `__half*`, ABI-compatible with `half::f16`.
+fn launch_axis_reduction_f16(
+    ctx: &IconnxCudaContext,
+    kernels: &ReductionKernelCache,
+    name: &'static str,
+    out: &mut DeviceSlice<'static, half::f16>,
+    inp: &DeviceSlice<'static, half::f16>,
+    outer_size: usize,
+    axis_size: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: kernel signature is
+    // `(__half* out, const __half* inp, size_t outer_size, size_t axis_size)`.
+    let kernel = unsafe {
+        kernels.module().typed_kernel::<(
+            &mut DeviceSlice<'_, half::f16>,
+            &DeviceSlice<'_, half::f16>,
             usize,
             usize,
         )>(name)
@@ -345,6 +459,10 @@ pub fn gpu_reduce_sum_axis(
 }
 
 /// GPU ReduceMean along last axis: input[..., N] -> output[...].
+///
+/// Supports Float32 and Float16. The Float16 path uses a kernel with
+/// FP16 IO and an f32 accumulator (WS-3 M3.4 sub-3) so long axes don't
+/// overflow.
 pub fn gpu_reduce_mean_axis(
     ctx: &IconnxCudaContext,
     kernels: &ReductionKernelCache,
@@ -359,31 +477,58 @@ pub fn gpu_reduce_mean_axis(
     let axis_size = *shape.last().unwrap();
     let outer_size: usize = shape[..shape.len() - 1].iter().product();
 
-    if outer_size == 0 {
-        return pool.get_tensor_f32(ctx, vec![1]);
-    }
-
     let out_shape: Vec<usize> = if shape.len() > 1 {
         shape[..shape.len() - 1].to_vec()
     } else {
         vec![1]
     };
-    let mut out = pool.get_tensor_f32(ctx, out_shape)?;
 
-    launch_axis_reduction(
-        ctx,
-        kernels,
-        "reduce_mean_kernel",
-        out.data_f32_mut()?,
-        input.data_f32()?,
-        outer_size,
-        axis_size,
-    )?;
-
-    Ok(out)
+    match input.dtype() {
+        super::tensor::DType::Float32 => {
+            if outer_size == 0 {
+                return pool.get_tensor_f32(ctx, vec![1]);
+            }
+            let mut out = pool.get_tensor_f32(ctx, out_shape)?;
+            launch_axis_reduction(
+                ctx,
+                kernels,
+                "reduce_mean_kernel",
+                out.data_f32_mut()?,
+                input.data_f32()?,
+                outer_size,
+                axis_size,
+            )?;
+            Ok(out)
+        }
+        super::tensor::DType::Float16 => {
+            if outer_size == 0 {
+                return pool.get_tensor_f16(ctx, vec![1]);
+            }
+            let mut out = pool.get_tensor_f16(ctx, out_shape)?;
+            launch_axis_reduction_f16(
+                ctx,
+                kernels,
+                "reduce_mean_f16_kernel",
+                out.data_f16_mut()?,
+                input.data_f16()?,
+                outer_size,
+                axis_size,
+            )?;
+            Ok(out)
+        }
+        dt => Err(CudaError::Kernel(format!(
+            "ReduceMean: unsupported dtype {}",
+            dt.name()
+        ))),
+    }
 }
 
 /// GPU Softmax along last axis (numerically stable).
+///
+/// Supports Float32 and Float16. The Float16 path uses a kernel with
+/// FP16 IO and an f32 accumulator (WS-3 M3.4 sub-3); Whisper attention
+/// reduces over K=1500 keys, where pure-FP16 accumulation would
+/// overflow.
 pub fn gpu_softmax(
     ctx: &IconnxCudaContext,
     kernels: &ReductionKernelCache,
@@ -399,19 +544,38 @@ pub fn gpu_softmax(
     let outer_size: usize = shape[..shape.len() - 1].iter().product();
     let outer_size = if outer_size == 0 { 1 } else { outer_size };
 
-    let mut out = pool.get_tensor_f32(ctx, shape.to_vec())?;
-
-    launch_axis_reduction(
-        ctx,
-        kernels,
-        "softmax_kernel",
-        out.data_f32_mut()?,
-        input.data_f32()?,
-        outer_size,
-        axis_size,
-    )?;
-
-    Ok(out)
+    match input.dtype() {
+        super::tensor::DType::Float32 => {
+            let mut out = pool.get_tensor_f32(ctx, shape.to_vec())?;
+            launch_axis_reduction(
+                ctx,
+                kernels,
+                "softmax_kernel",
+                out.data_f32_mut()?,
+                input.data_f32()?,
+                outer_size,
+                axis_size,
+            )?;
+            Ok(out)
+        }
+        super::tensor::DType::Float16 => {
+            let mut out = pool.get_tensor_f16(ctx, shape.to_vec())?;
+            launch_axis_reduction_f16(
+                ctx,
+                kernels,
+                "softmax_f16_kernel",
+                out.data_f16_mut()?,
+                input.data_f16()?,
+                outer_size,
+                axis_size,
+            )?;
+            Ok(out)
+        }
+        dt => Err(CudaError::Kernel(format!(
+            "Softmax: unsupported dtype {}",
+            dt.name()
+        ))),
+    }
 }
 
 /// GPU LayerNormalization along last axis.
@@ -693,5 +857,131 @@ mod tests {
         // With beta=1: [-1.684, 0.106, 1.894, 3.684]
         assert!((result[0] - (-1.684)).abs() < 0.01);
         assert!((result[3] - 3.684).abs() < 0.01);
+    }
+
+    // =========================================================================
+    // WS-3 M3.4 sub-3: FP16 reduction contract tests.
+    //
+    // Tolerance is set generously vs. f32 because (a) FP16 inputs already lose
+    // ~3 decimal digits, (b) the kernel rounds intermediates back through
+    // FP16 storage between passes for the softmax case. The accumulator
+    // stays in f32 so long axes don't overflow.
+    // =========================================================================
+
+    fn h(values: &[f32]) -> Vec<half::f16> {
+        values.iter().copied().map(half::f16::from_f32).collect()
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_reduce_mean_axis_float16() {
+        let (ctx, kernels, mut pool) = setup();
+
+        // [[1, 2, 3], [4, 5, 6]] -> mean along last axis -> [2.0, 5.0].
+        let input = GpuTensor::from_host_f16(&ctx, &h(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), vec![2, 3])
+            .unwrap();
+
+        let output = gpu_reduce_mean_axis(&ctx, &kernels, &mut pool, &input).unwrap();
+        assert_eq!(output.dtype(), super::super::tensor::DType::Float16);
+        let result = output.to_host_f16(&ctx).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!((result[0].to_f32() - 2.0).abs() < 1e-3);
+        assert!((result[1].to_f32() - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_reduce_mean_axis_float16_long_axis_no_overflow() {
+        // 1500-wide axis matches Whisper attention's K dimension. Pure-FP16
+        // accumulation would overflow once values * length exceed 65504;
+        // f32 accumulator keeps the sum in float until the final divide,
+        // so the mean stays in f16 range.
+        let (ctx, kernels, mut pool) = setup();
+
+        let axis = 1500;
+        let mut data = Vec::with_capacity(axis);
+        for _ in 0..axis {
+            data.push(half::f16::from_f32(50.0));
+        }
+        // Sum would be 75000 in f32 — well past f16 max (65504). Mean is 50.
+        let input = GpuTensor::from_host_f16(&ctx, &data, vec![1, axis]).unwrap();
+
+        let output = gpu_reduce_mean_axis(&ctx, &kernels, &mut pool, &input).unwrap();
+        let result = output.to_host_f16(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(
+            (result[0].to_f32() - 50.0).abs() < 0.5,
+            "got {} (expected ~50.0); pure-FP16 accumulator would have overflowed",
+            result[0].to_f32()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_softmax_float16() {
+        let (ctx, kernels, mut pool) = setup();
+
+        // 2 rows, 3 cols. Softmax along last axis. Expected per-row:
+        //   row 0 = softmax([1,2,3])
+        //   row 1 = softmax([1,1,1]) = [1/3, 1/3, 1/3].
+        let input = GpuTensor::from_host_f16(&ctx, &h(&[1.0, 2.0, 3.0, 1.0, 1.0, 1.0]), vec![2, 3])
+            .unwrap();
+
+        let output = gpu_softmax(&ctx, &kernels, &mut pool, &input).unwrap();
+        assert_eq!(output.dtype(), super::super::tensor::DType::Float16);
+        let result = output.to_host_f16(&ctx).unwrap();
+        assert_eq!(result.len(), 6);
+
+        // Row 0 hand-computed:
+        //   exp([-2,-1,0]) = [0.1353, 0.3679, 1.0], sum ≈ 1.503,
+        //   softmax ≈ [0.0900, 0.2447, 0.6652].
+        let row0_expected = [0.0900_f32, 0.2447, 0.6652];
+        for (i, &exp) in row0_expected.iter().enumerate() {
+            let got = result[i].to_f32();
+            assert!(
+                (got - exp).abs() < 5e-3,
+                "row0[{}]: got {} vs {}",
+                i,
+                got,
+                exp
+            );
+        }
+
+        // Row 1 — uniform input -> uniform softmax.
+        for (i, slot) in result.iter().enumerate().skip(3) {
+            let got = slot.to_f32();
+            assert!(
+                (got - 1.0 / 3.0).abs() < 5e-3,
+                "row1[{}]: got {}, expected 1/3",
+                i - 3,
+                got
+            );
+            // Each row should sum to 1.
+        }
+        let row1_sum: f32 = result[3..].iter().map(|h| h.to_f32()).sum();
+        assert!((row1_sum - 1.0).abs() < 1e-2, "row1 sum = {}", row1_sum);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn test_softmax_float16_numerical_stability() {
+        // Large input magnitudes exercise the max-subtraction step.
+        // softmax([100, 100, 100]) = [1/3, 1/3, 1/3]. Without subtracting
+        // the max, exp(100) overflows.
+        let (ctx, kernels, mut pool) = setup();
+
+        let input =
+            GpuTensor::from_host_f16(&ctx, &h(&[100.0, 100.0, 100.0]), vec![1, 3]).unwrap();
+        let output = gpu_softmax(&ctx, &kernels, &mut pool, &input).unwrap();
+        let result = output.to_host_f16(&ctx).unwrap();
+
+        for slot in &result {
+            let got = slot.to_f32();
+            assert!(
+                (got - 1.0 / 3.0).abs() < 5e-3,
+                "got {} (expected 1/3)",
+                got
+            );
+        }
     }
 }
