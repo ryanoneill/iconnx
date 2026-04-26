@@ -700,8 +700,8 @@ fn gpu_add_broadcast_scalar(
 ) -> Result<GpuTensor, CudaError> {
     let n = tensor.len();
 
-    match (tensor, scalar) {
-        (GpuTensor::Int64 { .. }, GpuTensor::Int64 { .. }) => {
+    match (tensor.dtype(), scalar.dtype()) {
+        (super::tensor::DType::Int64, super::tensor::DType::Int64) => {
             let mut out = pool.get_tensor_i64(ctx, tensor.shape().to_vec())?;
             launch_binary_i64(
                 ctx,
@@ -714,7 +714,7 @@ fn gpu_add_broadcast_scalar(
             )?;
             Ok(out)
         }
-        _ => {
+        (super::tensor::DType::Float32, super::tensor::DType::Float32) => {
             let mut out = pool.get_tensor_f32(ctx, tensor.shape().to_vec())?;
             launch_binary_f32(
                 ctx,
@@ -727,6 +727,24 @@ fn gpu_add_broadcast_scalar(
             )?;
             Ok(out)
         }
+        (super::tensor::DType::Float16, super::tensor::DType::Float16) => {
+            let mut out = pool.get_tensor_f16(ctx, tensor.shape().to_vec())?;
+            launch_binary_f16(
+                ctx,
+                kernels,
+                "add_f16_scalar_ptr_kernel",
+                out.data_f16_mut()?,
+                tensor.data_f16()?,
+                scalar.data_f16()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        (t_dt, s_dt) => Err(CudaError::Kernel(format!(
+            "Add (scalar broadcast): unsupported dtype combination ({} + {})",
+            t_dt.name(),
+            s_dt.name()
+        ))),
     }
 }
 

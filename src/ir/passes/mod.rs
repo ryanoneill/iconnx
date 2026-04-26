@@ -17,7 +17,7 @@ pub use dce::dead_code_elimination;
 pub use elementwise_fusion::{
     elementwise_fusion as elementwise_fusion_pass, fusion_annotations_from_graph,
 };
-pub use fusion::{FusionAnnotations, detect_fusion};
+pub use fusion::{FusionAnnotations, detect_fusion, gate_fusion_to_float32};
 pub use memory_planner::memory_planner;
 pub use precompute::precompute_params;
 pub use shape_extraction_folding::{shape_extraction_folding, ShapeExtractionFoldingCounts};

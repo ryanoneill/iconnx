@@ -483,8 +483,8 @@ pub(super) fn resolve_inputs<'a>(
 /// this path.
 ///
 /// Float64 has no GPU representation today and reaches the catchall
-/// `_ => as_slice()` path, which panics — match the audit L2.1 status
-/// quo, fix when a roster model surfaces it.
+/// `_ => as_slice()` path, which panics — fix when a roster model
+/// surfaces it.
 pub(super) fn upload_tensor(
     ctx: &IconnxCudaContext,
     tensor: &Tensor,
@@ -493,6 +493,10 @@ pub(super) fn upload_tensor(
         Tensor::Float32(_) => {
             let data = tensor.as_slice();
             GpuTensor::from_host_f32(ctx, &data, tensor.shape().to_vec())
+        }
+        Tensor::Float16(_) => {
+            let data = tensor.as_slice_f16();
+            GpuTensor::from_host_f16(ctx, &data, tensor.shape().to_vec())
         }
         Tensor::Int64(_) => {
             let data = tensor.as_slice_i64();

@@ -29,6 +29,12 @@ pub const KERNEL_NAMES_FP16: &[&str] = &[
     "cast_i32_to_f16_kernel",
     "cast_f16_to_i64_kernel",
     "cast_i64_to_f16_kernel",
+    // M3.7 (Whisper-Tiny encoder surfaced gap): Expand. Whisper's
+    // attention path broadcasts the FP16 KV cache via Expand; the M3.4
+    // sub-1 audit missed this because Expand isn't in the layout-op
+    // family this file owns. Memcpy-class — pure stride lookup, no FP
+    // arithmetic — so `unsigned short*` matches the M3.4 pattern.
+    "expand_f16_kernel",
 ];
 
 /// CUDA kernel source for the WS-3 FP16 op family. See module docs for
@@ -183,5 +189,33 @@ extern "C" __global__ void cast_i64_to_f16_kernel(
     if (i < n) {
         out[i] = __float2half_rn((float)inp[i]);
     }
+}
+
+// ============================================================================
+// WS-3 M3.7 Expand (Float16). Mirrors `expand_kernel` in `kernels.rs`
+// byte-for-byte with `unsigned short*` data pointers in place of
+// `float*`. Memcpy-class — pure broadcast via stride lookup, no FP
+// arithmetic — so byte-level identity with half::f16 is sufficient.
+// ============================================================================
+extern "C" __global__ void expand_f16_kernel(
+    unsigned short* out, const unsigned short* inp,
+    const size_t* out_shape, const size_t* out_strides,
+    const size_t* inp_shape, const size_t* inp_strides,
+    size_t ndim, size_t total_elements
+) {
+    size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out_idx >= total_elements) return;
+    size_t coords[8];
+    size_t remaining = out_idx;
+    for (size_t d = 0; d < ndim; d++) {
+        coords[d] = remaining / out_strides[d];
+        remaining = remaining % out_strides[d];
+    }
+    size_t inp_idx = 0;
+    for (size_t d = 0; d < ndim; d++) {
+        size_t coord = (inp_shape[d] == 1) ? 0 : coords[d];
+        inp_idx += coord * inp_strides[d];
+    }
+    out[out_idx] = inp[inp_idx];
 }
 "#;

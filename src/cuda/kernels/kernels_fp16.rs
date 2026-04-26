@@ -36,6 +36,10 @@ pub const KERNEL_NAMES_FP16: &[&str] = &[
     "sqrt_f16_kernel",
     "pow_f16_kernel",
     "erf_f16_kernel",
+    // M3.7: scalar-broadcast Add — Whisper-Tiny encoder hits the
+    // gpu_add_broadcast_scalar path. Mirrors `add_scalar_ptr_kernel`
+    // (Float32) with __half operands.
+    "add_f16_scalar_ptr_kernel",
 ];
 
 /// CUDA kernel source for the WS-3 FP16 elementwise op family.
@@ -113,6 +117,21 @@ extern "C" __global__ void erf_f16_kernel(__half* out, const __half* x, size_t n
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = __float2half(erff(__half2float(x[i])));
+    }
+}
+
+// =============================================================================
+// FP16 scalar-broadcast Add: out[i] = a[i] + scalar_ptr[0]. Mirrors
+// `add_scalar_ptr_kernel` (Float32). The scalar lives on-device so
+// gpu_add avoids a D2H round-trip when one operand is a length-1
+// tensor. Pure FP16 add via `__hadd` — single op, no accumulation.
+// =============================================================================
+extern "C" __global__ void add_f16_scalar_ptr_kernel(
+    __half* out, const __half* a, const __half* scalar_ptr, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __hadd(a[i], scalar_ptr[0]);
     }
 }
 "#;

@@ -13,8 +13,8 @@ use crate::cuda::{CudaError, GpuTensor, IconnxCudaContext};
 use crate::ir::graph::OptimizableGraph;
 use crate::ir::passes::{
     constant_folding_pass, dead_code_elimination, detect_fusion,
-    elementwise_fusion_pass, fusion_annotations_from_graph, memory_planner,
-    precompute_params, shape_extraction_folding, shape_inference,
+    elementwise_fusion_pass, fusion_annotations_from_graph, gate_fusion_to_float32,
+    memory_planner, precompute_params, shape_extraction_folding, shape_inference,
     tensor_shapes_from_graph, topo_sort, FusionAnnotations,
 };
 use crate::ir::plan::{
@@ -126,6 +126,14 @@ pub fn lower(
     // candidates and any head not claimed by the new pass.
     let legacy_fusion = detect_fusion(&graph);
     let fusion = merge_fusion_annotations(fusion_annotations, legacy_fusion);
+
+    // Gate the merged fusion against non-Float32 initializers. Today's
+    // fused kernels (`gpu_fused_div_rsqrt` et al.) are sealed to f32, so
+    // any pattern whose static eps/scale/bias is Float16 (Whisper-FP16,
+    // BERT-FP16) must take the op-by-op fallback. Without this gate the
+    // executor's fused dispatch panics inside `to_host_f32`. M3.7
+    // surfaced this on Whisper's LayerNorm DivRsqrt.
+    let fusion = gate_fusion_to_float32(fusion, &graph);
 
     // 7. Upload initializers to GPU.
     let weights = upload_initializers(&graph, ctx)?;

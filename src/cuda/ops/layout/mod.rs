@@ -1587,9 +1587,51 @@ pub fn gpu_expand(
                 dtype.name()
             )))
         }
-        crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
+        crate::cuda::tensor::DType::Float16 => {
+            // WS-3 M3.7 (Whisper-Tiny encoder surfaced gap): Expand FP16.
+            // Memcpy-class — mirrors the f32 arm with `unsigned short*`
+            // data pointers backed by half::f16's repr(transparent) u16
+            // layout. M3.4 sub-1 audit missed Expand because it lives in
+            // the layout-broadcast family, not the layout-shuffle family
+            // M3.4 sub-1 swept.
+            let mut output = pool.get_tensor_f16(ctx, out_shape.clone())?;
+            // SAFETY: expand_f16_kernel mirrors expand_kernel byte-for-byte
+            // with `unsigned short*` data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("expand_f16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("expand_f16_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f16_mut()?,
+                        input.data_f16()?,
+                        &out_shape_gpu,
+                        &out_strides_gpu,
+                        &inp_shape_gpu,
+                        &inp_strides_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("expand_f16 launch failed: {}", e)))?;
+            Ok(output)
+        }
+        crate::cuda::tensor::DType::Bool => {
             Err(CudaError::Kernel(format!(
-                "Expand does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
+                "Expand does not support {} (WS-3 M3.4 — Bool dispatch arm pending; \
+                 Whisper-FP16 doesn't exercise Bool expand)",
                 dtype.name()
             )))
         }

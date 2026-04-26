@@ -14,8 +14,11 @@
 
 use std::collections::HashMap;
 
-use crate::cuda::conv::{add_bias, gpu_conv2d, gpu_conv_transpose_2d, Conv2dParams};
+use crate::cuda::conv::{
+    add_bias, gpu_conv1d, gpu_conv2d, gpu_conv_transpose_2d, Conv1dParams, Conv2dParams,
+};
 use crate::cuda::cudnn::{garboard_conv_1d, garboard_conv_transpose_1d};
+use crate::cuda::tensor::DType;
 use crate::cuda::{CudaError, GpuTensor};
 use crate::ir::PlannedOp;
 
@@ -44,7 +47,16 @@ impl Executor {
                 let shape = inputs[0].shape();
                 match shape.len() {
                     3 => {
-                        // 1D conv: [batch, channels, length] - use cuDNN via garboard.
+                        // 1D conv: [batch, channels, length].
+                        //
+                        // Float32 routes through garboard's cuDNN binding
+                        // (`conv_forward`, sealed to f32 — see garboard
+                        // dnn.rs:48). Float16 routes through the in-tree
+                        // `gpu_conv1d` (im2col + cuBLAS gemm_fp16_acc32 lit
+                        // up at WS-3 M3.6); cuDNN supports FP16 in
+                        // principle but the garboard binding is f32-only
+                        // today. Queued upstream ask alongside the FP16
+                        // batched-MatMul gap.
                         let strides = attributes.get_ints("strides").unwrap_or(&[1]);
                         let pads = attributes.get_ints("pads").unwrap_or(&[0, 0]);
                         let dilations = attributes.get_ints("dilations").unwrap_or(&[1]);
@@ -54,17 +66,59 @@ impl Executor {
                         let padding = pads.first().copied().unwrap_or(0) as usize;
                         let dilation = dilations.first().copied().unwrap_or(1) as usize;
 
-                        let mut output = garboard_conv_1d(
-                            &self.ctx,
-                            inputs[0],
-                            inputs[1],
-                            stride,
-                            padding,
-                            dilation,
-                            group,
-                        )?;
+                        let mut output = match inputs[0].dtype() {
+                            DType::Float32 => garboard_conv_1d(
+                                &self.ctx,
+                                inputs[0],
+                                inputs[1],
+                                stride,
+                                padding,
+                                dilation,
+                                group,
+                            )?,
+                            DType::Float16 => {
+                                if group != 1 {
+                                    return Err(CudaError::Kernel(format!(
+                                        "Float16 1D Conv with groups={} not supported \
+                                         (garboard cuDNN binding is f32-only; in-tree \
+                                         gpu_conv1d does not support groups)",
+                                        group
+                                    )));
+                                }
+                                let kernel_size = inputs[1].shape()[2];
+                                let params = Conv1dParams {
+                                    kernel_size,
+                                    stride,
+                                    padding,
+                                    dilation,
+                                };
+                                let bias =
+                                    if inputs.len() > 2 { Some(inputs[2]) } else { None };
+                                let out = gpu_conv1d(
+                                    &self.ctx,
+                                    &self.conv_kernels,
+                                    &mut pool,
+                                    inputs[0],
+                                    inputs[1],
+                                    bias,
+                                    &params,
+                                )?;
+                                // gpu_conv1d folds bias inline; skip the
+                                // explicit add_bias step below by returning
+                                // early.
+                                return Ok(out);
+                            }
+                            dt => {
+                                return Err(CudaError::Kernel(format!(
+                                    "1D Conv: unsupported input dtype {}",
+                                    dt.name()
+                                )))
+                            }
+                        };
 
-                        // cuDNN doesn't include bias in conv; apply it here.
+                        // cuDNN doesn't include bias in conv; apply it here
+                        // (Float32 path only — Float16 path already folded
+                        // bias inside gpu_conv1d).
                         if inputs.len() > 2 {
                             let bias = inputs[2];
                             let out_shape = output.shape();
