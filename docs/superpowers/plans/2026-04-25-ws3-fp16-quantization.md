@@ -574,12 +574,13 @@ git commit -S -m "feat(ops): Cast FP16↔Float32 + Bool routing for comparison/W
 - Test: `tests/matmul_float16_test.rs` (NEW)
 - Test: `tests/conv_float16_test.rs` (NEW — explicit FP16-end-to-end assertion at the `im2col → GEMM` seam, no silent f32 coercion)
 
-**Branch decision — garboard FP16 binding status:**
-- IF garboard ships its FP16 GEMM binding before M3.6 entry: use it. cuBLAS handles dispatch / Tensor Cores transparently.
-  - **Default:** `gemm_fp16_acc32` (CUBLAS_COMPUTE_32F — FP32 accumulator with FP16 IO). This is the correct primitive for Whisper attention's long-K matmuls (`[1, 1500, 384] × [384, 384]`); a pure-FP16 accumulator overflows on K=1500-class reductions. Per leadline advisor pass 2026-04-25.
-  - `gemm_fp16` (CUBLAS_COMPUTE_16F — FP16 accumulator) is **reserved for the perf workstream**, not used in WS-3 M3.6.
-- IF garboard binding slips: write NVRTC FP16 GEMM. Naive tiled `__half` × `__half` → FP32 accumulator → `__half` output (mirrors `gemm_fp16_acc32` semantics). Adequate for correctness; perf falls behind cuBLAS but this is correctness-only per leadline.
-- DECISION POINT: at M3.6 entry, `cargo update -p garboard && grep -n "gemm_fp16_acc32\|gemm_fp16\|fp16\|f16" $(find ~/.cargo/registry/src -path '*garboard*' -name '*.rs' 2>/dev/null) | head -20`. If `gemm_fp16_acc32` visible, take Path A (cuBLAS). Else Path B (NVRTC).
+**Branch decision — RESOLVED: Path A (cuBLAS via garboard).**
+
+Per leadline 2026-04-26: garboard PR #2 merged at `4ef68ad` and `gemm_fp16_acc32` is visible in the binding. Path A is selected. Path B (NVRTC FP16 GEMM) is documented below as a fallback design — **do NOT implement it this milestone**; gate-keep it as the recovery path if the binding ever regresses, rather than shipping dead code.
+
+- **Path A (active):** `gemm_fp16_acc32` (CUBLAS_COMPUTE_32F — FP32 accumulator with FP16 IO). This is the correct primitive for Whisper attention's long-K matmuls (`[1, 1500, 384] × [384, 384]`); a pure-FP16 accumulator overflows on K=1500-class reductions. Per leadline advisor pass 2026-04-25.
+- `gemm_fp16` (CUBLAS_COMPUTE_16F — FP16 accumulator) is **reserved for the perf workstream**, not used in WS-3 M3.6.
+- **Path B (fallback design — do not implement):** NVRTC FP16 GEMM, naive tiled `__half` × `__half` → FP32 accumulator → `__half` output (mirrors `gemm_fp16_acc32` semantics). Land if and only if the garboard binding regresses upstream.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -610,26 +611,100 @@ fn matmul_float16_whisper_attention_shape() {
 
 - [ ] **Step 2: Run, verify failure**
 
-- [ ] **Step 3a (Path A — garboard FP16 ready): cuBLAS dispatch**
+- [ ] **Step 3: cuBLAS FP16 dispatch (Path A)**
 
-Wire `gpu_matmul` FP16 arm through garboard's `gemm_fp16_acc32` (CUBLAS_COMPUTE_32F: FP16 IO + FP32 accumulator). Pattern mirrors the existing f32 cuBLAS dispatch. Do NOT use the pure-FP16 accumulator variant here — Whisper's K=1500 attention reductions need the f32 accumulator for numerical stability.
+Wire `gpu_gemm` / `gpu_matmul` FP16 arm through garboard's `gemm_fp16_acc32` (CUBLAS_COMPUTE_32F: FP16 IO + FP32 accumulator). Pattern mirrors the existing f32 cuBLAS dispatch. Do NOT use the pure-FP16 accumulator variant here — Whisper's K=1500 attention reductions need the f32 accumulator for numerical stability.
 
-- [ ] **Step 3b (Path B — garboard slip): NVRTC FP16 GEMM**
-
-Add `matmul_fp16_kernel` to `src/cuda/ops/kernels_fp16.rs`. Naive tiled GEMM, 16×16 tiles, FP32 accumulator, FP16 IO. Document as "perf placeholder, replace once garboard FP16 binding lands."
-
-Both paths land the same `dispatch_matmul` Float16 arm. Subsequent garboard upgrade is a swap, not a rewrite.
+(Path B — NVRTC FP16 GEMM — is gate-kept as fallback design only. Do not write it unless the garboard binding regresses upstream. If that ever happens: add `matmul_fp16_kernel` to `src/cuda/kernels/kernels_fp16.rs`; naive tiled GEMM, 16×16 tiles, FP32 accumulator, FP16 IO. Both paths share the same dispatch arm so the swap is a kernel change, not a rewrite.)
 
 - [ ] **Step 4: 3-D × 2-D batched FP16**
 
 WS-4 M4.7 retrospective: MatMulInteger's 3-D × 2-D batched case was missed in M4.6 and surfaced via runtime panic in M4.7. Whisper attention uses `[1, T, D] × [D, D]` patterns. Apply the same wrapper-level reshape pattern: `[B, M, K] × [K, N]` → reshape `[B*M, K]`, run 2-D GEMM, reshape result back to `[B, M, N]`.
 
-- [ ] **Step 5: Run tests**
+- [ ] **Step 5: Im2col FP16 mirror (Conv prerequisite)**
 
-- [ ] **Step 6: Commit**
+The plan's Files section calls out that `gpu_conv2d → gpu_im2col → gpu_gemm` only lights up FP16 once both seams accept it. Step 3 lights up the GEMM seam; this step lights up the im2col seam.
+
+Pattern is identical to M3.4 sub-1: a memcpy-class layout op extended for Float16. Add `im2col_f16_kernel` and `im2col_1d_f16_kernel` to `src/cuda/conv/kernels.rs` (or the conv-side kernel cache that lives there) — straight `unsigned short*` mirrors of the existing f32 kernels, no FP arithmetic, byte-level copy via 16-bit element type. `half::f16` is `#[repr(transparent)] struct(u16)`, so the byte layout matches `unsigned short`.
+
+Wire Float16 arms in `gpu_im2col` and `gpu_im2col_1d` (both in `src/cuda/conv/forward.rs`). Replace the unconditional `pool.get_tensor_f32` + `data_f32`/`data_f32_mut` pattern with an `match input.dtype()` on Float32 / Float16 plus a typed unsupported-dtype error for everything else (closes the silent-fallthrough plan-oversight gap that exists today, mirroring the gpu_add/gpu_sub pattern fix in M3.4 sub-2).
+
+`gpu_conv2d` and `gpu_conv1d` allocate the col-matrix output via `gpu_im2col(_1d)`; once that returns the right dtype, the downstream GEMM call already accepts FP16 (Step 3) and the conv result naturally stays FP16 throughout. The kernel reshape between im2col and GEMM is a metadata-only `clone().reshape(...)` — no dtype change there.
+
+Without this step, exercising `gpu_conv2d` on FP16 input panics at the unconditional `data_f32()` call inside `gpu_im2col`. The risk leadline flagged is real: forgetting this step until Conv FP16 is exercised end-to-end at M3.7.
+
+- [ ] **Step 6: Conv FP16-throughout regression test**
+
+Real assertion in `tests/conv_float16_test.rs`. This is the silent-failure-prevention test that locks in the contract — Conv must stay FP16 end-to-end with no internal f32 promotion at the `im2col → GEMM` seam (the kind of pattern WS-1 exists to catch):
+
+```rust
+#![cfg(feature = "cuda")]
+
+use half::f16;
+use iconnx::cuda::{gpu_conv2d, Conv2dParams, DType, GpuMemoryPool, GpuTensor,
+    IconnxCudaContext, ConvKernelCache};
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn conv_float16_stays_float16_through_im2col_gemm() {
+    let ctx = IconnxCudaContext::new().expect("ctx");
+    let cache = ConvKernelCache::new(&ctx).expect("cache");
+    let mut pool = GpuMemoryPool::new();
+
+    // Small fixture — 1x1x4x4 input, 2x1x3x3 kernel, no padding/stride 1.
+    // Values chosen for exact f16 representability; expected hand-computed.
+    let input_f16: Vec<f16> = (1..=16).map(|x| f16::from_f32(x as f32)).collect();
+    let weight_f16: Vec<f16> = (1..=18).map(|x| f16::from_f32(x as f32 * 0.1)).collect();
+
+    let input  = GpuTensor::from_host_f16(&ctx, &input_f16,  vec![1, 1, 4, 4]).unwrap();
+    let weight = GpuTensor::from_host_f16(&ctx, &weight_f16, vec![2, 1, 3, 3]).unwrap();
+
+    let params = Conv2dParams { kernel_h: 3, kernel_w: 3,
+                                 stride_h: 1, stride_w: 1,
+                                 pad_h: 0, pad_w: 0 };
+
+    let out = gpu_conv2d(&ctx, &cache, &mut pool, &input, &weight, None, &params).unwrap();
+
+    // Contract: FP16 input + FP16 weight -> FP16 output, no silent
+    // promotion to f32 at the im2col->GEMM seam.
+    assert_eq!(out.dtype(), DType::Float16,
+               "Conv must stay FP16 end-to-end; got {} — silent f32 coercion regression",
+               out.dtype().name());
+    assert_eq!(out.shape(), &[1, 2, 2, 2]);
+
+    // Sanity-check at least one element matches the hand-computed value
+    // (full numerical correctness lives in the cross-ORT test below).
+    let host = out.to_host_f16(&ctx).unwrap();
+    // out[0, 0, 0, 0] = sum(input[0..3, 0..3] * weight[0]) where weight[0] = 0.1..0.9.
+    // = 1*0.1 + 2*0.2 + 3*0.3 + 5*0.4 + 6*0.5 + 7*0.6 + 9*0.7 + 10*0.8 + 11*0.9
+    // = 0.1+0.4+0.9+2.0+3.0+4.2+6.3+8.0+9.9 = 34.8.
+    assert!((host[0].to_f32() - 34.8).abs() < 0.5,
+            "out[0]={} expected ~34.8", host[0].to_f32());
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn conv_float16_whisper_encoder_shape_matches_ort_within_tolerance() {
+    // Whisper-Tiny encoder's first Conv: [1, 80, 3000] × [384, 80, 3] → [1, 384, 3000]
+    // (1-D conv lowered as 2-D with kernel_h=1). Cross-check vs ORT to within 1e-2.
+    // Hand-computed expected is impractical at this size; the assertion is a
+    // tolerance-shaped equality vs the f32 reference output.
+    // ... (set up small subset of Whisper weights, compute f32 reference via gpu_conv2d
+    //      on cast-to-f32 inputs, compare f16 result within tolerance)
+}
+```
+
+The hand-computed test is the load-bearing one — it surfaces both the dtype contract (assert_eq dtype Float16) and a numerical correctness signal at a scale where the math is auditable. The Whisper-shape test cross-checks against the f32 reference at a realistic shape but at looser tolerance; both stay in the same file.
+
+- [ ] **Step 7: Run tests**
+
+`cargo test --features cuda --test matmul_float16_test --test conv_float16_test -- --include-ignored` → both pass.
+`cargo test --features cuda` (full suite) → no regressions.
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git commit -S -m "feat(ops): add Float16 MatMul (cuBLAS / NVRTC fallback) (WS-3 M3.6)"
+git commit -S -m "feat(ops): add Float16 MatMul + Conv via cuBLAS gemm_fp16_acc32 (WS-3 M3.6)"
 ```
 
 ---
