@@ -7,6 +7,13 @@ pub const KERNEL_NAMES: &[&str] = &[
     "im2col_1d_kernel",
     "col2im_1d_kernel",
     "add_bias_kernel",
+    // WS-3 M3.6 — FP16 mirrors of im2col / im2col_1d. Pure memcpy +
+    // zero-fill on padding, no FP arithmetic, so the C parameter type
+    // is `unsigned short*` (byte-identical to `half::f16`'s
+    // `repr(transparent) u16`). Matches M3.4 sub-1 pattern.
+    "im2col_f16_kernel",
+    "im2col_1d_f16_kernel",
+    "add_bias_f16_kernel",
 ];
 
 /// Convolution CUDA kernel source code
@@ -252,5 +259,135 @@ extern "C" __global__ void add_bias_kernel(
     // Determine which channel this element belongs to
     size_t channel = (idx / spatial_size) % channels;
     output[idx] += bias[channel];
+}
+
+// ============================================================================
+// WS-3 M3.6 — FP16 conv-side kernels.
+//
+// im2col / im2col_1d are pure memcpy + zero-fill on padding — no FP
+// arithmetic — so the FP16 mirrors use `unsigned short*` operands (which
+// matches `half::f16`'s `repr(transparent) u16` byte layout). The
+// padding zero-fill `(unsigned short)0` is the IEEE binary16 +0 bit
+// pattern — identical to `__float2half(0.0f)`.
+//
+// add_bias_f16_kernel does need FP arithmetic (`output += bias`),
+// so it pulls in `<cuda_fp16.h>` for `__half`, `__hadd`, and the FP16
+// element type. Matches the M3.4 sub-2 elementwise FP16 pattern.
+// ============================================================================
+#include <cuda_fp16.h>
+
+extern "C" __global__ void im2col_f16_kernel(
+    unsigned short* col_matrix,
+    const unsigned short* input,
+    size_t batch_size,
+    size_t channels,
+    size_t height,
+    size_t width,
+    size_t kernel_h,
+    size_t kernel_w,
+    size_t stride_h,
+    size_t stride_w,
+    size_t pad_h,
+    size_t pad_w,
+    size_t out_h,
+    size_t out_w
+) {
+    size_t col_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_cols = batch_size * out_h * out_w;
+    if (col_idx >= total_cols) return;
+
+    size_t batch = col_idx / (out_h * out_w);
+    size_t spatial_idx = col_idx % (out_h * out_w);
+    size_t out_y = spatial_idx / out_w;
+    size_t out_x = spatial_idx % out_w;
+
+    size_t in_y_start = out_y * stride_h;
+    size_t in_x_start = out_x * stride_w;
+
+    size_t row_idx = 0;
+
+    for (size_t c = 0; c < channels; c++) {
+        for (size_t ky = 0; ky < kernel_h; ky++) {
+            for (size_t kx = 0; kx < kernel_w; kx++) {
+                size_t in_y = in_y_start + ky;
+                size_t in_x = in_x_start + kx;
+
+                unsigned short val = (unsigned short)0; // f16 +0 bit pattern.
+
+                if (in_y >= pad_h && in_y < height + pad_h &&
+                    in_x >= pad_w && in_x < width + pad_w) {
+                    size_t actual_y = in_y - pad_h;
+                    size_t actual_x = in_x - pad_w;
+                    size_t input_idx = batch * (channels * height * width) +
+                                       c * (height * width) +
+                                       actual_y * width +
+                                       actual_x;
+                    val = input[input_idx];
+                }
+
+                col_matrix[row_idx * total_cols + col_idx] = val;
+                row_idx++;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void im2col_1d_f16_kernel(
+    unsigned short* col_matrix,
+    const unsigned short* input,
+    size_t batch_size,
+    size_t channels,
+    size_t length,
+    size_t kernel_size,
+    size_t stride,
+    size_t padding,
+    size_t dilation,
+    size_t out_length
+) {
+    size_t col_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_cols = batch_size * out_length;
+    if (col_idx >= total_cols) return;
+
+    size_t batch = col_idx / out_length;
+    size_t out_pos = col_idx % out_length;
+
+    size_t in_pos_start = out_pos * stride;
+    size_t row_idx = 0;
+
+    for (size_t c = 0; c < channels; c++) {
+        for (size_t k = 0; k < kernel_size; k++) {
+            size_t in_pos = in_pos_start + k * dilation;
+
+            unsigned short val = (unsigned short)0;
+            if (in_pos >= padding && in_pos < length + padding) {
+                size_t actual_pos = in_pos - padding;
+                size_t input_idx = batch * (channels * length) + c * length + actual_pos;
+                val = input[input_idx];
+            }
+
+            col_matrix[row_idx * total_cols + col_idx] = val;
+            row_idx++;
+        }
+    }
+}
+
+// add_bias_f16: per-channel bias add. FP16 IO; intermediate sum stays
+// in f32 to avoid round-off in long-channel models (Whisper's first
+// conv has C_out=384, not problematic alone, but the pattern matches
+// the gemm_fp16_acc32 precision strategy).
+extern "C" __global__ void add_bias_f16_kernel(
+    __half* output,
+    const __half* bias,
+    size_t batch_size,
+    size_t channels,
+    size_t spatial_size
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch_size * channels * spatial_size;
+    if (idx >= total) return;
+
+    size_t channel = (idx / spatial_size) % channels;
+    float sum = __half2float(output[idx]) + __half2float(bias[channel]);
+    output[idx] = __float2half_rn(sum);
 }
 "#;
