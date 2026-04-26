@@ -77,7 +77,14 @@ jobs:
         run: |
           echo "CUDA_PATH=/usr/local/cuda" >> "$GITHUB_ENV"
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          # Test binaries link against `libcuda.so.1` (the driver-API
+          # SONAME). CPU-only runners have no NVIDIA driver, so create
+          # the SONAME symlink against the toolkit stub. The stub
+          # satisfies dlopen on process startup; any actual CUDA call
+          # would fail, but lib tests that don't touch GPU work fine.
+          sudo ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
+                      /usr/local/cuda/lib64/stubs/libcuda.so.1
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
