@@ -54,7 +54,7 @@ jobs:
           path: /var/cache/apt/archives
           key: cuda-apt-12.8-${{ runner.os }}-v1
 
-      - name: Install CUDA development libraries
+      - name: Install CUDA development libraries + protoc
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
@@ -63,7 +63,8 @@ jobs:
             cuda-cudart-dev-12-8 \
             cuda-nvrtc-dev-12-8 \
             libcublas-dev-12-8 \
-            libcudnn9-dev-cuda-12
+            libcudnn9-dev-cuda-12 \
+            protobuf-compiler
 
       - name: Configure CUDA environment
         run: |
