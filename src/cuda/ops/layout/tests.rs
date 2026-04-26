@@ -716,6 +716,35 @@ fn test_nonzero() {
 
 #[test]
 #[ignore = "requires CUDA GPU"]
+fn test_nonzero_bool() {
+    // M3.7c: Kokoro's istft chain feeds a Bool comparison output into
+    // NonZero. Pre-fix this site unconditionally read host bytes via
+    // `to_host_f32` and panicked. Bool input must be accepted.
+    let (ctx, _cache, _pool) = setup();
+
+    let input = GpuTensor::from_host_bool(
+        &ctx,
+        &[false, true, false, true, true, false],
+        vec![6],
+    )
+    .unwrap();
+    let output = gpu_nonzero(&ctx, &input).unwrap();
+    let result = output.to_host_i64(&ctx).unwrap();
+    assert_eq!(output.shape(), &[1, 3]);
+    assert_eq!(result, vec![1i64, 3, 4]);
+
+    // 2D Bool: [[true, false], [false, true]] → indices (0,0) and (1,1).
+    let input_2d =
+        GpuTensor::from_host_bool(&ctx, &[true, false, false, true], vec![2, 2]).unwrap();
+    let output_2d = gpu_nonzero(&ctx, &input_2d).unwrap();
+    let result_2d = output_2d.to_host_i64(&ctx).unwrap();
+    assert_eq!(output_2d.shape(), &[2, 2]);
+    // Row indices [0, 1], Col indices [0, 1].
+    assert_eq!(result_2d, vec![0i64, 1, 0, 1]);
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
 fn test_where_i32() {
     let (ctx, cache, mut pool) = setup();
 

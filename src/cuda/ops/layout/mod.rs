@@ -2487,22 +2487,63 @@ pub fn gpu_resize(
 /// Returns a tensor of shape (ndim, num_nonzero) containing indices of non-zero elements.
 /// This uses CPU fallback since output size is data-dependent.
 pub fn gpu_nonzero(ctx: &IconnxCudaContext, input: &GpuTensor) -> Result<GpuTensor, CudaError> {
-    // NonZero has dynamic output size - use CPU fallback
-    // Copy input to CPU
-    let data = input.to_host_f32(ctx)?;
+    // NonZero has dynamic output size — CPU fallback. Per ONNX spec
+    // (https://onnx.ai/onnx/operators/onnx__NonZero.html) the output is
+    // always Int64 indices regardless of input dtype, so the dtype
+    // dispatch only varies how we evaluate "is non-zero" per element.
+    //
+    // M3.7c: Kokoro's istft chain feeds the output of a Bool comparison
+    // into NonZero. Pre-fix this site unconditionally called
+    // `to_host_f32` and panicked on Bool. M3.5 sub-B's Bool migration
+    // changed comparison ops to emit Bool natively; NonZero is one of
+    // the downstream consumers that needs a Bool-aware path.
     let shape = input.shape();
     let ndim = shape.len();
 
-    // Calculate strides for multi-dim index computation
+    // Compute the per-dimension flat-index strides once.
     let strides: Vec<usize> = (0..ndim)
         .map(|i| shape[i + 1..].iter().product::<usize>().max(1))
         .collect();
 
-    // Find all non-zero element indices
-    let mut all_indices: Vec<Vec<i64>> = vec![Vec::new(); ndim];
+    // Materialize a single is-nonzero predicate per element so the
+    // index-extraction loop below stays dtype-agnostic.
+    let is_nonzero: Vec<bool> = match input.dtype() {
+        crate::cuda::tensor::DType::Float32 => input
+            .to_host_f32(ctx)?
+            .into_iter()
+            .map(|v| v != 0.0)
+            .collect(),
+        crate::cuda::tensor::DType::Float16 => input
+            .to_host_f16(ctx)?
+            .into_iter()
+            .map(|v| v.to_f32() != 0.0)
+            .collect(),
+        crate::cuda::tensor::DType::Int64 => input
+            .to_host_i64(ctx)?
+            .into_iter()
+            .map(|v| v != 0)
+            .collect(),
+        crate::cuda::tensor::DType::Int32 => input
+            .to_host_i32(ctx)?
+            .into_iter()
+            .map(|v| v != 0)
+            .collect(),
+        crate::cuda::tensor::DType::Int8 => input
+            .to_host_i8(ctx)?
+            .into_iter()
+            .map(|v| v != 0)
+            .collect(),
+        crate::cuda::tensor::DType::UInt8 => input
+            .to_host_u8(ctx)?
+            .into_iter()
+            .map(|v| v != 0)
+            .collect(),
+        crate::cuda::tensor::DType::Bool => input.to_host_bool(ctx)?,
+    };
 
-    for (flat_idx, &value) in data.iter().enumerate() {
-        if value != 0.0 {
+    let mut all_indices: Vec<Vec<i64>> = vec![Vec::new(); ndim];
+    for (flat_idx, nz) in is_nonzero.into_iter().enumerate() {
+        if nz {
             let mut temp_idx = flat_idx;
             for dim in 0..ndim {
                 all_indices[dim].push((temp_idx / strides[dim]) as i64);
@@ -2513,14 +2554,12 @@ pub fn gpu_nonzero(ctx: &IconnxCudaContext, input: &GpuTensor) -> Result<GpuTens
 
     let num_nonzero = all_indices.first().map(|v| v.len()).unwrap_or(0);
 
-    // Build output: shape (ndim, num_nonzero)
     // Output is stored row-major: [dim0_indices..., dim1_indices..., ...]
     let mut output_data = Vec::with_capacity(ndim * num_nonzero);
     for dim_indices in &all_indices {
         output_data.extend_from_slice(dim_indices);
     }
 
-    // ONNX NonZero returns Int64
     if num_nonzero == 0 {
         GpuTensor::from_host_i64(ctx, &[], vec![ndim, 0])
     } else {
