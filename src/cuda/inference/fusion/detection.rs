@@ -50,6 +50,7 @@ pub(crate) fn detect_fused_patterns(
                 .and_then(|t| t.to_host_f32(ctx).ok())
         },
         |name| weights.contains_key(name),
+        |name| weights.get(name).map(|t| t.shape().to_vec()),
     )
 }
 
@@ -74,6 +75,7 @@ pub(crate) fn detect_fused_patterns_from_cpu(
             })
         },
         |name| initializers.contains_key(name),
+        |name| initializers.get(name).map(|t| t.shape().to_vec()),
     )
 }
 
@@ -91,10 +93,18 @@ pub(crate) fn detect_fused_patterns_from_cpu(
 /// `is_initializer(name)` returns `true` iff `name` is registered as an
 /// initializer (regardless of dtype). The detector uses this for static-
 /// value predicates that don't need to inspect the value itself.
+///
+/// `static_shape(name)` returns the shape of an initializer/static tensor
+/// when known. The MulAdd walker uses this to verify that the static-side
+/// `b` shares the bias `c`'s shape — the only contract `gpu_fused_mul_add`
+/// can honor. WS-4 M4.7: without this check the matcher claimed any
+/// Mul→Add chain whose `c` was an initializer, and DistilBERT-INT8's
+/// per-tensor scale × per-channel bias chain panicked at dispatch.
 fn detect_with_scalar_lookup(
     nodes: &[GraphNode],
     read_f32: impl Fn(&str) -> Option<Vec<f32>>,
     is_initializer: impl Fn(&str) -> bool,
+    static_shape: impl Fn(&str) -> Option<Vec<usize>>,
 ) -> (
     HashMap<String, FusedPatternInfo>,
     HashSet<String>,
@@ -594,9 +604,21 @@ fn detect_with_scalar_lookup(
         fused_patterns.insert(node.name.clone(), pattern_info);
     }
 
-    // Detect Mul -> Add pattern (simple multiply-add: a * b + c)
-    // This is a simpler pattern than AddMulAdd, catching remaining Mul-Add pairs
-    // Only fuse when c is a weight (constant), ensuring it's available at execution time
+    // Detect Mul -> Add pattern (simple multiply-add: a * b + c).
+    //
+    // The fused kernel `gpu_fused_mul_add` supports two layouts and BOTH
+    // require `b.shape == c.shape`:
+    //   1. All-same-shape: `a.shape == b.shape == c.shape`.
+    //   2. Per-channel broadcast: `b.shape == c.shape && b.numel == a.last`.
+    //
+    // The walker therefore (a) requires `c` to be a static initializer
+    // with a known shape, and (b) demands one of the two `Mul` inputs be
+    // a static initializer of the same shape as `c` — that one is `b`
+    // (the bias-paired scale); the other is the dynamic activation `a`.
+    // When neither qualifies, fusion is unsafe (Path 1 needs runtime
+    // shape agreement we can't verify; Path 2 needs static `b`); the
+    // unfused Mul + Add then fall back to separate elementwise ops,
+    // which broadcast correctly via the standard binary kernels.
     for node in nodes {
         if node.op_type == "Mul"
             && !nodes_to_skip.contains(&node.name)
@@ -623,17 +645,29 @@ fn detect_with_scalar_lookup(
                     .cloned()
                     .unwrap_or_default();
 
-                // Only fuse if c is a weight (constant) to ensure shape compatibility
-                // Fused kernels don't support broadcasting, so we can't use computed values
-                // that might have different shapes requiring broadcast
-                if !is_initializer(&c_input) {
+                let Some(c_shape) = static_shape(&c_input) else {
                     continue;
-                }
+                };
+
+                // Identify which Mul input is the static side matching
+                // c's shape; that one is `b`. Refuse if neither
+                // qualifies — wrapper has no path for that case.
+                let in0 = &node.inputs[0];
+                let in1 = &node.inputs[1];
+                let in0_matches = static_shape(in0).is_some_and(|s| s == c_shape);
+                let in1_matches = static_shape(in1).is_some_and(|s| s == c_shape);
+                let (a_input, b_input) = if in1_matches {
+                    (in0.clone(), in1.clone())
+                } else if in0_matches {
+                    (in1.clone(), in0.clone())
+                } else {
+                    continue;
+                };
 
                 let pattern_info = FusedPatternInfo {
                     pattern: FusedPattern::MulAdd {
-                        a_input: node.inputs[0].clone(),
-                        b_input: node.inputs[1].clone(),
+                        a_input,
+                        b_input,
                         c_input,
                         output_name: add_node.outputs[0].clone(),
                     },

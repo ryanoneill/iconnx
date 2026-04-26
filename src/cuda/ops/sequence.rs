@@ -242,6 +242,12 @@ pub fn gpu_cumsum(
                 })?;
             Ok(output)
         }
+        crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
+            Err(CudaError::Kernel(format!(
+                "CumSum does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through CumSum)",
+                dtype.name()
+            )))
+        }
     }
 }
 

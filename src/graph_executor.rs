@@ -7,9 +7,11 @@
 use crate::operators;
 use crate::operators::{
     add, and, atan, cast, clip, concat, constant, constant_of_shape, conv, conv_transpose, cos,
-    cumsum, div, equal, erf, exp, expand, flatten, floor, gather, gemm, global_average_pool,
+    cumsum, dequantize_linear, div, equal, erf, exp, expand, flatten, floor, gather, gemm,
+    global_average_pool,
     greater, greater_or_equal,
-    layer_normalization, leaky_relu, less, lstm, matmul, max_pool, mul, nonzero, pad, pow, range,
+    layer_normalization, leaky_relu, less, lstm, matmul, matmul_integer, max_pool, mul, nonzero,
+    pad, pow, range,
     reduce_mean, reduce_sum, relu, reshape, resize, round, scatter_nd, shape, sigmoid, sin, slice,
     softmax, sqrt, squeeze, stft, sub, tanh, transpose, unsqueeze, where_op,
 };
@@ -179,7 +181,8 @@ impl GraphExecutor {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            // Split is the only true multi-output op iconnx supports today.
+            // Split is one of two true multi-output ops iconnx supports
+            // today (the other is DynamicQuantizeLinear, handled below).
             // Other multi-output ops (LSTM) are aliased — single tensor
             // under multiple names — and are handled via the single-output
             // path below with the LSTM-style Arc-share fallback.
@@ -190,6 +193,21 @@ impl GraphExecutor {
                     node.outputs.len(),
                 );
                 for (name, tensor) in node.outputs.iter().zip(split_outputs.into_iter()) {
+                    if !name.is_empty() {
+                        values.insert(name.clone(), tensor);
+                    }
+                }
+                continue;
+            }
+
+            // DynamicQuantizeLinear: 3 distinct outputs (y, y_scale,
+            // y_zero_point). Same multi-output handling as Split.
+            if node.op_type == "DynamicQuantizeLinear" {
+                let outs = operators::dynamic_quantize_linear::DynamicQuantizeLinear::forward(
+                    &input_tensors,
+                    &node.attributes,
+                );
+                for (name, tensor) in node.outputs.iter().zip(outs.into_iter()) {
                     if !name.is_empty() {
                         values.insert(name.clone(), tensor);
                     }
@@ -374,6 +392,7 @@ impl GraphExecutor {
             "Less" => Ok(less::Less::forward(inputs, attributes)),
             "LSTM" => Ok(lstm::LSTM::forward(inputs, attributes)),
             "MatMul" => Ok(matmul::MatMul::forward(inputs, attributes)),
+            "MatMulInteger" => Ok(matmul_integer::MatMulInteger::forward(inputs, attributes)),
             "Mul" => Ok(mul::Mul::forward(inputs, attributes)),
             "NonZero" => Ok(nonzero::NonZero::forward(inputs, attributes)),
             "Pad" => Ok(pad::Pad::forward(inputs, attributes)),
@@ -395,6 +414,9 @@ impl GraphExecutor {
             "Squeeze" => Ok(squeeze::Squeeze::forward(inputs, attributes)),
             "STFT" => Ok(stft::Stft::forward(inputs, attributes)),
             "Sub" => Ok(sub::Sub::forward(inputs, attributes)),
+            "DequantizeLinear" => Ok(dequantize_linear::DequantizeLinear::forward(
+                inputs, attributes,
+            )),
             "Erf" => Ok(erf::Erf::forward(inputs, attributes)),
             "Flatten" => Ok(flatten::Flatten::forward(inputs, attributes)),
             "GlobalAveragePool" => Ok(global_average_pool::GlobalAveragePool::forward(
@@ -478,6 +500,21 @@ impl GraphExecutor {
                     node.outputs.len(),
                 );
                 for (name, tensor) in node.outputs.iter().zip(split_outputs.into_iter()) {
+                    if !name.is_empty() {
+                        values.insert(name.clone(), tensor);
+                    }
+                }
+                continue;
+            }
+
+            // DynamicQuantizeLinear: 3 distinct outputs (y, y_scale,
+            // y_zero_point). Same multi-output handling as Split.
+            if node.op_type == "DynamicQuantizeLinear" {
+                let outs = operators::dynamic_quantize_linear::DynamicQuantizeLinear::forward(
+                    &input_tensors,
+                    &node.attributes,
+                );
+                for (name, tensor) in node.outputs.iter().zip(outs.into_iter()) {
                     if !name.is_empty() {
                         values.insert(name.clone(), tensor);
                     }

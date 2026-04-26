@@ -370,6 +370,57 @@ pub fn gpu_transpose_nd(
                 })?;
             Ok(output)
         }
+        GpuTensor::UInt8 { .. } => {
+            // WS-4 M4.7: DistilBERT-INT8 transposes the UINT8 weight
+            // initializer (`<weight>_transposed_quantized`) before the
+            // downstream DequantizeLinear restores f32. Memcpy-class —
+            // mirrors the f32 / i64 / i32 arms above byte-for-byte with
+            // `unsigned char` data pointers.
+            let mut output = pool.get_tensor_u8(ctx, out_shape)?;
+            // SAFETY: transpose_general_u8_kernel signature mirrors
+            // transpose_general_kernel with `unsigned char*` (u8) data
+            // pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, u8>,
+                    &garboard::DeviceSlice<'_, u8>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("transpose_general_u8_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("transpose_general_u8_kernel lookup: {}", e))
+            })?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_u8_mut()?,
+                        input.data_u8()?,
+                        &in_shape_gpu,
+                        &in_strides_gpu,
+                        &out_strides_gpu,
+                        &perm_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("transpose_general_u8 launch failed: {}", e))
+                })?;
+            Ok(output)
+        }
+        GpuTensor::Int8 { .. } => {
+            Err(CudaError::Kernel(format!(
+                "Transpose does not support {} (WS-4 — quantization graph should not route INT8 through Transpose)",
+                input.dtype().name()
+            )))
+        }
     }
 }
 
@@ -489,6 +540,12 @@ pub fn gpu_where(
                 .map_err(|e| CudaError::Kernel(format!("where_i32 launch failed: {}", e)))?;
             Ok(output)
         }
+        crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
+            Err(CudaError::Kernel(format!(
+                "Where does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Where)",
+                dtype.name()
+            )))
+        }
     }
 }
 
@@ -601,6 +658,40 @@ pub fn gpu_gather(
                 .map_err(|e| CudaError::Kernel(format!("gather_i64 launch failed: {}", e)))?;
             Ok(output)
         }
+        GpuTensor::UInt8 { .. } => {
+            // WS-4 M4.7: DistilBERT-INT8's word-embeddings table is UINT8;
+            // Gather flies UINT8 before downstream DequantizeLinear converts
+            // back to fp32.
+            let mut output = pool.get_tensor_u8(ctx, out_shape)?;
+            // SAFETY: gather_u8_kernel takes (unsigned char* out, const unsigned char* inp,
+            //   const long long* indices, size_t num_indices, size_t slice_size, size_t dim0_size).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, u8>,
+                    &garboard::DeviceSlice<'_, u8>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                )>("gather_u8_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("gather_u8_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_u8_mut()?,
+                        input.data_u8()?,
+                        &indices_gpu,
+                        num_indices,
+                        slice_size,
+                        dim0_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("gather_u8 launch failed: {}", e)))?;
+            Ok(output)
+        }
         _ => Err(CudaError::Kernel(format!(
             "Gather: unsupported input dtype {}",
             input.dtype().name()
@@ -700,6 +791,40 @@ pub fn gpu_gather_from_gpu(
                     ),
                 )
                 .map_err(|e| CudaError::Kernel(format!("gather_i64 launch failed: {}", e)))?;
+            Ok(output)
+        }
+        GpuTensor::UInt8 { .. } => {
+            // WS-4 M4.7: parallel of gpu_gather's UINT8 arm — DistilBERT-INT8's
+            // word-embeddings table is UINT8 and may be gathered with
+            // GPU-resident indices.
+            let mut output = pool.get_tensor_u8(ctx, out_shape)?;
+            // SAFETY: gather_u8_kernel takes (unsigned char* out, const unsigned char* inp,
+            //   const long long* indices, size_t num_indices, size_t slice_size, size_t dim0_size).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, u8>,
+                    &garboard::DeviceSlice<'_, u8>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                )>("gather_u8_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("gather_u8_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_u8_mut()?,
+                        input.data_u8()?,
+                        indices_tensor.data_i64()?,
+                        num_indices,
+                        slice_size,
+                        dim0_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("gather_u8 launch failed: {}", e)))?;
             Ok(output)
         }
         _ => Err(CudaError::Kernel(format!(
@@ -826,6 +951,12 @@ pub fn gpu_copy(
                 )
                 .map_err(|e| CudaError::Kernel(format!("copy_i32 launch failed: {}", e)))?;
             Ok(output)
+        }
+        GpuTensor::Int8 { .. } | GpuTensor::UInt8 { .. } => {
+            Err(CudaError::Kernel(format!(
+                "gpu_copy does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through gpu_copy)",
+                input.dtype().name()
+            )))
         }
     }
 }
@@ -1058,6 +1189,12 @@ pub fn gpu_concat(
             }
             Ok(output)
         }
+        crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
+            Err(CudaError::Kernel(format!(
+                "Concat does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Concat)",
+                dtype.name()
+            )))
+        }
     }
 }
 
@@ -1234,6 +1371,12 @@ pub fn gpu_expand(
                 )
                 .map_err(|e| CudaError::Kernel(format!("expand_i32 launch failed: {}", e)))?;
             Ok(output)
+        }
+        crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
+            Err(CudaError::Kernel(format!(
+                "Expand does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Expand)",
+                dtype.name()
+            )))
         }
     }
 }
@@ -2233,6 +2376,12 @@ pub fn gpu_slice_nd(
             crate::cuda::tensor::DType::Float32 => pool.get_tensor_f32(ctx, out_shape),
             crate::cuda::tensor::DType::Int64 => pool.get_tensor_i64(ctx, out_shape),
             crate::cuda::tensor::DType::Int32 => pool.get_tensor_i32(ctx, out_shape),
+            crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
+                Err(CudaError::Kernel(format!(
+                    "Slice does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Slice)",
+                    dtype.name()
+                )))
+            }
         };
     }
 
@@ -2546,6 +2695,12 @@ pub fn gpu_slice_nd(
                 )
                 .map_err(|e| CudaError::Kernel(format!("slice_nd_i32 launch failed: {}", e)))?;
             Ok(output)
+        }
+        (_, crate::cuda::tensor::DType::Int8) | (_, crate::cuda::tensor::DType::UInt8) => {
+            Err(CudaError::Kernel(format!(
+                "Slice does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Slice)",
+                dtype.name()
+            )))
         }
     }
 }

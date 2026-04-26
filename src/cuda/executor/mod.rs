@@ -270,6 +270,7 @@ impl Executor {
     ) -> Result<Vec<GpuTensor>, CudaError> {
         match op.node.op_type.as_str() {
             "Split" => self.dispatch_split(op, values, plan),
+            "DynamicQuantizeLinear" => self.dispatch_dynamic_quantize_linear(op, values, plan),
             _ => Ok(vec![self.dispatch_op(op, values, plan)?]),
         }
     }
@@ -501,6 +502,14 @@ pub(super) fn upload_tensor(
             let data = tensor.as_slice_i32();
             GpuTensor::from_host_i32(ctx, &data, tensor.shape().to_vec())
         }
+        Tensor::Int8(_) => {
+            let data = tensor.as_slice_i8();
+            GpuTensor::from_host_i8(ctx, &data, tensor.shape().to_vec())
+        }
+        Tensor::UInt8(_) => {
+            let data = tensor.as_slice_u8();
+            GpuTensor::from_host_u8(ctx, &data, tensor.shape().to_vec())
+        }
         Tensor::Bool(arr) => {
             // Bool → Float32 with `false` mapping to 0.0 and `true` to
             // 1.0. Explicit conversion — `tensor.as_slice()` panics on
@@ -546,6 +555,14 @@ pub(super) fn collect_outputs(
             GpuTensor::Int32 { shape, .. } => {
                 let data = gpu_tensor.to_host_i32(ctx)?;
                 Tensor::from_vec_i32(data, shape.clone())
+            }
+            GpuTensor::Int8 { shape, .. } => {
+                let data = gpu_tensor.to_host_i8(ctx)?;
+                Tensor::from_vec_i8(data, shape.clone())
+            }
+            GpuTensor::UInt8 { shape, .. } => {
+                let data = gpu_tensor.to_host_u8(ctx)?;
+                Tensor::from_vec_u8(data, shape.clone())
             }
         };
         outputs.insert((*name).to_string(), cpu_tensor);

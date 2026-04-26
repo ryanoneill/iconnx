@@ -1,6 +1,6 @@
 /// Transpose operator for Iconnx
 ///
-/// Permutes tensor dimensions
+/// Permutes tensor dimensions. Memcpy-class op — preserves dtype.
 /// ONNX spec: https://onnx.ai/onnx/operators/onnx__Transpose.html
 use crate::tensor::Tensor;
 
@@ -15,10 +15,12 @@ impl Transpose {
     ///   - data: Tensor to transpose
     ///   - perm (optional): Permutation order as 1D tensor
     ///
-    /// If no permutation provided, reverses all axes (e.g., 2D matrix transpose)
-    ///
-    /// # Returns
-    /// Transposed tensor
+    /// If no permutation provided, reverses all axes (e.g., 2D matrix transpose).
+    /// Dtype-polymorphic — output preserves input dtype (Transpose is
+    /// pure shape relabel, no math). WS-4 added Int8/UInt8 arms so the
+    /// constant-folding pass can transpose quantized weight initializers
+    /// in DistilBERT-INT8 without panicking via the f32-strict
+    /// `to_array()` accessor.
     pub fn forward(
         inputs: &[Tensor],
         attributes: &crate::attributes::NodeAttributes,
@@ -27,24 +29,34 @@ impl Transpose {
 
         let data = &inputs[0];
 
-        // Get permutation from attributes (ONNX spec)
         let perm: Vec<usize> = if let Some(perm_attr) = attributes.get_ints("perm") {
-            // Use permutation from attributes
             perm_attr.iter().map(|&v| v as usize).collect()
         } else {
-            // Default: reverse all axes
             (0..data.ndim()).rev().collect()
         };
 
-        #[cfg(debug_assertions)]
-        {}
-
-        // Perform transpose
-        let transposed = data.to_array().clone().permuted_axes(perm);
-
-        #[cfg(debug_assertions)]
-        {}
-
-        Tensor::from_array(transposed)
+        match data {
+            Tensor::Float32(arr) => {
+                Tensor::from_array(arr.clone().permuted_axes(perm))
+            }
+            Tensor::Float64(arr) => {
+                Tensor::Float64(arr.clone().permuted_axes(perm))
+            }
+            Tensor::Int64(arr) => {
+                Tensor::from_array_i64(arr.clone().permuted_axes(perm))
+            }
+            Tensor::Int32(arr) => {
+                Tensor::from_array_i32(arr.clone().permuted_axes(perm))
+            }
+            Tensor::Bool(arr) => {
+                Tensor::Bool(arr.clone().permuted_axes(perm))
+            }
+            Tensor::Int8(arr) => {
+                Tensor::Int8(arr.clone().permuted_axes(perm))
+            }
+            Tensor::UInt8(arr) => {
+                Tensor::UInt8(arr.clone().permuted_axes(perm))
+            }
+        }
     }
 }

@@ -236,13 +236,16 @@ impl OnnxModel {
     /// Extract weight tensors from initializers.
     ///
     /// Returns a map of tensor name → Tensor. Supports ONNX dtypes
-    /// FLOAT(1), INT64(7), INT32(6), FLOAT64(11), and BOOL(9) —
-    /// the five dtypes currently representable by [`crate::tensor::Tensor`].
+    /// FLOAT(1), INT64(7), INT32(6), FLOAT64(11), BOOL(9), INT8(3),
+    /// and UINT8(2) — the seven dtypes currently representable by
+    /// [`crate::tensor::Tensor`]. INT8/UINT8 were added in WS-4 M4.2
+    /// to unblock dynamic-quantized models (DistilBERT-INT8 pilot:
+    /// DequantizeLinear / DynamicQuantizeLinear / MatMulInteger).
     ///
-    /// Any other dtype (FP16=10, BF16=16, INT8=3, UINT8=2, INT16=5,
-    /// UINT16=4, UINT32=12, UINT64=13, the FLOAT*E* variants, …) is
-    /// surfaced as [`ParseError::UnsupportedInitializerDType`]
-    /// rather than silently dropped: the pre-WS-1 `#[cfg(debug_assertions)]
+    /// Any other dtype (FP16=10, BF16=16, INT16=5, UINT16=4,
+    /// UINT32=12, UINT64=13, the FLOAT*E* variants, …) is surfaced
+    /// as [`ParseError::UnsupportedInitializerDType`] rather than
+    /// silently dropped: the pre-WS-1 `#[cfg(debug_assertions)]
     /// eprintln!` fallback produced release-mode-invisible weight
     /// drops that corrupt downstream inference.
     ///
@@ -283,6 +286,8 @@ impl OnnxModel {
                     6 => crate::tensor::Tensor::from_vec_i32(Vec::new(), shape),
                     11 => crate::tensor::Tensor::from_vec_f64(Vec::new(), shape),
                     9 => crate::tensor::Tensor::from_vec_bool(Vec::new(), shape),
+                    3 => crate::tensor::Tensor::from_vec_i8(Vec::new(), shape),
+                    2 => crate::tensor::Tensor::from_vec_u8(Vec::new(), shape),
                     other => {
                         return Err(ParseError::UnsupportedInitializerDType {
                             name,
@@ -326,6 +331,22 @@ impl OnnxModel {
                     let data = Self::decode_bool_payload(&name, tensor_proto)?;
                     let final_shape = self.correct_shape(&name, &shape, expected_len, data.len())?;
                     crate::tensor::Tensor::from_vec_bool(data, final_shape)
+                }
+                3 => {
+                    // INT8 (i8) — WS-4 M4.2. Wire format mirrors INT32:
+                    // int32_data carries one i32 per element (low 8 bits,
+                    // sign-extended via `as i8`); raw_data carries one
+                    // byte per element interpreted as i8.
+                    let data = Self::decode_i8_payload(&name, tensor_proto)?;
+                    let final_shape = self.correct_shape(&name, &shape, expected_len, data.len())?;
+                    crate::tensor::Tensor::from_vec_i8(data, final_shape)
+                }
+                2 => {
+                    // UINT8 (u8) — WS-4 M4.2. Same wire format as INT8
+                    // but zero-extended.
+                    let data = Self::decode_u8_payload(&name, tensor_proto)?;
+                    let final_shape = self.correct_shape(&name, &shape, expected_len, data.len())?;
+                    crate::tensor::Tensor::from_vec_u8(data, final_shape)
                 }
                 other => {
                     return Err(ParseError::UnsupportedInitializerDType {
@@ -477,6 +498,53 @@ impl OnnxModel {
         Ok(raw.iter().map(|&b| b != 0).collect())
     }
 
+    fn decode_i8_payload(
+        name: &str,
+        tensor_proto: &onnx_proto::TensorProto,
+    ) -> Result<Vec<i8>, ParseError> {
+        // ONNX wire format: INT8 carries elements in int32_data
+        // (one i32 per element, low 8 bits — sign-extended via
+        // `as i8`) or raw_data (one byte per element interpreted
+        // as i8 two's complement). WS-4 M4.2.
+        if !tensor_proto.int32_data.is_empty() {
+            return Ok(tensor_proto.int32_data.iter().map(|&v| v as i8).collect());
+        }
+        let raw = tensor_proto.raw_data.as_ref().ok_or_else(|| ParseError::InvalidTensorData {
+            name: name.to_string(),
+            reason: "no int32_data and no raw_data".to_string(),
+        })?;
+        if raw.is_empty() {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: "empty raw_data for INT8 tensor".to_string(),
+            });
+        }
+        Ok(raw.iter().map(|&b| b as i8).collect())
+    }
+
+    fn decode_u8_payload(
+        name: &str,
+        tensor_proto: &onnx_proto::TensorProto,
+    ) -> Result<Vec<u8>, ParseError> {
+        // ONNX wire format: UINT8 carries elements in int32_data
+        // (one i32 per element, low 8 bits — zero-extended via
+        // `as u8`) or raw_data (one byte per element). WS-4 M4.2.
+        if !tensor_proto.int32_data.is_empty() {
+            return Ok(tensor_proto.int32_data.iter().map(|&v| v as u8).collect());
+        }
+        let raw = tensor_proto.raw_data.as_ref().ok_or_else(|| ParseError::InvalidTensorData {
+            name: name.to_string(),
+            reason: "no int32_data and no raw_data".to_string(),
+        })?;
+        if raw.is_empty() {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: "empty raw_data for UINT8 tensor".to_string(),
+            });
+        }
+        Ok(raw.clone())
+    }
+
     /// Reconcile declared shape with actual data length.
     ///
     /// * Default / strict: any mismatch becomes
@@ -617,11 +685,11 @@ impl OnnxModel {
 
     /// Parse a TensorProto into a Tensor.
     ///
-    /// Supports ONNX dtypes FLOAT(1), INT64(7), INT32(6), BOOL(9).
-    /// Every failure path — unsupported dtype, empty/misaligned
-    /// payload, shape/length mismatch — returns a typed [`ParseError`]
-    /// so callers can decide what to do instead of silently dropping
-    /// the attribute (the pre-WS-1 behaviour).
+    /// Supports ONNX dtypes FLOAT(1), INT64(7), INT32(6), BOOL(9),
+    /// INT8(3), UINT8(2). Every failure path — unsupported dtype,
+    /// empty/misaligned payload, shape/length mismatch — returns a
+    /// typed [`ParseError`] so callers can decide what to do instead
+    /// of silently dropping the attribute (the pre-WS-1 behaviour).
     fn parse_tensor_proto(
         tensor_proto: &onnx_proto::TensorProto,
     ) -> Result<crate::tensor::Tensor, ParseError> {
@@ -646,6 +714,8 @@ impl OnnxModel {
                 7 => Ok(crate::tensor::Tensor::from_vec_i64(Vec::new(), shape)),
                 6 => Ok(crate::tensor::Tensor::from_vec_i32(Vec::new(), shape)),
                 9 => Ok(crate::tensor::Tensor::from_vec_bool(Vec::new(), shape)),
+                3 => Ok(crate::tensor::Tensor::from_vec_i8(Vec::new(), shape)),
+                2 => Ok(crate::tensor::Tensor::from_vec_u8(Vec::new(), shape)),
                 other => Err(ParseError::UnsupportedDType {
                     name,
                     dtype_id: other,
@@ -813,6 +883,70 @@ impl OnnxModel {
                     });
                 }
                 Ok(crate::tensor::Tensor::from_vec_bool(data, shape))
+            }
+            3 => {
+                // INT8 (i8) — WS-4 M4.2. Wire format: int32_data carries
+                // one i32 per element (the low 8 bits, sign-extended via
+                // `as i8`); raw_data carries one byte per element
+                // interpreted as i8 two's complement. Both branches
+                // mirror the BOOL arm above modulo cast vs nonzero.
+                let data: Vec<i8> = if !tensor_proto.int32_data.is_empty() {
+                    tensor_proto.int32_data.iter().map(|&v| v as i8).collect()
+                } else if let Some(raw) = &tensor_proto.raw_data {
+                    if raw.is_empty() {
+                        return Err(ParseError::InvalidTensorData {
+                            name,
+                            reason: "empty raw_data for INT8 tensor".to_string(),
+                        });
+                    }
+                    raw.iter().map(|&b| b as i8).collect()
+                } else {
+                    return Err(ParseError::InvalidTensorData {
+                        name,
+                        reason: "no int32_data and no raw_data".to_string(),
+                    });
+                };
+
+                if data.len() != expected_len {
+                    return Err(ParseError::ShapeMismatch {
+                        name,
+                        declared: shape,
+                        declared_len: expected_len,
+                        actual_len: data.len(),
+                    });
+                }
+                Ok(crate::tensor::Tensor::from_vec_i8(data, shape))
+            }
+            2 => {
+                // UINT8 (u8) — WS-4 M4.2. Same wire format as INT8 but
+                // zero-extended: int32_data → cast each i32 to u8 (low 8
+                // bits); raw_data → bytes copied verbatim.
+                let data: Vec<u8> = if !tensor_proto.int32_data.is_empty() {
+                    tensor_proto.int32_data.iter().map(|&v| v as u8).collect()
+                } else if let Some(raw) = &tensor_proto.raw_data {
+                    if raw.is_empty() {
+                        return Err(ParseError::InvalidTensorData {
+                            name,
+                            reason: "empty raw_data for UINT8 tensor".to_string(),
+                        });
+                    }
+                    raw.clone()
+                } else {
+                    return Err(ParseError::InvalidTensorData {
+                        name,
+                        reason: "no int32_data and no raw_data".to_string(),
+                    });
+                };
+
+                if data.len() != expected_len {
+                    return Err(ParseError::ShapeMismatch {
+                        name,
+                        declared: shape,
+                        declared_len: expected_len,
+                        actual_len: data.len(),
+                    });
+                }
+                Ok(crate::tensor::Tensor::from_vec_u8(data, shape))
             }
             other => Err(ParseError::UnsupportedDType {
                 name,
@@ -1369,6 +1503,89 @@ mod tests {
                 assert_eq!(arr.len(), 0);
             }
             other => panic!("expected Tensor::Float32, got {:?}", other),
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // WS-4 M4.2 — INT8 + UINT8 initializer parsing.
+    //
+    // ONNX wire format: INT8 (3) and UINT8 (2) carry their elements in
+    // either `int32_data` (one i32 per element; low 8 bits — sign-
+    // extended for i8, zero-extended for u8) or `raw_data` (one byte
+    // per element, two's complement for i8 / unsigned for u8). Same
+    // shape as the BOOL arm above, modulo cast vs. nonzero.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn parse_tensor_proto_int8_via_int32_data() {
+        let proto = onnx_proto::TensorProto {
+            name: Some("weights_i8".to_string()),
+            data_type: Some(3), // INT8
+            dims: vec![4],
+            int32_data: vec![-128, 0, 1, 127],
+            ..Default::default()
+        };
+        match OnnxModel::parse_tensor_proto(&proto).expect("INT8 should parse") {
+            Tensor::Int8(arr) => {
+                assert_eq!(arr.shape(), &[4]);
+                assert_eq!(arr.iter().copied().collect::<Vec<_>>(), vec![-128_i8, 0, 1, 127]);
+            }
+            other => panic!("expected Tensor::Int8, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_int8_via_raw_data() {
+        // Each byte is reinterpreted as i8 in two's-complement: 0xFF → -1,
+        // 0x00 → 0, 0x01 → 1, 0x7F → 127. Boundary value -128 (0x80) is
+        // covered separately by parse_tensor_proto_int8_via_int32_data.
+        let bytes: Vec<u8> = vec![0xFF, 0x00, 0x01, 0x7F];
+        let proto = onnx_proto::TensorProto {
+            name: Some("w".into()),
+            data_type: Some(3),
+            dims: vec![4],
+            raw_data: Some(bytes),
+            ..Default::default()
+        };
+        let tensor = OnnxModel::parse_tensor_proto(&proto).expect("INT8 raw_data");
+        if let Tensor::Int8(arr) = tensor {
+            assert_eq!(arr.iter().copied().collect::<Vec<_>>(), vec![-1_i8, 0, 1, 127]);
+        } else {
+            panic!("expected Int8");
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_uint8_via_int32_data() {
+        let proto = onnx_proto::TensorProto {
+            name: Some("zp".into()),
+            data_type: Some(2), // UINT8
+            dims: vec![3],
+            int32_data: vec![0, 128, 255],
+            ..Default::default()
+        };
+        let tensor = OnnxModel::parse_tensor_proto(&proto).expect("UINT8 should parse");
+        if let Tensor::UInt8(arr) = tensor {
+            assert_eq!(arr.iter().copied().collect::<Vec<_>>(), vec![0_u8, 128, 255]);
+        } else {
+            panic!("expected UInt8");
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_int8_zero_element() {
+        let proto = onnx_proto::TensorProto {
+            name: Some("empty".into()),
+            data_type: Some(3),
+            dims: vec![0],
+            ..Default::default()
+        };
+        let tensor = OnnxModel::parse_tensor_proto(&proto).expect("zero-element INT8");
+        if let Tensor::Int8(arr) = tensor {
+            assert_eq!(arr.shape(), &[0]);
+            assert_eq!(arr.len(), 0);
+        } else {
+            panic!("expected Int8");
         }
     }
 }

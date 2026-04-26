@@ -226,6 +226,12 @@ fn binary_comparison(
                     CudaError::Kernel(format!("{} launch failed: {}", i32_kernel_name, e))
                 })?;
         }
+        crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
+            return Err(CudaError::Kernel(format!(
+                "Comparison does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through comparison ops)",
+                dtype.name()
+            )));
+        }
     }
 
     Ok(output)

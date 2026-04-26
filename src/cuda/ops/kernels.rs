@@ -78,6 +78,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     "fill_kernel",
     "fill_i64_kernel",
     "max_pool_2d_kernel",
+    // WS-4 quantization kernels live in `quantize_kernels.rs`
+    // (split out per the project's 1000-line file guideline).
 ];
 
 /// CUDA kernel source code
@@ -1646,4 +1648,5 @@ extern "C" __global__ void max_pool_2d_kernel(
 
     out[((n * C + c) * oH + oh) * oW + ow] = any ? maxv : -CUDART_INF_F;
 }
+
 "#;

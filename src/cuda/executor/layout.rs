@@ -23,9 +23,11 @@ use std::collections::HashMap;
 use crate::cuda::inference::{compute_broadcast_shape, maybe_expand};
 use crate::cuda::ops::{
     gpu_cast, gpu_concat, gpu_constant_of_shape_direct, gpu_constant_of_shape_direct_i64, gpu_copy,
-    gpu_cumsum, gpu_expand, gpu_gather_from_gpu, gpu_max_pool_2d, gpu_nonzero, gpu_pad, gpu_range,
-    gpu_range_i64, gpu_resize, gpu_scatter_nd, gpu_shape, gpu_slice_nd, gpu_transpose_2d,
-    gpu_transpose_nd, gpu_where, ResizeCoordMode, ResizeMode, ResizeNearestMode,
+    gpu_cumsum, gpu_dequantize_linear, gpu_expand, gpu_gather_from_gpu, gpu_matmul_integer,
+    gpu_max_pool_2d,
+    gpu_nonzero, gpu_pad, gpu_range, gpu_range_i64, gpu_resize, gpu_scatter_nd, gpu_shape,
+    gpu_slice_nd, gpu_transpose_2d, gpu_transpose_nd, gpu_where, ResizeCoordMode, ResizeMode,
+    ResizeNearestMode,
 };
 use crate::cuda::tensor::DType;
 use crate::cuda::{CudaError, GpuTensor};
@@ -942,6 +944,133 @@ impl Executor {
                 )
             }
 
+            // --- DequantizeLinear (WS-4 M4.4) ----------------------------
+            //
+            // y = (x - zero_point) * scale; output is FP32. `scale` is FP32
+            // (scalar = per-tensor; 1-D = per-axis). `zero_point` (input 2)
+            // is optional and shares dtype with `x`. `axis` defaults to 1
+            // and is ignored when `scale` is scalar.
+            "DequantizeLinear" => {
+                if inputs.len() < 2 || inputs.len() > 3 {
+                    return Err(CudaError::Kernel(format!(
+                        "DequantizeLinear requires 2 or 3 inputs, got {}",
+                        inputs.len()
+                    )));
+                }
+                let x = inputs[0];
+                let scale = inputs[1];
+                let zp = inputs.get(2).copied();
+
+                // Resolve `axis` — default 1, normalize negatives modulo
+                // ndim. Only meaningful in the per-axis case; the wrapper
+                // ignores it when `scale` is scalar.
+                let raw_axis = attributes.get_int("axis").unwrap_or(1);
+                let ndim = x.ndim() as i64;
+                let resolved = if raw_axis < 0 {
+                    raw_axis + ndim
+                } else {
+                    raw_axis
+                };
+                if !(0..ndim).contains(&resolved) {
+                    return Err(CudaError::Kernel(format!(
+                        "DequantizeLinear: axis {} out of range for ndim {}",
+                        raw_axis, ndim
+                    )));
+                }
+                let axis = resolved as usize;
+
+                gpu_dequantize_linear(&self.ctx, &self.ops_kernels, &mut pool, x, scale, zp, axis)
+            }
+
+            // --- MatMulInteger (WS-4 M4.6 + M4.7 batched) ----------------
+            //
+            // out = matmul((a - a_zp), (b - b_zp)), output Int32. The
+            // backing kernel is 2-D only; `a` is `[M, K]`, `b` is `[K, N]`;
+            // each operand is Int8 or UInt8 (4 sign-combination kernel
+            // variants). `a_zero_point` (input 2) and `b_zero_point` (input
+            // 3) are optional and must be scalar (rank 0 or single-element
+            // 1-D). Per-axis zp is rejected — DistilBERT does not exercise
+            // that path and the M4.6 GPU kernel ABI is scalar-zp only.
+            //
+            // M4.7 surfaced 3-D × 2-D inputs from DistilBERT-INT8
+            // (`[B, M, K] × [K, N] → [B, M, N]`). Mirrors the regular
+            // `MatMul` executor's 3-D × 2-D handling in
+            // `src/cuda/executor/matmul.rs`: reshape A `[B, M, K]` →
+            // `[B*M, K]` (metadata-only on `GpuTensor`), run the existing
+            // 2-D kernel, reshape result `[B*M, N]` → `[B, M, N]`. No new
+            // kernel, no new math — just dimension flatten/restore at the
+            // wrapper boundary.
+            //
+            // Routed through `dispatch_layout` rather than `dispatch_matmul`
+            // because every other quantization op (DequantizeLinear,
+            // DynamicQuantizeLinear) lives here, and the wrapper boundary
+            // is `gpu_matmul_integer` in `src/cuda/ops/quantize.rs` —
+            // consistent with the rest of the WS-4 op family.
+            "MatMulInteger" => {
+                if inputs.len() < 2 || inputs.len() > 4 {
+                    return Err(CudaError::Kernel(format!(
+                        "MatMulInteger requires 2, 3, or 4 inputs, got {}",
+                        inputs.len()
+                    )));
+                }
+                let a = inputs[0];
+                let b = inputs[1];
+                let a_zp = inputs.get(2).copied();
+                let b_zp = inputs.get(3).copied();
+
+                let a_ndim = a.ndim();
+                let b_ndim = b.ndim();
+                match (a_ndim, b_ndim) {
+                    (2, 2) => gpu_matmul_integer(
+                        &self.ctx,
+                        &self.ops_kernels,
+                        &mut pool,
+                        a,
+                        b,
+                        a_zp,
+                        b_zp,
+                    ),
+                    (3, 2) => {
+                        // [B, M, K] × [K, N] → [B, M, N]. Reshape A to
+                        // [B*M, K], 2-D matmul, reshape result back.
+                        let a_shape = a.shape();
+                        let b_shape = b.shape();
+                        let batch = a_shape[0];
+                        let m = a_shape[1];
+                        let k = a_shape[2];
+                        let n = b_shape[1];
+
+                        let a_reshaped =
+                            a.clone().reshape(vec![batch * m, k]).ok_or_else(|| {
+                                CudaError::Kernel(
+                                    "MatMulInteger: failed to reshape A to 2-D".into(),
+                                )
+                            })?;
+
+                        let result_2d = gpu_matmul_integer(
+                            &self.ctx,
+                            &self.ops_kernels,
+                            &mut pool,
+                            &a_reshaped,
+                            b,
+                            a_zp,
+                            b_zp,
+                        )?;
+
+                        result_2d.reshape(vec![batch, m, n]).ok_or_else(|| {
+                            CudaError::Kernel(
+                                "MatMulInteger: failed to reshape result to 3-D".into(),
+                            )
+                        })
+                    }
+                    _ => Err(CudaError::Kernel(format!(
+                        "MatMulInteger: unsupported ranks A={}D, B={}D \
+                         (M4.7 supports 2×2 and 3×2)",
+                        a_ndim, b_ndim
+                    ))),
+                }
+            }
+
             other => Err(CudaError::Kernel(format!(
                 "dispatch_layout called with non-layout op '{}'",
                 other
@@ -1047,6 +1176,30 @@ impl Executor {
             axis as i64,
             &sizes,
         )
+    }
+
+    /// GPU dispatch for `DynamicQuantizeLinear` (WS-4 M4.5). Multi-output
+    /// op like `Split` — returns three tensors `(y, y_scale, y_zero_point)`
+    /// stored under their own names by `store_outputs`'s distinct-multi
+    /// path. Routed through `dispatch_op_multi`, never single-output
+    /// `dispatch_op`.
+    pub(crate) fn dispatch_dynamic_quantize_linear(
+        &self,
+        op: &PlannedOp,
+        values: &HashMap<String, GpuTensor>,
+        plan: &ExecutionPlan,
+    ) -> Result<Vec<GpuTensor>, CudaError> {
+        let weights = &plan.weights;
+        let inputs = resolve_inputs(&op.node.inputs, values, weights)?;
+        if inputs.is_empty() {
+            return Err(CudaError::Kernel(
+                "DynamicQuantizeLinear: missing input tensor".into(),
+            ));
+        }
+        // Host-quantize MVP — wrapper neither launches a kernel nor touches
+        // the pool, so we don't borrow either. See gpu_dynamic_quantize_linear
+        // for the f64-parity rationale.
+        crate::cuda::ops::gpu_dynamic_quantize_linear(&self.ctx, inputs[0])
     }
 
     /// Resolve split sizes when no explicit `split` input was provided.

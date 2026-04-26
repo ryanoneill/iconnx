@@ -44,7 +44,11 @@ where
 }
 
 /// GPU Cast: convert tensor from one dtype to another.
-/// Supports conversions between Float32, Int64, and Int32.
+///
+/// Supports conversions between Float32, Int64, and Int32. INT8/UINT8 are
+/// not handled here — those cross the float/int boundary via
+/// `DequantizeLinear` (M4.4) and `DynamicQuantizeLinear` (M4.5); plain
+/// Cast on those dtypes returns `CudaError::Kernel`.
 pub fn gpu_cast(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
@@ -162,7 +166,20 @@ pub fn gpu_cast(
         // Same-type cases already handled above by early return.
         (DType::Float32, DType::Float32)
         | (DType::Int64, DType::Int64)
-        | (DType::Int32, DType::Int32) => unreachable!("Same-type cast handled above"),
+        | (DType::Int32, DType::Int32)
+        | (DType::Int8, DType::Int8)
+        | (DType::UInt8, DType::UInt8) => unreachable!("Same-type cast handled above"),
+
+        // INT8/UINT8 casts: WS-4 quantization graph dequantizes via
+        // DequantizeLinear (M4.5) and quantizes via DynamicQuantizeLinear
+        // (M4.6). Plain Cast is not on that path.
+        (DType::Int8, _) | (DType::UInt8, _) | (_, DType::Int8) | (_, DType::UInt8) => {
+            Err(CudaError::Kernel(format!(
+                "Cast does not support {} -> {} (WS-4 — INT8/UINT8 should use DequantizeLinear / DynamicQuantizeLinear, not Cast)",
+                src_dtype.name(),
+                target_dtype.name()
+            )))
+        }
     }
 }
 

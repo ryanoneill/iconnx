@@ -20,6 +20,8 @@ pub enum DType {
     Float32,
     Int64,
     Int32,
+    Int8,
+    UInt8,
 }
 
 impl DType {
@@ -29,6 +31,8 @@ impl DType {
             DType::Float32 => 4,
             DType::Int64 => 8,
             DType::Int32 => 4,
+            DType::Int8 => 1,
+            DType::UInt8 => 1,
         }
     }
 
@@ -38,6 +42,8 @@ impl DType {
             DType::Float32 => "float32",
             DType::Int64 => "int64",
             DType::Int32 => "int32",
+            DType::Int8 => "int8",
+            DType::UInt8 => "uint8",
         }
     }
 }
@@ -50,6 +56,8 @@ pub enum TypedSlice {
     Float32(DeviceSlice<'static, f32>),
     Int64(DeviceSlice<'static, i64>),
     Int32(DeviceSlice<'static, i32>),
+    Int8(DeviceSlice<'static, i8>),
+    UInt8(DeviceSlice<'static, u8>),
 }
 
 /// GPU-resident tensor with multiple data type support.
@@ -71,6 +79,14 @@ pub enum GpuTensor {
         data: Arc<DeviceSlice<'static, i32>>,
         shape: Vec<usize>,
     },
+    Int8 {
+        data: Arc<DeviceSlice<'static, i8>>,
+        shape: Vec<usize>,
+    },
+    UInt8 {
+        data: Arc<DeviceSlice<'static, u8>>,
+        shape: Vec<usize>,
+    },
 }
 
 impl GpuTensor {
@@ -82,6 +98,8 @@ impl GpuTensor {
             GpuTensor::Float32 { shape, .. } => shape,
             GpuTensor::Int64 { shape, .. } => shape,
             GpuTensor::Int32 { shape, .. } => shape,
+            GpuTensor::Int8 { shape, .. } => shape,
+            GpuTensor::UInt8 { shape, .. } => shape,
         }
     }
 
@@ -106,6 +124,8 @@ impl GpuTensor {
             GpuTensor::Float32 { .. } => DType::Float32,
             GpuTensor::Int64 { .. } => DType::Int64,
             GpuTensor::Int32 { .. } => DType::Int32,
+            GpuTensor::Int8 { .. } => DType::Int8,
+            GpuTensor::UInt8 { .. } => DType::UInt8,
         }
     }
 
@@ -124,6 +144,8 @@ impl GpuTensor {
             GpuTensor::Float32 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::Int64 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::Int32 { data, .. } => data.as_raw_device_ptr(),
+            GpuTensor::Int8 { data, .. } => data.as_raw_device_ptr(),
+            GpuTensor::UInt8 { data, .. } => data.as_raw_device_ptr(),
         }
     }
 
@@ -423,6 +445,200 @@ impl GpuTensor {
         matches!(self, GpuTensor::Int32 { .. })
     }
 
+    // ==================== Int8 methods ====================
+
+    /// Create a new Int8 GPU tensor from shape and GPU data.
+    pub fn new_i8(data: DeviceSlice<'static, i8>, shape: Vec<usize>) -> Self {
+        GpuTensor::Int8 {
+            data: Arc::new(data),
+            shape,
+        }
+    }
+
+    /// Create an Int8 GPU tensor from host data.
+    pub fn from_host_i8(
+        ctx: &IconnxCudaContext,
+        data: &[i8],
+        shape: Vec<usize>,
+    ) -> Result<Self, CudaError> {
+        let expected_len: usize = shape.iter().product();
+        assert_eq!(
+            data.len(),
+            expected_len,
+            "Data length {} doesn't match shape {:?} (expected {})",
+            data.len(),
+            shape,
+            expected_len
+        );
+
+        let gpu_data = ctx.htod(data)?;
+        Ok(GpuTensor::Int8 {
+            data: Arc::new(gpu_data),
+            shape,
+        })
+    }
+
+    /// Create a zeroed Int8 GPU tensor with given shape.
+    pub fn zeros_i8(ctx: &IconnxCudaContext, shape: Vec<usize>) -> Result<Self, CudaError> {
+        let len: usize = shape.iter().product();
+        let gpu_data = ctx.alloc_zeros::<i8>(len)?;
+        Ok(GpuTensor::Int8 {
+            data: Arc::new(gpu_data),
+            shape,
+        })
+    }
+
+    /// Copy Int8 tensor data back to host.
+    ///
+    /// Note: Returns only the elements defined by the tensor's shape,
+    /// even if the underlying slice has more capacity (due to memory
+    /// pool sizing).
+    pub fn to_host_i8(&self, ctx: &IconnxCudaContext) -> Result<Vec<i8>, CudaError> {
+        match self {
+            GpuTensor::Int8 { data, shape } => {
+                let mut full = ctx.dtoh(data)?;
+                let len: usize = shape.iter().product();
+                full.truncate(len);
+                Ok(full)
+            }
+            _ => Err(CudaError::Kernel(format!(
+                "to_host_i8 called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Get a reference to the underlying Int8 `DeviceSlice`.
+    pub fn data_i8(&self) -> Result<&DeviceSlice<'static, i8>, CudaError> {
+        match self {
+            GpuTensor::Int8 { data, .. } => Ok(data),
+            _ => Err(CudaError::Kernel(format!(
+                "data_i8 called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Get a mutable reference to the underlying Int8 `DeviceSlice`.
+    /// See [`GpuTensor::data_f32_mut`] for the shared-Arc note.
+    pub fn data_i8_mut(&mut self) -> Result<&mut DeviceSlice<'static, i8>, CudaError> {
+        match self {
+            GpuTensor::Int8 { data, .. } => Arc::get_mut(data).ok_or_else(|| {
+                CudaError::Kernel(
+                    "data_i8_mut: tensor is shared (Arc refcount > 1); \
+                     cannot obtain mutable access without aliasing"
+                        .to_string(),
+                )
+            }),
+            _ => Err(CudaError::Kernel(format!(
+                "data_i8_mut called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Check if this is an Int8 tensor.
+    pub fn is_i8(&self) -> bool {
+        matches!(self, GpuTensor::Int8 { .. })
+    }
+
+    // ==================== UInt8 methods ====================
+
+    /// Create a new UInt8 GPU tensor from shape and GPU data.
+    pub fn new_u8(data: DeviceSlice<'static, u8>, shape: Vec<usize>) -> Self {
+        GpuTensor::UInt8 {
+            data: Arc::new(data),
+            shape,
+        }
+    }
+
+    /// Create a UInt8 GPU tensor from host data.
+    pub fn from_host_u8(
+        ctx: &IconnxCudaContext,
+        data: &[u8],
+        shape: Vec<usize>,
+    ) -> Result<Self, CudaError> {
+        let expected_len: usize = shape.iter().product();
+        assert_eq!(
+            data.len(),
+            expected_len,
+            "Data length {} doesn't match shape {:?} (expected {})",
+            data.len(),
+            shape,
+            expected_len
+        );
+
+        let gpu_data = ctx.htod(data)?;
+        Ok(GpuTensor::UInt8 {
+            data: Arc::new(gpu_data),
+            shape,
+        })
+    }
+
+    /// Create a zeroed UInt8 GPU tensor with given shape.
+    pub fn zeros_u8(ctx: &IconnxCudaContext, shape: Vec<usize>) -> Result<Self, CudaError> {
+        let len: usize = shape.iter().product();
+        let gpu_data = ctx.alloc_zeros::<u8>(len)?;
+        Ok(GpuTensor::UInt8 {
+            data: Arc::new(gpu_data),
+            shape,
+        })
+    }
+
+    /// Copy UInt8 tensor data back to host.
+    ///
+    /// Note: Returns only the elements defined by the tensor's shape,
+    /// even if the underlying slice has more capacity (due to memory
+    /// pool sizing).
+    pub fn to_host_u8(&self, ctx: &IconnxCudaContext) -> Result<Vec<u8>, CudaError> {
+        match self {
+            GpuTensor::UInt8 { data, shape } => {
+                let mut full = ctx.dtoh(data)?;
+                let len: usize = shape.iter().product();
+                full.truncate(len);
+                Ok(full)
+            }
+            _ => Err(CudaError::Kernel(format!(
+                "to_host_u8 called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Get a reference to the underlying UInt8 `DeviceSlice`.
+    pub fn data_u8(&self) -> Result<&DeviceSlice<'static, u8>, CudaError> {
+        match self {
+            GpuTensor::UInt8 { data, .. } => Ok(data),
+            _ => Err(CudaError::Kernel(format!(
+                "data_u8 called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Get a mutable reference to the underlying UInt8 `DeviceSlice`.
+    /// See [`GpuTensor::data_f32_mut`] for the shared-Arc note.
+    pub fn data_u8_mut(&mut self) -> Result<&mut DeviceSlice<'static, u8>, CudaError> {
+        match self {
+            GpuTensor::UInt8 { data, .. } => Arc::get_mut(data).ok_or_else(|| {
+                CudaError::Kernel(
+                    "data_u8_mut: tensor is shared (Arc refcount > 1); \
+                     cannot obtain mutable access without aliasing"
+                        .to_string(),
+                )
+            }),
+            _ => Err(CudaError::Kernel(format!(
+                "data_u8_mut called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Check if this is a UInt8 tensor.
+    pub fn is_u8(&self) -> bool {
+        matches!(self, GpuTensor::UInt8 { .. })
+    }
+
     // ==================== Reshape (type-preserving) ====================
 
     /// Reshape the tensor (no data copy, just shape change). Returns
@@ -456,6 +672,14 @@ impl GpuTensor {
                 data,
                 shape: new_shape,
             }),
+            GpuTensor::Int8 { data, .. } => Some(GpuTensor::Int8 {
+                data,
+                shape: new_shape,
+            }),
+            GpuTensor::UInt8 { data, .. } => Some(GpuTensor::UInt8 {
+                data,
+                shape: new_shape,
+            }),
         }
     }
 
@@ -474,6 +698,12 @@ impl GpuTensor {
             }
             GpuTensor::Int32 { data, .. } => {
                 Arc::try_unwrap(data).ok().map(TypedSlice::Int32)
+            }
+            GpuTensor::Int8 { data, .. } => {
+                Arc::try_unwrap(data).ok().map(TypedSlice::Int8)
+            }
+            GpuTensor::UInt8 { data, .. } => {
+                Arc::try_unwrap(data).ok().map(TypedSlice::UInt8)
             }
         }
     }
@@ -663,6 +893,19 @@ mod tests {
         // Trying to get i64 data should fail.
         assert!(tensor_f32.data_i64().is_err());
         assert!(tensor_f32.to_host_i64(&ctx).is_err());
+
+        // INT8 / UINT8 (WS-4 M4.3): same wrong-variant contract.
+        let tensor_i8 = GpuTensor::from_host_i8(&ctx, &[-1_i8, 0, 1], vec![3])
+            .expect("Failed to create i8 tensor");
+        assert!(tensor_i8.data_u8().is_err());
+        assert!(tensor_i8.to_host_u8(&ctx).is_err());
+        assert!(tensor_i8.data_f32().is_err());
+
+        let tensor_u8 = GpuTensor::from_host_u8(&ctx, &[0_u8, 128, 255], vec![3])
+            .expect("Failed to create u8 tensor");
+        assert!(tensor_u8.data_i8().is_err());
+        assert!(tensor_u8.to_host_i8(&ctx).is_err());
+        assert!(tensor_u8.data_i32().is_err());
     }
 
     #[test]
@@ -678,5 +921,12 @@ mod tests {
 
         let tensor_i32 = GpuTensor::zeros_i32(&ctx, vec![100]).unwrap();
         assert_eq!(tensor_i32.size_bytes(), 400); // 100 * 4 bytes.
+
+        // INT8 / UINT8 (WS-4 M4.3): 1 byte per element.
+        let tensor_i8 = GpuTensor::zeros_i8(&ctx, vec![100]).unwrap();
+        assert_eq!(tensor_i8.size_bytes(), 100);
+
+        let tensor_u8 = GpuTensor::zeros_u8(&ctx, vec![100]).unwrap();
+        assert_eq!(tensor_u8.size_bytes(), 100);
     }
 }

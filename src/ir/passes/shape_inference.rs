@@ -114,6 +114,13 @@ fn infer_node_output_shapes(
             vec![s]
         }
 
+        // DequantizeLinear: output shape == input[0] shape (scale/zp are
+        // not part of the data shape — they parameterize the conversion).
+        "DequantizeLinear" => {
+            let s = input_shapes.first().cloned().unwrap_or_default();
+            vec![s]
+        }
+
         // Shape family.
         "Shape" => {
             let rank = input_shapes.first().map(|s| s.len()).unwrap_or(0);
@@ -217,6 +224,12 @@ fn infer_node_output_shapes(
         "MatMul" => {
             vec![infer_matmul(&input_shapes)]
         }
+        // MatMulInteger: standard MatMul shape rules ([M, K] @ [K, N] →
+        // [M, N]); zp inputs (slots 2/3) are scalar/per-axis metadata
+        // and don't enter the output shape. WS-4 M4.6.
+        "MatMulInteger" => {
+            vec![infer_matmul(&input_shapes)]
+        }
         "Gemm" => {
             vec![infer_gemm(&input_shapes, attrs)]
         }
@@ -231,6 +244,14 @@ fn infer_node_output_shapes(
         // mirrors the executor: explicit `split` initializer if present,
         // else `num_outputs` attribute, else node.outputs.len().
         "Split" => infer_split(&input_shapes, node, attrs, initializers),
+
+        // DynamicQuantizeLinear — 3 outputs: (y, y_scale, y_zero_point).
+        // y has the same shape as the input; y_scale and y_zero_point
+        // are scalars (rank-0 shapes).
+        "DynamicQuantizeLinear" => {
+            let input_shape = input_shapes.first().cloned().unwrap_or_default();
+            vec![input_shape, Shape::new(), Shape::new()]
+        }
 
         _ => vec![Shape::new(); node.outputs.len().max(1)],
     }
