@@ -248,6 +248,12 @@ pub fn gpu_cumsum(
                 dtype.name()
             )))
         }
+        crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
+            Err(CudaError::Kernel(format!(
+                "CumSum does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
+                dtype.name()
+            )))
+        }
     }
 }
 

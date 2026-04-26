@@ -3,12 +3,14 @@
 //! All ops kernels are loaded into a single garboard `Module` and launched
 //! via the typed-kernel API on garboard's user stream. Source is composed
 //! from per-category constants — `kernels::OPS_KERNELS` for layout/utility
-//! ops plus `quantize_kernels::QUANTIZE_KERNELS` for the WS-4 quantization
+//! ops, `quantize_kernels::QUANTIZE_KERNELS` for the WS-4 quantization
+//! family, and `kernels_fp16::OPS_KERNELS_FP16` for the WS-3 FP16 op
 //! family — concatenated at startup before NVRTC compilation. This keeps
 //! per-file source within the project's 1000-line guideline as the kernel
 //! catalogue grows.
 
 use super::kernels::{KERNEL_NAMES, OPS_KERNELS};
+use super::kernels_fp16::{KERNEL_NAMES_FP16, OPS_KERNELS_FP16};
 use super::quantize_kernels::{QUANTIZE_KERNEL_NAMES, QUANTIZE_KERNELS};
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use garboard::{Module, Program};
@@ -23,7 +25,10 @@ impl OpsKernelCache {
     /// `*_KERNELS` constant is concatenated then handed to NVRTC as a
     /// single translation unit.
     pub fn new(ctx: &IconnxCudaContext) -> Result<Self, CudaError> {
-        let combined_src = format!("{}\n{}", OPS_KERNELS, QUANTIZE_KERNELS);
+        let combined_src = format!(
+            "{}\n{}\n{}",
+            OPS_KERNELS, QUANTIZE_KERNELS, OPS_KERNELS_FP16
+        );
         let garboard_program =
             Program::compile_for_device(&combined_src, ctx.garboard_device(), &[]).map_err(
                 |e| CudaError::Kernel(format!("NVRTC compilation failed: {}", e)),
@@ -32,7 +37,11 @@ impl OpsKernelCache {
             .garboard_device()
             .load_module(&garboard_program)
             .map_err(|e| CudaError::Kernel(format!("Module load failed: {}", e)))?;
-        for name in KERNEL_NAMES.iter().chain(QUANTIZE_KERNEL_NAMES.iter()) {
+        for name in KERNEL_NAMES
+            .iter()
+            .chain(QUANTIZE_KERNEL_NAMES.iter())
+            .chain(KERNEL_NAMES_FP16.iter())
+        {
             garboard_module.function(name).map_err(|e| {
                 CudaError::Kernel(format!("Failed to load kernel '{}': {}", name, e))
             })?;

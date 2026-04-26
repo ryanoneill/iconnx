@@ -18,10 +18,12 @@ use super::context::{CudaError, IconnxCudaContext};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     Float32,
+    Float16,
     Int64,
     Int32,
     Int8,
     UInt8,
+    Bool,
 }
 
 impl DType {
@@ -29,10 +31,12 @@ impl DType {
     pub fn size_bytes(&self) -> usize {
         match self {
             DType::Float32 => 4,
+            DType::Float16 => 2,
             DType::Int64 => 8,
             DType::Int32 => 4,
             DType::Int8 => 1,
             DType::UInt8 => 1,
+            DType::Bool => 1,
         }
     }
 
@@ -40,10 +44,12 @@ impl DType {
     pub fn name(&self) -> &'static str {
         match self {
             DType::Float32 => "float32",
+            DType::Float16 => "float16",
             DType::Int64 => "int64",
             DType::Int32 => "int32",
             DType::Int8 => "int8",
             DType::UInt8 => "uint8",
+            DType::Bool => "bool",
         }
     }
 }
@@ -54,10 +60,12 @@ impl DType {
 /// for returning to the memory pool.
 pub enum TypedSlice {
     Float32(DeviceSlice<'static, f32>),
+    Float16(DeviceSlice<'static, half::f16>),
     Int64(DeviceSlice<'static, i64>),
     Int32(DeviceSlice<'static, i32>),
     Int8(DeviceSlice<'static, i8>),
     UInt8(DeviceSlice<'static, u8>),
+    Bool(DeviceSlice<'static, u8>),
 }
 
 /// GPU-resident tensor with multiple data type support.
@@ -69,6 +77,12 @@ pub enum TypedSlice {
 pub enum GpuTensor {
     Float32 {
         data: Arc<DeviceSlice<'static, f32>>,
+        shape: Vec<usize>,
+    },
+    /// IEEE binary16 — element type is `half::f16`. Added in WS-3 M3.3
+    /// for FP16 model support (Whisper-Tiny encoder FP16, BERT-FP16).
+    Float16 {
+        data: Arc<DeviceSlice<'static, half::f16>>,
         shape: Vec<usize>,
     },
     Int64 {
@@ -87,6 +101,15 @@ pub enum GpuTensor {
         data: Arc<DeviceSlice<'static, u8>>,
         shape: Vec<usize>,
     },
+    /// Bool — CUDA has no native bool type; conventional choice is one
+    /// byte per element (`u8`) where 0 = false, nonzero = true. Host
+    /// `&[bool]` is converted at upload via `b as u8`. WS-3 M3.3
+    /// closes the L2.1/L3.5 audit: pre-WS-3 the `Tensor::Bool` upload
+    /// path cast to `f32` to fit a single supported GPU dtype.
+    Bool {
+        data: Arc<DeviceSlice<'static, u8>>,
+        shape: Vec<usize>,
+    },
 }
 
 impl GpuTensor {
@@ -96,10 +119,12 @@ impl GpuTensor {
     pub fn shape(&self) -> &[usize] {
         match self {
             GpuTensor::Float32 { shape, .. } => shape,
+            GpuTensor::Float16 { shape, .. } => shape,
             GpuTensor::Int64 { shape, .. } => shape,
             GpuTensor::Int32 { shape, .. } => shape,
             GpuTensor::Int8 { shape, .. } => shape,
             GpuTensor::UInt8 { shape, .. } => shape,
+            GpuTensor::Bool { shape, .. } => shape,
         }
     }
 
@@ -122,10 +147,12 @@ impl GpuTensor {
     pub fn dtype(&self) -> DType {
         match self {
             GpuTensor::Float32 { .. } => DType::Float32,
+            GpuTensor::Float16 { .. } => DType::Float16,
             GpuTensor::Int64 { .. } => DType::Int64,
             GpuTensor::Int32 { .. } => DType::Int32,
             GpuTensor::Int8 { .. } => DType::Int8,
             GpuTensor::UInt8 { .. } => DType::UInt8,
+            GpuTensor::Bool { .. } => DType::Bool,
         }
     }
 
@@ -142,10 +169,12 @@ impl GpuTensor {
     pub fn device_ptr(&self, _ctx: &IconnxCudaContext) -> u64 {
         match self {
             GpuTensor::Float32 { data, .. } => data.as_raw_device_ptr(),
+            GpuTensor::Float16 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::Int64 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::Int32 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::Int8 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::UInt8 { data, .. } => data.as_raw_device_ptr(),
+            GpuTensor::Bool { data, .. } => data.as_raw_device_ptr(),
         }
     }
 
@@ -639,6 +668,201 @@ impl GpuTensor {
         matches!(self, GpuTensor::UInt8 { .. })
     }
 
+    // ==================== Float16 methods ====================
+
+    /// Create a new Float16 GPU tensor from shape and GPU data.
+    pub fn new_f16(data: DeviceSlice<'static, half::f16>, shape: Vec<usize>) -> Self {
+        GpuTensor::Float16 {
+            data: Arc::new(data),
+            shape,
+        }
+    }
+
+    /// Create a Float16 GPU tensor from host data.
+    pub fn from_host_f16(
+        ctx: &IconnxCudaContext,
+        data: &[half::f16],
+        shape: Vec<usize>,
+    ) -> Result<Self, CudaError> {
+        let expected_len: usize = shape.iter().product();
+        assert_eq!(
+            data.len(),
+            expected_len,
+            "Data length {} doesn't match shape {:?} (expected {})",
+            data.len(),
+            shape,
+            expected_len
+        );
+
+        let gpu_data = ctx.htod(data)?;
+        Ok(GpuTensor::Float16 {
+            data: Arc::new(gpu_data),
+            shape,
+        })
+    }
+
+    /// Create a zeroed Float16 GPU tensor with given shape.
+    pub fn zeros_f16(ctx: &IconnxCudaContext, shape: Vec<usize>) -> Result<Self, CudaError> {
+        let len: usize = shape.iter().product();
+        let gpu_data = ctx.alloc_zeros::<half::f16>(len)?;
+        Ok(GpuTensor::Float16 {
+            data: Arc::new(gpu_data),
+            shape,
+        })
+    }
+
+    /// Copy Float16 tensor data back to host.
+    pub fn to_host_f16(&self, ctx: &IconnxCudaContext) -> Result<Vec<half::f16>, CudaError> {
+        match self {
+            GpuTensor::Float16 { data, shape } => {
+                let mut full = ctx.dtoh(data)?;
+                let len: usize = shape.iter().product();
+                full.truncate(len);
+                Ok(full)
+            }
+            _ => Err(CudaError::Kernel(format!(
+                "to_host_f16 called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Get a reference to the underlying Float16 `DeviceSlice`.
+    pub fn data_f16(&self) -> Result<&DeviceSlice<'static, half::f16>, CudaError> {
+        match self {
+            GpuTensor::Float16 { data, .. } => Ok(data),
+            _ => Err(CudaError::Kernel(format!(
+                "data_f16 called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Get a mutable reference to the underlying Float16 `DeviceSlice`.
+    /// See [`GpuTensor::data_f32_mut`] for the shared-Arc note.
+    pub fn data_f16_mut(&mut self) -> Result<&mut DeviceSlice<'static, half::f16>, CudaError> {
+        match self {
+            GpuTensor::Float16 { data, .. } => Arc::get_mut(data).ok_or_else(|| {
+                CudaError::Kernel(
+                    "data_f16_mut: tensor is shared (Arc refcount > 1); \
+                     cannot obtain mutable access without aliasing"
+                        .to_string(),
+                )
+            }),
+            _ => Err(CudaError::Kernel(format!(
+                "data_f16_mut called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Check if this is a Float16 tensor.
+    pub fn is_f16(&self) -> bool {
+        matches!(self, GpuTensor::Float16 { .. })
+    }
+
+    // ==================== Bool methods ====================
+
+    /// Create a new Bool GPU tensor from shape and GPU data.
+    /// The underlying device storage is `u8` — 0 = false, nonzero = true.
+    pub fn new_bool(data: DeviceSlice<'static, u8>, shape: Vec<usize>) -> Self {
+        GpuTensor::Bool {
+            data: Arc::new(data),
+            shape,
+        }
+    }
+
+    /// Create a Bool GPU tensor from host `&[bool]`.
+    ///
+    /// Bool's GPU representation is `u8` (CUDA has no native bool); host
+    /// `bool` values are converted via `b as u8` (which the Rust spec
+    /// guarantees is 0 or 1) before upload. Reading back via
+    /// [`to_host_bool`] inverts the same mapping (`b != 0`).
+    pub fn from_host_bool(
+        ctx: &IconnxCudaContext,
+        data: &[bool],
+        shape: Vec<usize>,
+    ) -> Result<Self, CudaError> {
+        let expected_len: usize = shape.iter().product();
+        assert_eq!(
+            data.len(),
+            expected_len,
+            "Data length {} doesn't match shape {:?} (expected {})",
+            data.len(),
+            shape,
+            expected_len
+        );
+
+        let bytes: Vec<u8> = data.iter().map(|&b| b as u8).collect();
+        let gpu_data = ctx.htod(&bytes)?;
+        Ok(GpuTensor::Bool {
+            data: Arc::new(gpu_data),
+            shape,
+        })
+    }
+
+    /// Create a zeroed Bool GPU tensor (all false) with given shape.
+    pub fn zeros_bool(ctx: &IconnxCudaContext, shape: Vec<usize>) -> Result<Self, CudaError> {
+        let len: usize = shape.iter().product();
+        let gpu_data = ctx.alloc_zeros::<u8>(len)?;
+        Ok(GpuTensor::Bool {
+            data: Arc::new(gpu_data),
+            shape,
+        })
+    }
+
+    /// Copy Bool tensor data back to host as `Vec<bool>`. The byte-level
+    /// `u8` storage is reinterpreted via `b != 0` so values written by
+    /// kernels that use any nonzero "true" sentinel decode correctly.
+    pub fn to_host_bool(&self, ctx: &IconnxCudaContext) -> Result<Vec<bool>, CudaError> {
+        match self {
+            GpuTensor::Bool { data, shape } => {
+                let mut full: Vec<u8> = ctx.dtoh(data)?;
+                let len: usize = shape.iter().product();
+                full.truncate(len);
+                Ok(full.into_iter().map(|b| b != 0).collect())
+            }
+            _ => Err(CudaError::Kernel(format!(
+                "to_host_bool called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Get a reference to the underlying Bool `DeviceSlice<u8>`.
+    pub fn data_bool(&self) -> Result<&DeviceSlice<'static, u8>, CudaError> {
+        match self {
+            GpuTensor::Bool { data, .. } => Ok(data),
+            _ => Err(CudaError::Kernel(format!(
+                "data_bool called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Get a mutable reference to the underlying Bool `DeviceSlice<u8>`.
+    /// See [`GpuTensor::data_f32_mut`] for the shared-Arc note.
+    pub fn data_bool_mut(&mut self) -> Result<&mut DeviceSlice<'static, u8>, CudaError> {
+        match self {
+            GpuTensor::Bool { data, .. } => Arc::get_mut(data).ok_or_else(|| {
+                CudaError::Kernel(
+                    "data_bool_mut: tensor is shared (Arc refcount > 1); \
+                     cannot obtain mutable access without aliasing"
+                        .to_string(),
+                )
+            }),
+            _ => Err(CudaError::Kernel(format!(
+                "data_bool_mut called on {} tensor",
+                self.dtype().name()
+            ))),
+        }
+    }
+
+    /// Check if this is a Bool tensor.
+    pub fn is_bool(&self) -> bool {
+        matches!(self, GpuTensor::Bool { .. })
+    }
+
     // ==================== Reshape (type-preserving) ====================
 
     /// Reshape the tensor (no data copy, just shape change). Returns
@@ -664,6 +888,10 @@ impl GpuTensor {
                 data,
                 shape: new_shape,
             }),
+            GpuTensor::Float16 { data, .. } => Some(GpuTensor::Float16 {
+                data,
+                shape: new_shape,
+            }),
             GpuTensor::Int64 { data, .. } => Some(GpuTensor::Int64 {
                 data,
                 shape: new_shape,
@@ -680,6 +908,10 @@ impl GpuTensor {
                 data,
                 shape: new_shape,
             }),
+            GpuTensor::Bool { data, .. } => Some(GpuTensor::Bool {
+                data,
+                shape: new_shape,
+            }),
         }
     }
 
@@ -693,6 +925,9 @@ impl GpuTensor {
             GpuTensor::Float32 { data, .. } => {
                 Arc::try_unwrap(data).ok().map(TypedSlice::Float32)
             }
+            GpuTensor::Float16 { data, .. } => {
+                Arc::try_unwrap(data).ok().map(TypedSlice::Float16)
+            }
             GpuTensor::Int64 { data, .. } => {
                 Arc::try_unwrap(data).ok().map(TypedSlice::Int64)
             }
@@ -704,6 +939,9 @@ impl GpuTensor {
             }
             GpuTensor::UInt8 { data, .. } => {
                 Arc::try_unwrap(data).ok().map(TypedSlice::UInt8)
+            }
+            GpuTensor::Bool { data, .. } => {
+                Arc::try_unwrap(data).ok().map(TypedSlice::Bool)
             }
         }
     }

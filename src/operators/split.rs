@@ -100,6 +100,7 @@ impl Split {
             Tensor::Bool(arr) => slice_into(arr, axis, &sizes, Tensor::Bool),
             Tensor::Int8(arr) => slice_into(arr, axis, &sizes, Tensor::Int8),
             Tensor::UInt8(arr) => slice_into(arr, axis, &sizes, Tensor::UInt8),
+            Tensor::Float16(arr) => slice_into(arr, axis, &sizes, Tensor::Float16),
         }
     }
 }

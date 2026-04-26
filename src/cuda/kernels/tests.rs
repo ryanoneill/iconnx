@@ -327,3 +327,187 @@ fn test_gpu_large_tensor() {
     assert_eq!(result[1], 3.0);
     assert_eq!(result[n - 1], (n - 1) as f32 + ((n - 1) * 2) as f32);
 }
+
+// =============================================================================
+// WS-3 M3.4 sub-2: FP16 elementwise contract tests
+//
+// All inputs are chosen to be exactly representable in f16 so the bit-level
+// expectation matches `f16::from_f32`. For pow / erf / sqrt, results are
+// compared with a small tolerance to absorb f32 round-trip and intrinsic
+// precision (sub-1-ULP for the chosen inputs).
+// =============================================================================
+
+fn h(values: &[f32]) -> Vec<half::f16> {
+    values.iter().copied().map(half::f16::from_f32).collect()
+}
+
+fn assert_close_f16(actual: &[half::f16], expected: &[f32], tol: f32, label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{}: length mismatch", label);
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        let a_f32 = a.to_f32();
+        assert!(
+            (a_f32 - e).abs() <= tol,
+            "{}: idx {} got {} vs {} (tol {})",
+            label,
+            i,
+            a_f32,
+            e,
+            tol
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_add_float16() {
+    let (ctx, kernels, mut pool) = setup();
+    let a = GpuTensor::from_host_f16(&ctx, &h(&[1.0, 2.0, -3.0, 0.5]), vec![4]).unwrap();
+    let b = GpuTensor::from_host_f16(&ctx, &h(&[10.0, -2.0, 3.0, 0.25]), vec![4]).unwrap();
+
+    let out = gpu_add(&ctx, &kernels, &mut pool, &a, &b).unwrap();
+    assert_eq!(out.dtype(), super::super::tensor::DType::Float16);
+    let result = out.to_host_f16(&ctx).unwrap();
+    assert_eq!(result, h(&[11.0, 0.0, 0.0, 0.75]));
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_sub_float16() {
+    let (ctx, kernels, mut pool) = setup();
+    let a = GpuTensor::from_host_f16(&ctx, &h(&[5.0, 7.5, -2.0]), vec![3]).unwrap();
+    let b = GpuTensor::from_host_f16(&ctx, &h(&[2.0, 0.5, -1.0]), vec![3]).unwrap();
+
+    let out = gpu_sub(&ctx, &kernels, &mut pool, &a, &b).unwrap();
+    let result = out.to_host_f16(&ctx).unwrap();
+    assert_eq!(result, h(&[3.0, 7.0, -1.0]));
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_mul_float16() {
+    let (ctx, kernels, mut pool) = setup();
+    let a = GpuTensor::from_host_f16(&ctx, &h(&[2.0, 3.5, -4.0, 0.5]), vec![4]).unwrap();
+    let b = GpuTensor::from_host_f16(&ctx, &h(&[4.0, 2.0, 0.5, 8.0]), vec![4]).unwrap();
+
+    let out = gpu_mul(&ctx, &kernels, &mut pool, &a, &b).unwrap();
+    let result = out.to_host_f16(&ctx).unwrap();
+    assert_eq!(result, h(&[8.0, 7.0, -2.0, 4.0]));
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_div_float16() {
+    let (ctx, kernels, mut pool) = setup();
+    // Choose denominators well above the 1e-8 epsilon so the protect-branch
+    // doesn't kick in.
+    let a = GpuTensor::from_host_f16(&ctx, &h(&[8.0, 9.0, -6.0, 0.5]), vec![4]).unwrap();
+    let b = GpuTensor::from_host_f16(&ctx, &h(&[2.0, 3.0, 4.0, 0.25]), vec![4]).unwrap();
+
+    let out = gpu_div(&ctx, &kernels, &mut pool, &a, &b).unwrap();
+    let result = out.to_host_f16(&ctx).unwrap();
+    // 4.0, 3.0, -1.5, 2.0 — all exactly representable.
+    assert_eq!(result, h(&[4.0, 3.0, -1.5, 2.0]));
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_div_float16_zero_protected_no_nan() {
+    let (ctx, kernels, mut pool) = setup();
+    // Both 0/0 and 1/0 cases. The kernel's epsilon guard's job is
+    // specifically to prevent 0/0 = NaN; for 1/0 the f32 division
+    // 1.0 / 1e-8 overflows f16 to +inf when the result is rounded back,
+    // which is the correct behavior — only NaN must be excluded.
+    let a = GpuTensor::from_host_f16(&ctx, &h(&[0.0, 1.0]), vec![2]).unwrap();
+    let b = GpuTensor::from_host_f16(&ctx, &h(&[0.0, 0.0]), vec![2]).unwrap();
+
+    let out = gpu_div(&ctx, &kernels, &mut pool, &a, &b).unwrap();
+    let result = out.to_host_f16(&ctx).unwrap();
+    assert!(
+        !result[0].to_f32().is_nan(),
+        "0/0 produced NaN — epsilon guard regression"
+    );
+    assert!(
+        !result[1].to_f32().is_nan(),
+        "1/0 produced NaN — epsilon guard regression"
+    );
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_sqrt_float16() {
+    let (ctx, kernels, mut pool) = setup();
+    let x = GpuTensor::from_host_f16(&ctx, &h(&[4.0, 9.0, 16.0, 0.25]), vec![4]).unwrap();
+
+    let out = gpu_sqrt(&ctx, &kernels, &mut pool, &x).unwrap();
+    let result = out.to_host_f16(&ctx).unwrap();
+    // 2.0, 3.0, 4.0, 0.5 — all exact perfect squares in f16 range.
+    assert_eq!(result, h(&[2.0, 3.0, 4.0, 0.5]));
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_sqrt_float16_negative_clamped() {
+    let (ctx, kernels, mut pool) = setup();
+    // Negative input must clamp to 0 to match the f32 sqrt_kernel guard.
+    let x = GpuTensor::from_host_f16(&ctx, &h(&[-4.0, 9.0]), vec![2]).unwrap();
+
+    let out = gpu_sqrt(&ctx, &kernels, &mut pool, &x).unwrap();
+    let result = out.to_host_f16(&ctx).unwrap();
+    assert_eq!(result, h(&[0.0, 3.0]));
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_pow_float16() {
+    let (ctx, kernels, mut pool) = setup();
+    let base = GpuTensor::from_host_f16(&ctx, &h(&[2.0, 3.0, 4.0, 5.0]), vec![4]).unwrap();
+    let exp = GpuTensor::from_host_f16(&ctx, &h(&[3.0, 2.0, 0.5, 0.0]), vec![4]).unwrap();
+
+    let out = gpu_pow(&ctx, &kernels, &mut pool, &base, &exp).unwrap();
+    let result = out.to_host_f16(&ctx).unwrap();
+    // 8.0, 9.0, 2.0, 1.0 — small enough that the f32 round-trip lands on
+    // exactly the same f16. Tolerance kept tight (0.01) to catch regressions.
+    assert_close_f16(&result, &[8.0, 9.0, 2.0, 1.0], 0.01, "pow_f16");
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_erf_float16() {
+    let (ctx, kernels, mut pool) = setup();
+    // erf(0) = 0, erf(1) ≈ 0.8427, erf(-1) ≈ -0.8427, erf(2) ≈ 0.9953.
+    let x = GpuTensor::from_host_f16(&ctx, &h(&[0.0, 1.0, -1.0, 2.0]), vec![4]).unwrap();
+
+    let out = gpu_erf(&ctx, &kernels, &mut pool, &x).unwrap();
+    let result = out.to_host_f16(&ctx).unwrap();
+    // f16 has ~3 decimal digits of precision — tolerance set to 1e-3.
+    assert_close_f16(
+        &result,
+        &[0.0, 0.8427, -0.8427, 0.9953],
+        1e-3,
+        "erf_f16",
+    );
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_gpu_add_float16_dtype_mismatch_errors() {
+    // Plan-oversight closure: mixing Float16 + Float32 used to silently fall
+    // through to the f32 path and crash on `data_f32 called on float16
+    // tensor`. With the dispatch made exhaustive on (a.dtype, b.dtype), the
+    // mismatch returns a clear error.
+    let (ctx, kernels, mut pool) = setup();
+    let a = GpuTensor::from_host_f16(&ctx, &h(&[1.0, 2.0]), vec![2]).unwrap();
+    let b = GpuTensor::from_host_f32(&ctx, &[1.0f32, 2.0], vec![2]).unwrap();
+
+    match gpu_add(&ctx, &kernels, &mut pool, &a, &b) {
+        Ok(_) => panic!("expected dtype mismatch error, got Ok"),
+        Err(super::super::context::CudaError::Kernel(msg)) => {
+            assert!(
+                msg.contains("unsupported dtype combination"),
+                "expected typed error, got {}",
+                msg
+            );
+        }
+        Err(other) => panic!("expected CudaError::Kernel, got {}", other),
+    }
+}

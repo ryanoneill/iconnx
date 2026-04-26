@@ -16,6 +16,7 @@
 
 use crate::attributes::NodeAttributes;
 use crate::tensor::Tensor;
+use half::f16;
 use ndarray::Axis;
 
 /// ONNX GlobalAveragePool.
@@ -83,6 +84,14 @@ fn reduce_mean_last_axis(t: Tensor, last_axis: usize) -> Tensor {
             // any reduction).
             panic!("GlobalAveragePool does not support {} inputs (dequantize first)", t.dtype());
         }
+        Tensor::Float16(arr) => {
+            // f32 accumulator — same precision contract M3.4 will use
+            // for FP16 reductions (Softmax / ReduceMean) on GPU.
+            let axis_size = arr.shape()[last_axis] as f32;
+            let as_f32 = arr.mapv(|v| v.to_f32());
+            let summed = as_f32.sum_axis(Axis(last_axis));
+            Tensor::Float16(summed.mapv(|v| f16::from_f32(v / axis_size)))
+        }
     }
 }
 
@@ -109,6 +118,9 @@ fn reshape_preserving_dtype(t: Tensor, new_shape: Vec<usize>) -> Tensor {
         }
         Tensor::UInt8(arr) => {
             Tensor::UInt8(arr.into_shape_with_order(IxDyn(&new_shape)).expect("reshape u8"))
+        }
+        Tensor::Float16(arr) => {
+            Tensor::Float16(arr.into_shape_with_order(IxDyn(&new_shape)).expect("reshape f16"))
         }
     }
 }

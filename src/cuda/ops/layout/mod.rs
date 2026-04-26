@@ -421,6 +421,58 @@ pub fn gpu_transpose_nd(
                 input.dtype().name()
             )))
         }
+        GpuTensor::Float16 { .. } => {
+            // WS-3 M3.4 sub-1: Whisper-Tiny encoder transposes FP16
+            // activations and projection weights. Memcpy-class — mirrors
+            // the f32 / i64 / i32 / u8 arms above with `unsigned short*`
+            // (16-bit) data pointers backed by half::f16's repr(transparent)
+            // u16 layout.
+            let mut output = pool.get_tensor_f16(ctx, out_shape)?;
+            // SAFETY: transpose_general_f16_kernel signature mirrors
+            // transpose_general_kernel with `unsigned short*` data pointers
+            // in place of `float*` — half::f16 is `#[repr(transparent)]
+            // struct(u16)`, so the byte layout is identical.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("transpose_general_f16_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("transpose_general_f16_kernel lookup: {}", e))
+            })?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f16_mut()?,
+                        input.data_f16()?,
+                        &in_shape_gpu,
+                        &in_strides_gpu,
+                        &out_strides_gpu,
+                        &perm_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("transpose_general_f16 launch failed: {}", e))
+                })?;
+            Ok(output)
+        }
+        GpuTensor::Bool { .. } => {
+            Err(CudaError::Kernel(format!(
+                "Transpose does not support {} (WS-3 M3.4 sub-2+ — Bool dispatch arm pending; Whisper-FP16 doesn't exercise Bool transpose)",
+                input.dtype().name()
+            )))
+        }
     }
 }
 
@@ -440,6 +492,13 @@ pub fn gpu_where(
     assert_eq!(x.len(), n, "x length mismatch");
     assert_eq!(y.len(), n, "y length mismatch");
 
+    if condition.dtype() != crate::cuda::tensor::DType::Bool {
+        return Err(CudaError::Kernel(format!(
+            "Where: condition must be Bool, got {} (WS-3 M3.5 — comparison/Cast→Bool produce native Bool now; non-Bool conditions need an explicit Cast→Bool upstream)",
+            condition.dtype().name()
+        )));
+    }
+
     let dtype = x.dtype();
     if y.dtype() != dtype {
         return Err(CudaError::Kernel(format!(
@@ -455,12 +514,12 @@ pub fn gpu_where(
     match dtype {
         crate::cuda::tensor::DType::Float32 => {
             let mut output = pool.get_tensor_f32(ctx, condition.shape().to_vec())?;
-            // SAFETY: where_kernel takes (float* out, const float* condition,
+            // SAFETY: where_kernel takes (float* out, const unsigned char* condition,
             //   const float* x, const float* y, size_t n).
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
                     &mut garboard::DeviceSlice<'_, f32>,
-                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u8>,
                     &garboard::DeviceSlice<'_, f32>,
                     &garboard::DeviceSlice<'_, f32>,
                     usize,
@@ -473,7 +532,7 @@ pub fn gpu_where(
                     &config,
                     (
                         output.data_f32_mut()?,
-                        condition.data_f32()?,
+                        condition.data_bool()?,
                         x.data_f32()?,
                         y.data_f32()?,
                         n,
@@ -484,12 +543,12 @@ pub fn gpu_where(
         }
         crate::cuda::tensor::DType::Int64 => {
             let mut output = pool.get_tensor_i64(ctx, condition.shape().to_vec())?;
-            // SAFETY: where_i64_kernel takes (long long* out, const float* condition,
+            // SAFETY: where_i64_kernel takes (long long* out, const unsigned char* condition,
             //   const long long* x, const long long* y, size_t n).
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
                     &mut garboard::DeviceSlice<'_, i64>,
-                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u8>,
                     &garboard::DeviceSlice<'_, i64>,
                     &garboard::DeviceSlice<'_, i64>,
                     usize,
@@ -502,7 +561,7 @@ pub fn gpu_where(
                     &config,
                     (
                         output.data_i64_mut()?,
-                        condition.data_f32()?,
+                        condition.data_bool()?,
                         x.data_i64()?,
                         y.data_i64()?,
                         n,
@@ -513,12 +572,12 @@ pub fn gpu_where(
         }
         crate::cuda::tensor::DType::Int32 => {
             let mut output = pool.get_tensor_i32(ctx, condition.shape().to_vec())?;
-            // SAFETY: where_i32_kernel takes (int* out, const float* condition,
+            // SAFETY: where_i32_kernel takes (int* out, const unsigned char* condition,
             //   const int* x, const int* y, size_t n).
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
                     &mut garboard::DeviceSlice<'_, i32>,
-                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u8>,
                     &garboard::DeviceSlice<'_, i32>,
                     &garboard::DeviceSlice<'_, i32>,
                     usize,
@@ -531,7 +590,7 @@ pub fn gpu_where(
                     &config,
                     (
                         output.data_i32_mut()?,
-                        condition.data_f32()?,
+                        condition.data_bool()?,
                         x.data_i32()?,
                         y.data_i32()?,
                         n,
@@ -543,6 +602,12 @@ pub fn gpu_where(
         crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
             Err(CudaError::Kernel(format!(
                 "Where does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Where)",
+                dtype.name()
+            )))
+        }
+        crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
+            Err(CudaError::Kernel(format!(
+                "Where does not support {} for x/y (Whisper-FP16 doesn't route FP16 through Where; Bool x/y not on any active graph)",
                 dtype.name()
             )))
         }
@@ -692,8 +757,46 @@ pub fn gpu_gather(
                 .map_err(|e| CudaError::Kernel(format!("gather_u8 launch failed: {}", e)))?;
             Ok(output)
         }
-        _ => Err(CudaError::Kernel(format!(
-            "Gather: unsupported input dtype {}",
+        GpuTensor::Float16 { .. } => {
+            // WS-3 M3.4 sub-1: Whisper-Tiny encoder gathers FP16 token
+            // embeddings. Memcpy-class — mirrors the f32 / i64 / u8 arms
+            // above with `unsigned short*` data pointers backed by
+            // half::f16's repr(transparent) u16 layout.
+            let mut output = pool.get_tensor_f16(ctx, out_shape)?;
+            // SAFETY: gather_f16_kernel takes (unsigned short* out,
+            //   const unsigned short* inp, const long long* indices,
+            //   size_t num_indices, size_t slice_size, size_t dim0_size).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                )>("gather_f16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("gather_f16_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f16_mut()?,
+                        input.data_f16()?,
+                        &indices_gpu,
+                        num_indices,
+                        slice_size,
+                        dim0_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("gather_f16 launch failed: {}", e)))?;
+            Ok(output)
+        }
+        GpuTensor::Int32 { .. }
+        | GpuTensor::Int8 { .. }
+        | GpuTensor::Bool { .. } => Err(CudaError::Kernel(format!(
+            "Gather: unsupported input dtype {} (WS-3 M3.4 sub-2+ for Bool; Int32/Int8 not on any active model graph)",
             input.dtype().name()
         ))),
     }
@@ -827,8 +930,45 @@ pub fn gpu_gather_from_gpu(
                 .map_err(|e| CudaError::Kernel(format!("gather_u8 launch failed: {}", e)))?;
             Ok(output)
         }
-        _ => Err(CudaError::Kernel(format!(
-            "Gather: unsupported input dtype {}",
+        GpuTensor::Float16 { .. } => {
+            // WS-3 M3.4 sub-1: parallel of gpu_gather's Float16 arm —
+            // Whisper-Tiny encoder gathers FP16 token embeddings, and the
+            // graph may route the indices on-GPU.
+            let mut output = pool.get_tensor_f16(ctx, out_shape)?;
+            // SAFETY: gather_f16_kernel takes (unsigned short* out,
+            //   const unsigned short* inp, const long long* indices,
+            //   size_t num_indices, size_t slice_size, size_t dim0_size).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                )>("gather_f16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("gather_f16_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f16_mut()?,
+                        input.data_f16()?,
+                        indices_tensor.data_i64()?,
+                        num_indices,
+                        slice_size,
+                        dim0_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("gather_f16 launch failed: {}", e)))?;
+            Ok(output)
+        }
+        GpuTensor::Int32 { .. }
+        | GpuTensor::Int8 { .. }
+        | GpuTensor::Bool { .. } => Err(CudaError::Kernel(format!(
+            "Gather: unsupported input dtype {} (WS-3 M3.4 sub-2+ for Bool; Int32/Int8 not on any active model graph)",
             input.dtype().name()
         ))),
     }
@@ -955,6 +1095,12 @@ pub fn gpu_copy(
         GpuTensor::Int8 { .. } | GpuTensor::UInt8 { .. } => {
             Err(CudaError::Kernel(format!(
                 "gpu_copy does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through gpu_copy)",
+                input.dtype().name()
+            )))
+        }
+        GpuTensor::Float16 { .. } | GpuTensor::Bool { .. } => {
+            Err(CudaError::Kernel(format!(
+                "gpu_copy does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
                 input.dtype().name()
             )))
         }
@@ -1195,6 +1341,69 @@ pub fn gpu_concat(
                 dtype.name()
             )))
         }
+        crate::cuda::tensor::DType::Float16 => {
+            // WS-3 M3.4 sub-1: Whisper-Tiny encoder concatenates FP16
+            // activations along the time axis. Memcpy-class — mirrors the
+            // f32 / i64 / i32 arms above with `unsigned short*` data
+            // pointers backed by half::f16's repr(transparent) u16 layout.
+            let mut output = pool.get_tensor_f16(ctx, out_shape.clone())?;
+            // SAFETY: concat_f16_kernel mirrors concat_kernel with
+            // `unsigned short*` data pointers — half::f16 is
+            // `#[repr(transparent)] struct(u16)`, so the byte layout is
+            // identical.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, half::f16>,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                )>("concat_f16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("concat_f16_kernel lookup: {}", e)))?;
+
+            let mut inp_offset: usize = 0;
+            for inp in inputs {
+                let inp_axis_size = inp.shape()[axis];
+                let total_inp_elements = inp.len();
+
+                if total_inp_elements == 0 {
+                    inp_offset += inp_axis_size;
+                    continue;
+                }
+
+                let config = garboard::LaunchConfig::for_num_elems(total_inp_elements as u32);
+
+                kernel
+                    .launch(
+                        ctx.garboard_stream(),
+                        &config,
+                        (
+                            output.data_f16_mut()?,
+                            inp.data_f16()?,
+                            inp_offset,
+                            inp_axis_size,
+                            outer_size,
+                            inner_size,
+                            out_axis_size,
+                            total_inp_elements,
+                        ),
+                    )
+                    .map_err(|e| CudaError::Kernel(format!("concat_f16 launch failed: {}", e)))?;
+
+                inp_offset += inp_axis_size;
+            }
+            Ok(output)
+        }
+        crate::cuda::tensor::DType::Bool => {
+            Err(CudaError::Kernel(format!(
+                "Concat does not support {} (WS-3 M3.4 sub-2+ — Bool dispatch arm pending; Whisper-FP16 doesn't exercise Bool concat)",
+                dtype.name()
+            )))
+        }
     }
 }
 
@@ -1377,6 +1586,86 @@ pub fn gpu_expand(
                 "Expand does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Expand)",
                 dtype.name()
             )))
+        }
+        crate::cuda::tensor::DType::Float16 => {
+            // WS-3 M3.7 (Whisper-Tiny encoder surfaced gap): Expand FP16.
+            // Memcpy-class — mirrors the f32 arm with `unsigned short*`
+            // data pointers backed by half::f16's repr(transparent) u16
+            // layout. M3.4 sub-1 audit missed Expand because it lives in
+            // the layout-broadcast family, not the layout-shuffle family
+            // M3.4 sub-1 swept.
+            let mut output = pool.get_tensor_f16(ctx, out_shape.clone())?;
+            // SAFETY: expand_f16_kernel mirrors expand_kernel byte-for-byte
+            // with `unsigned short*` data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, half::f16>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("expand_f16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("expand_f16_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_f16_mut()?,
+                        input.data_f16()?,
+                        &out_shape_gpu,
+                        &out_strides_gpu,
+                        &inp_shape_gpu,
+                        &inp_strides_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("expand_f16 launch failed: {}", e)))?;
+            Ok(output)
+        }
+        crate::cuda::tensor::DType::Bool => {
+            // M3.7b: GPT-2 and DistilBERT-INT8 attention paths broadcast a
+            // Bool mask via Expand. Memcpy-class — mirrors the f32 arm with
+            // `unsigned char*` data pointers backed by GpuTensor::Bool's
+            // u8-per-element storage (one byte: 0 = false, 1 = true).
+            let mut output = pool.get_tensor_bool(ctx, out_shape.clone())?;
+            // SAFETY: expand_bool_kernel mirrors expand_kernel byte-for-byte
+            // with `unsigned char*` data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, u8>,
+                    &garboard::DeviceSlice<'_, u8>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("expand_bool_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("expand_bool_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_bool_mut()?,
+                        input.data_bool()?,
+                        &out_shape_gpu,
+                        &out_strides_gpu,
+                        &inp_shape_gpu,
+                        &inp_strides_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("expand_bool launch failed: {}", e)))?;
+            Ok(output)
         }
     }
 }
@@ -2198,22 +2487,63 @@ pub fn gpu_resize(
 /// Returns a tensor of shape (ndim, num_nonzero) containing indices of non-zero elements.
 /// This uses CPU fallback since output size is data-dependent.
 pub fn gpu_nonzero(ctx: &IconnxCudaContext, input: &GpuTensor) -> Result<GpuTensor, CudaError> {
-    // NonZero has dynamic output size - use CPU fallback
-    // Copy input to CPU
-    let data = input.to_host_f32(ctx)?;
+    // NonZero has dynamic output size — CPU fallback. Per ONNX spec
+    // (https://onnx.ai/onnx/operators/onnx__NonZero.html) the output is
+    // always Int64 indices regardless of input dtype, so the dtype
+    // dispatch only varies how we evaluate "is non-zero" per element.
+    //
+    // M3.7c: Kokoro's istft chain feeds the output of a Bool comparison
+    // into NonZero. Pre-fix this site unconditionally called
+    // `to_host_f32` and panicked on Bool. M3.5 sub-B's Bool migration
+    // changed comparison ops to emit Bool natively; NonZero is one of
+    // the downstream consumers that needs a Bool-aware path.
     let shape = input.shape();
     let ndim = shape.len();
 
-    // Calculate strides for multi-dim index computation
+    // Compute the per-dimension flat-index strides once.
     let strides: Vec<usize> = (0..ndim)
         .map(|i| shape[i + 1..].iter().product::<usize>().max(1))
         .collect();
 
-    // Find all non-zero element indices
-    let mut all_indices: Vec<Vec<i64>> = vec![Vec::new(); ndim];
+    // Materialize a single is-nonzero predicate per element so the
+    // index-extraction loop below stays dtype-agnostic.
+    let is_nonzero: Vec<bool> = match input.dtype() {
+        crate::cuda::tensor::DType::Float32 => input
+            .to_host_f32(ctx)?
+            .into_iter()
+            .map(|v| v != 0.0)
+            .collect(),
+        crate::cuda::tensor::DType::Float16 => input
+            .to_host_f16(ctx)?
+            .into_iter()
+            .map(|v| v.to_f32() != 0.0)
+            .collect(),
+        crate::cuda::tensor::DType::Int64 => input
+            .to_host_i64(ctx)?
+            .into_iter()
+            .map(|v| v != 0)
+            .collect(),
+        crate::cuda::tensor::DType::Int32 => input
+            .to_host_i32(ctx)?
+            .into_iter()
+            .map(|v| v != 0)
+            .collect(),
+        crate::cuda::tensor::DType::Int8 => input
+            .to_host_i8(ctx)?
+            .into_iter()
+            .map(|v| v != 0)
+            .collect(),
+        crate::cuda::tensor::DType::UInt8 => input
+            .to_host_u8(ctx)?
+            .into_iter()
+            .map(|v| v != 0)
+            .collect(),
+        crate::cuda::tensor::DType::Bool => input.to_host_bool(ctx)?,
+    };
 
-    for (flat_idx, &value) in data.iter().enumerate() {
-        if value != 0.0 {
+    let mut all_indices: Vec<Vec<i64>> = vec![Vec::new(); ndim];
+    for (flat_idx, nz) in is_nonzero.into_iter().enumerate() {
+        if nz {
             let mut temp_idx = flat_idx;
             for dim in 0..ndim {
                 all_indices[dim].push((temp_idx / strides[dim]) as i64);
@@ -2224,14 +2554,12 @@ pub fn gpu_nonzero(ctx: &IconnxCudaContext, input: &GpuTensor) -> Result<GpuTens
 
     let num_nonzero = all_indices.first().map(|v| v.len()).unwrap_or(0);
 
-    // Build output: shape (ndim, num_nonzero)
     // Output is stored row-major: [dim0_indices..., dim1_indices..., ...]
     let mut output_data = Vec::with_capacity(ndim * num_nonzero);
     for dim_indices in &all_indices {
         output_data.extend_from_slice(dim_indices);
     }
 
-    // ONNX NonZero returns Int64
     if num_nonzero == 0 {
         GpuTensor::from_host_i64(ctx, &[], vec![ndim, 0])
     } else {
@@ -2379,6 +2707,12 @@ pub fn gpu_slice_nd(
             crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
                 Err(CudaError::Kernel(format!(
                     "Slice does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Slice)",
+                    dtype.name()
+                )))
+            }
+            crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
+                Err(CudaError::Kernel(format!(
+                    "Slice does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
                     dtype.name()
                 )))
             }
@@ -2702,6 +3036,12 @@ pub fn gpu_slice_nd(
                 dtype.name()
             )))
         }
+        (_, crate::cuda::tensor::DType::Float16) | (_, crate::cuda::tensor::DType::Bool) => {
+            Err(CudaError::Kernel(format!(
+                "Slice does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
+                dtype.name()
+            )))
+        }
     }
 }
 
@@ -2861,3 +3201,6 @@ pub fn gpu_max_pool_2d(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_fp16;

@@ -1,7 +1,8 @@
 /// Tensor implementation for Iconnx
 ///
 /// Multi-dtype support for ONNX compatibility
-/// Supports: Float32, Float64, Int64, Int32, Int8, UInt8, Bool
+/// Supports: Float32, Float64, Float16, Int64, Int32, Int8, UInt8, Bool
+use half::f16;
 use ndarray::{ArrayD, IxDyn};
 
 /// N-dimensional tensor with multiple data types
@@ -27,6 +28,11 @@ pub enum Tensor {
     Int8(ArrayD<i8>),
     /// 8-bit unsigned integer (u8) — UINT8 quantization (DynamicQuantizeLinear output).
     UInt8(ArrayD<u8>),
+    /// IEEE binary16 — Float16 / FP16 (Whisper FP16, BERT-FP16, etc.).
+    /// Added in WS-3 M3.1; uses the `half` crate's `f16` type for full
+    /// IEEE-754 binary16 semantics including round-half-to-even when
+    /// quantizing from f32 via `f16::from_f32`.
+    Float16(ArrayD<f16>),
 }
 
 impl Tensor {
@@ -205,6 +211,33 @@ impl Tensor {
         Tensor::UInt8(array)
     }
 
+    /// Create Float16 tensor from flat vector and shape.
+    ///
+    /// Added in WS-3 M3.1 for FP16 model support (Whisper-Tiny encoder
+    /// FP16, BERT-FP16). `f16` is from the `half` crate; round-half-to-
+    /// even quantization happens at `f16::from_f32` call sites.
+    pub fn from_vec_f16(data: Vec<f16>, shape: Vec<usize>) -> Self {
+        let expected_len: usize = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product()
+        };
+
+        if data.len() != expected_len {
+            panic!(
+                "Shape mismatch: data has {} elements but shape {:?} requires {}",
+                data.len(),
+                shape,
+                expected_len
+            );
+        }
+
+        let array = ArrayD::from_shape_vec(IxDyn(&shape), data)
+            .expect("Failed to create array from shape and data");
+
+        Tensor::Float16(array)
+    }
+
     /// Legacy: Create Float32 tensor (backward compatibility)
     pub fn from_vec(data: Vec<f32>, shape: Vec<usize>) -> Self {
         Self::from_vec_f32(data, shape)
@@ -225,6 +258,11 @@ impl Tensor {
         Tensor::Int32(array)
     }
 
+    /// Create tensor from existing Float16 ndarray
+    pub fn from_array_f16(array: ArrayD<f16>) -> Self {
+        Tensor::Float16(array)
+    }
+
     // ========== Type introspection ==========
 
     /// Get data type as string
@@ -232,6 +270,7 @@ impl Tensor {
         match self {
             Tensor::Float32(_) => "float32",
             Tensor::Float64(_) => "float64",
+            Tensor::Float16(_) => "float16",
             Tensor::Int64(_) => "int64",
             Tensor::Int32(_) => "int32",
             Tensor::Bool(_) => "bool",
@@ -243,6 +282,16 @@ impl Tensor {
     /// Check if tensor is Float32
     pub fn is_float32(&self) -> bool {
         matches!(self, Tensor::Float32(_))
+    }
+
+    /// Check if tensor is Float64
+    pub fn is_float64(&self) -> bool {
+        matches!(self, Tensor::Float64(_))
+    }
+
+    /// Check if tensor is Float16
+    pub fn is_float16(&self) -> bool {
+        matches!(self, Tensor::Float16(_))
     }
 
     /// Check if tensor is Int64
@@ -265,6 +314,11 @@ impl Tensor {
         matches!(self, Tensor::UInt8(_))
     }
 
+    /// Check if tensor is Bool
+    pub fn is_bool(&self) -> bool {
+        matches!(self, Tensor::Bool(_))
+    }
+
     // ========== Shape operations ==========
 
     /// Get tensor shape
@@ -272,6 +326,7 @@ impl Tensor {
         match self {
             Tensor::Float32(a) => a.shape(),
             Tensor::Float64(a) => a.shape(),
+            Tensor::Float16(a) => a.shape(),
             Tensor::Int64(a) => a.shape(),
             Tensor::Int32(a) => a.shape(),
             Tensor::Bool(a) => a.shape(),
@@ -285,6 +340,7 @@ impl Tensor {
         match self {
             Tensor::Float32(a) => a.ndim(),
             Tensor::Float64(a) => a.ndim(),
+            Tensor::Float16(a) => a.ndim(),
             Tensor::Int64(a) => a.ndim(),
             Tensor::Int32(a) => a.ndim(),
             Tensor::Bool(a) => a.ndim(),
@@ -298,6 +354,7 @@ impl Tensor {
         match self {
             Tensor::Float32(a) => a.len(),
             Tensor::Float64(a) => a.len(),
+            Tensor::Float16(a) => a.len(),
             Tensor::Int64(a) => a.len(),
             Tensor::Int32(a) => a.len(),
             Tensor::Bool(a) => a.len(),
@@ -458,6 +515,67 @@ impl Tensor {
         }
     }
 
+    /// Get data as flat Float16 slice (panics if wrong type)
+    pub fn as_slice_f16(&self) -> Vec<f16> {
+        match self {
+            Tensor::Float16(a) => {
+                if let Some(slice) = a.as_slice() {
+                    slice.to_vec()
+                } else {
+                    a.iter().copied().collect()
+                }
+            }
+            _ => panic!(
+                "as_slice_f16() called on non-Float16 tensor ({})",
+                self.dtype()
+            ),
+        }
+    }
+
+    /// Get reference to Float16 array (panics if wrong type)
+    pub fn to_array_f16(&self) -> &ArrayD<f16> {
+        match self {
+            Tensor::Float16(a) => a,
+            _ => panic!(
+                "to_array_f16() called on non-Float16 tensor ({})",
+                self.dtype()
+            ),
+        }
+    }
+
+    /// Get data as flat Bool slice (panics if wrong type)
+    ///
+    /// Added in WS-3 M3.1's Bool surface audit. Closes the L2.1/L3.5
+    /// asymmetry: Bool match arms existed throughout but the dedicated
+    /// accessor was missing, forcing callers to either pattern-match the
+    /// Tensor variant directly or convert through a different dtype.
+    pub fn as_slice_bool(&self) -> Vec<bool> {
+        match self {
+            Tensor::Bool(a) => {
+                if let Some(slice) = a.as_slice() {
+                    slice.to_vec()
+                } else {
+                    a.iter().copied().collect()
+                }
+            }
+            _ => panic!(
+                "as_slice_bool() called on non-Bool tensor ({})",
+                self.dtype()
+            ),
+        }
+    }
+
+    /// Get reference to Bool array (panics if wrong type)
+    pub fn to_array_bool(&self) -> &ArrayD<bool> {
+        match self {
+            Tensor::Bool(a) => a,
+            _ => panic!(
+                "to_array_bool() called on non-Bool tensor ({})",
+                self.dtype()
+            ),
+        }
+    }
+
     // ========== Type conversions ==========
 
     /// Convert to Float32 (creates copy if needed)
@@ -486,6 +604,10 @@ impl Tensor {
             }
             Tensor::UInt8(a) => {
                 let data: Vec<f32> = a.iter().map(|&x| x as f32).collect();
+                Tensor::from_vec_f32(data, a.shape().to_vec())
+            }
+            Tensor::Float16(a) => {
+                let data: Vec<f32> = a.iter().map(|x| x.to_f32()).collect();
                 Tensor::from_vec_f32(data, a.shape().to_vec())
             }
         }
@@ -517,6 +639,10 @@ impl Tensor {
             }
             Tensor::UInt8(a) => {
                 let data: Vec<i64> = a.iter().map(|&x| x as i64).collect();
+                Tensor::from_vec_i64(data, a.shape().to_vec())
+            }
+            Tensor::Float16(a) => {
+                let data: Vec<i64> = a.iter().map(|x| x.to_f32() as i64).collect();
                 Tensor::from_vec_i64(data, a.shape().to_vec())
             }
         }
@@ -576,6 +702,16 @@ impl Tensor {
                 let as_i64 = arr.mapv(|x| x as i64);
                 let result_i64 = i64_op(&as_i64);
                 Tensor::UInt8(result_i64.mapv(|x| x as u8))
+            }
+            Tensor::Float16(arr) => {
+                // Convert to f32, operate, convert back to f16. Float16
+                // ops in iconnx today funnel through f32 for shape-class
+                // operations (Concat / Reshape / Transpose / etc.) and
+                // through dedicated FP16 NVRTC kernels for math (M3.4);
+                // this CPU path is the constant-folding fallback.
+                let as_f32 = arr.mapv(|x| x.to_f32());
+                let result_f32 = f32_op(&as_f32);
+                Tensor::Float16(result_f32.mapv(f16::from_f32))
             }
         }
     }
@@ -660,5 +796,87 @@ mod tests {
         assert_eq!(arr.shape(), &[3]);
         assert_eq!(arr[[0]], 1_i8);
         assert_eq!(arr[[1]], -2_i8);
+    }
+
+    // ========== WS-3 M3.1: Float16 + Bool surface audit ==========
+
+    #[test]
+    fn tensor_float16_constructor_and_accessors() {
+        use half::f16;
+        let v = vec![f16::from_f32(1.5), f16::from_f32(-2.0), f16::from_f32(0.0)];
+        let t = Tensor::from_vec_f16(v.clone(), vec![3]);
+        assert_eq!(t.dtype(), "float16");
+        assert!(t.is_float16());
+        assert_eq!(t.shape(), &[3]);
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.as_slice_f16(), v);
+    }
+
+    #[test]
+    fn tensor_float16_round_half_to_even_parity() {
+        use half::f16;
+        // 1.0 + 2^-12 (~1.000244) is below the f16 ULP at 1.0 (which is 2^-10);
+        // f16 quantizes it back to exactly 1.0, exercising IEEE-754 round-to-
+        // nearest-even on a tied f16 boundary.
+        let v = vec![f16::from_f32(1.0_f32 + (1.0_f32 / 4096.0))];
+        let t = Tensor::from_vec_f16(v, vec![1]);
+        let back: f32 = t.as_slice_f16()[0].to_f32();
+        assert!(
+            (back - 1.0).abs() < 1e-6,
+            "expected even round to 1.0, got {back}"
+        );
+    }
+
+    #[test]
+    fn tensor_float16_panic_on_wrong_accessor() {
+        use half::f16;
+        let t = Tensor::from_vec_f16(vec![f16::from_f32(0.0)], vec![1]);
+        let result = std::panic::catch_unwind(|| t.as_slice());
+        assert!(
+            result.is_err(),
+            "f32-strict accessor on Float16 must panic"
+        );
+    }
+
+    #[test]
+    fn tensor_float16_to_array_roundtrip() {
+        use half::f16;
+        let v = vec![f16::from_f32(0.5), f16::from_f32(-1.5), f16::from_f32(2.0)];
+        let t = Tensor::from_vec_f16(v, vec![3]);
+        let arr = t.to_array_f16();
+        assert_eq!(arr.shape(), &[3]);
+        assert_eq!(arr[[0]].to_f32(), 0.5);
+        assert_eq!(arr[[1]].to_f32(), -1.5);
+    }
+
+    /// L2.1 / L3.5 audit closure: confirm Bool has the same accessor
+    /// surface as the other dtype variants. Pre-WS-3 the Bool path lacked
+    /// `is_bool`, `as_slice_bool`, `to_array_bool` — only the match-arm
+    /// sites (`dtype`, `shape`, `len`, `to_float32`, `to_int64`,
+    /// `map_preserving_dtype`) had Bool coverage. M3.3's GPU upload path
+    /// needs the dedicated accessors.
+    #[test]
+    fn tensor_bool_accessor_symmetry() {
+        let t = Tensor::from_vec_bool(vec![true, false, true], vec![3]);
+        assert_eq!(t.dtype(), "bool");
+        assert!(t.is_bool());
+        assert_eq!(t.shape(), &[3]);
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.as_slice_bool(), vec![true, false, true]);
+        let arr = t.to_array_bool();
+        assert_eq!(arr.shape(), &[3]);
+        assert!(arr[[0]]);
+        assert!(!arr[[1]]);
+    }
+
+    /// Float64 also lacked `is_float64`. Add and verify alongside the
+    /// Float16 / Bool work — small symmetry win on the tensor introspection
+    /// surface.
+    #[test]
+    fn tensor_float64_is_float64() {
+        let t = Tensor::from_vec_f64(vec![1.0, 2.0], vec![2]);
+        assert_eq!(t.dtype(), "float64");
+        assert!(t.is_float64());
+        assert!(!t.is_float32());
     }
 }

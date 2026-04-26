@@ -20,6 +20,13 @@ prost = "0.13"
 # CPU tensors
 ndarray = "0.16"
 
+# IEEE binary16 (Float16 / FP16) support — `half::f16` element type for
+# `Tensor::Float16` and `GpuTensor::Float16`. WS-3 M3.1 / M3.3.
+# `bytemuck` feature is required so `f16` implements `Pod`, which the
+# generic `IconnxCudaContext::htod` / `dtoh` (T: bytemuck::Pod) bound
+# accepts for FP16 host↔device transfers.
+half = { version = "2", features = ["bytemuck"] }
+
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"

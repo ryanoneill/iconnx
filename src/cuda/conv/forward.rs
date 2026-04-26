@@ -5,12 +5,14 @@ use super::params::{Conv1dParams, Conv2dParams};
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::matmul::gpu_gemm;
 use crate::cuda::memory_pool::GpuMemoryPool;
-use crate::cuda::tensor::GpuTensor;
+use crate::cuda::tensor::{DType, GpuTensor};
 use garboard::{DeviceSlice, LaunchConfig};
 
 /// GPU im2col transformation for 2D convolution
 ///
-/// Transforms [N, C, H, W] into [C*kH*kW, N*out_H*out_W]
+/// Transforms [N, C, H, W] into [C*kH*kW, N*out_H*out_W]. Float32 and
+/// Float16 supported (M3.6 light-up: gpu_conv2d → gpu_im2col → gpu_gemm
+/// only stays FP16 if both seams accept it).
 pub fn gpu_im2col(
     ctx: &IconnxCudaContext,
     cache: &ConvKernelCache,
@@ -26,60 +28,91 @@ pub fn gpu_im2col(
     let height = shape[2];
     let width = shape[3];
 
-    // Calculate output dimensions
     let out_h = (height + 2 * params.pad_h - params.kernel_h) / params.stride_h + 1;
     let out_w = (width + 2 * params.pad_w - params.kernel_w) / params.stride_w + 1;
 
     let col_height = channels * params.kernel_h * params.kernel_w;
     let col_width = batch_size * out_h * out_w;
+    let launch_cfg = LaunchConfig::for_num_elems(col_width as u32);
 
-    // Allocate output
-    let mut output = pool.get_tensor_f32(ctx, vec![col_height, col_width])?;
+    match input.dtype() {
+        DType::Float32 => {
+            let mut output = pool.get_tensor_f32(ctx, vec![col_height, col_width])?;
+            // SAFETY: im2col_kernel signature is
+            // `(float* out, const float* inp, size_t N, size_t C, size_t H, size_t W,
+            //   size_t kH, size_t kW, size_t sH, size_t sW, size_t pH, size_t pW,
+            //   size_t out_H, size_t out_W)`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, f32>,
+                    &DeviceSlice<'_, f32>,
+                    usize, usize, usize, usize,
+                    usize, usize, usize, usize,
+                    usize, usize, usize, usize,
+                )>("im2col_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("im2col_kernel lookup failed: {}", e)))?;
 
-    // SAFETY: im2col_kernel signature is
-    // `(float* out, const float* inp, size_t N, size_t C, size_t H, size_t W,
-    //   size_t kH, size_t kW, size_t sH, size_t sW, size_t pH, size_t pW,
-    //   size_t out_H, size_t out_W)`.
-    let kernel = unsafe {
-        cache.module().typed_kernel::<(
-            &mut DeviceSlice<'_, f32>,
-            &DeviceSlice<'_, f32>,
-            usize, usize, usize, usize,
-            usize, usize, usize, usize,
-            usize, usize, usize, usize,
-        )>("im2col_kernel")
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &launch_cfg,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        batch_size, channels, height, width,
+                        params.kernel_h, params.kernel_w,
+                        params.stride_h, params.stride_w,
+                        params.pad_h, params.pad_w,
+                        out_h, out_w,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("im2col launch failed: {}", e)))?;
+            Ok(output)
+        }
+        DType::Float16 => {
+            let mut output = pool.get_tensor_f16(ctx, vec![col_height, col_width])?;
+            // SAFETY: im2col_f16_kernel signature mirrors im2col_kernel
+            // with `unsigned short*` (2-byte) data pointers — half::f16
+            // is `repr(transparent) u16`, byte-identical layout.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, half::f16>,
+                    &DeviceSlice<'_, half::f16>,
+                    usize, usize, usize, usize,
+                    usize, usize, usize, usize,
+                    usize, usize, usize, usize,
+                )>("im2col_f16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("im2col_f16_kernel lookup failed: {}", e)))?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &launch_cfg,
+                    (
+                        output.data_f16_mut()?,
+                        input.data_f16()?,
+                        batch_size, channels, height, width,
+                        params.kernel_h, params.kernel_w,
+                        params.stride_h, params.stride_w,
+                        params.pad_h, params.pad_w,
+                        out_h, out_w,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("im2col_f16 launch failed: {}", e)))?;
+            Ok(output)
+        }
+        dt => Err(CudaError::Kernel(format!(
+            "im2col: unsupported dtype {} (Float32 + Float16 supported)",
+            dt.name()
+        ))),
     }
-    .map_err(|e| CudaError::Kernel(format!("im2col_kernel lookup failed: {}", e)))?;
-
-    kernel
-        .launch(
-            ctx.garboard_stream(),
-            &LaunchConfig::for_num_elems(col_width as u32),
-            (
-                output.data_f32_mut()?,
-                input.data_f32()?,
-                batch_size,
-                channels,
-                height,
-                width,
-                params.kernel_h,
-                params.kernel_w,
-                params.stride_h,
-                params.stride_w,
-                params.pad_h,
-                params.pad_w,
-                out_h,
-                out_w,
-            ),
-        )
-        .map_err(|e| CudaError::Kernel(format!("im2col launch failed: {}", e)))?;
-
-    Ok(output)
 }
 
 /// GPU im2col transformation for 1D convolution
 ///
-/// Transforms [N, C, L] into [C*K, N*out_L]
+/// Transforms [N, C, L] into [C*K, N*out_L]. Float32 + Float16 supported.
 pub fn gpu_im2col_1d(
     ctx: &IconnxCudaContext,
     cache: &ConvKernelCache,
@@ -94,48 +127,80 @@ pub fn gpu_im2col_1d(
     let channels = shape[1];
     let length = shape[2];
 
-    // Calculate effective kernel size with dilation
     let effective_k = (params.kernel_size - 1) * params.dilation + 1;
     let out_length = (length + 2 * params.padding - effective_k) / params.stride + 1;
 
     let col_height = channels * params.kernel_size;
     let col_width = batch_size * out_length;
+    let launch_cfg = LaunchConfig::for_num_elems(col_width as u32);
 
-    let mut output = pool.get_tensor_f32(ctx, vec![col_height, col_width])?;
+    match input.dtype() {
+        DType::Float32 => {
+            let mut output = pool.get_tensor_f32(ctx, vec![col_height, col_width])?;
+            // SAFETY: im2col_1d_kernel signature is
+            // `(float* out, const float* inp, size_t N, size_t C, size_t L,
+            //   size_t K, size_t stride, size_t pad, size_t dilation, size_t out_L)`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, f32>,
+                    &DeviceSlice<'_, f32>,
+                    usize, usize, usize,
+                    usize, usize, usize, usize, usize,
+                )>("im2col_1d_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("im2col_1d_kernel lookup failed: {}", e)))?;
 
-    // SAFETY: im2col_1d_kernel signature is
-    // `(float* out, const float* inp, size_t N, size_t C, size_t L,
-    //   size_t K, size_t stride, size_t pad, size_t dilation, size_t out_L)`.
-    let kernel = unsafe {
-        cache.module().typed_kernel::<(
-            &mut DeviceSlice<'_, f32>,
-            &DeviceSlice<'_, f32>,
-            usize, usize, usize,
-            usize, usize, usize, usize, usize,
-        )>("im2col_1d_kernel")
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &launch_cfg,
+                    (
+                        output.data_f32_mut()?,
+                        input.data_f32()?,
+                        batch_size, channels, length,
+                        params.kernel_size, params.stride,
+                        params.padding, params.dilation, out_length,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("im2col_1d launch failed: {}", e)))?;
+            Ok(output)
+        }
+        DType::Float16 => {
+            let mut output = pool.get_tensor_f16(ctx, vec![col_height, col_width])?;
+            // SAFETY: im2col_1d_f16_kernel signature mirrors im2col_1d_kernel
+            // with `unsigned short*` data pointers (FP16 byte-identical to u16).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, half::f16>,
+                    &DeviceSlice<'_, half::f16>,
+                    usize, usize, usize,
+                    usize, usize, usize, usize, usize,
+                )>("im2col_1d_f16_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("im2col_1d_f16_kernel lookup failed: {}", e))
+            })?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &launch_cfg,
+                    (
+                        output.data_f16_mut()?,
+                        input.data_f16()?,
+                        batch_size, channels, length,
+                        params.kernel_size, params.stride,
+                        params.padding, params.dilation, out_length,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("im2col_1d_f16 launch failed: {}", e)))?;
+            Ok(output)
+        }
+        dt => Err(CudaError::Kernel(format!(
+            "im2col_1d: unsupported dtype {}",
+            dt.name()
+        ))),
     }
-    .map_err(|e| CudaError::Kernel(format!("im2col_1d_kernel lookup failed: {}", e)))?;
-
-    kernel
-        .launch(
-            ctx.garboard_stream(),
-            &LaunchConfig::for_num_elems(col_width as u32),
-            (
-                output.data_f32_mut()?,
-                input.data_f32()?,
-                batch_size,
-                channels,
-                length,
-                params.kernel_size,
-                params.stride,
-                params.padding,
-                params.dilation,
-                out_length,
-            ),
-        )
-        .map_err(|e| CudaError::Kernel(format!("im2col_1d launch failed: {}", e)))?;
-
-    Ok(output)
 }
 
 /// GPU 2D Convolution using im2col + cuBLAS GEMM
@@ -298,7 +363,7 @@ pub fn gpu_conv1d(
     Ok(output)
 }
 
-/// Add bias to convolution output
+/// Add bias to convolution output. Float32 + Float16 supported.
 pub fn add_bias(
     ctx: &IconnxCudaContext,
     cache: &ConvKernelCache,
@@ -309,31 +374,74 @@ pub fn add_bias(
     spatial_size: usize,
 ) -> Result<(), CudaError> {
     let total_elements = batch_size * out_channels * spatial_size;
+    let launch_cfg = LaunchConfig::for_num_elems(total_elements as u32);
 
-    // SAFETY: add_bias_kernel signature is
-    // `(float* output, const float* bias, size_t batch, size_t C, size_t spatial)`.
-    let kernel = unsafe {
-        cache.module().typed_kernel::<(
-            &mut DeviceSlice<'_, f32>,
-            &DeviceSlice<'_, f32>,
-            usize, usize, usize,
-        )>("add_bias_kernel")
+    if output.dtype() != bias.dtype() {
+        return Err(CudaError::Kernel(format!(
+            "add_bias: output/bias dtype mismatch ({} vs {})",
+            output.dtype().name(),
+            bias.dtype().name()
+        )));
     }
-    .map_err(|e| CudaError::Kernel(format!("add_bias_kernel lookup failed: {}", e)))?;
 
-    kernel
-        .launch(
-            ctx.garboard_stream(),
-            &LaunchConfig::for_num_elems(total_elements as u32),
-            (
-                output.data_f32_mut()?,
-                bias.data_f32()?,
-                batch_size,
-                out_channels,
-                spatial_size,
-            ),
-        )
-        .map_err(|e| CudaError::Kernel(format!("add_bias launch failed: {}", e)))?;
+    match output.dtype() {
+        DType::Float32 => {
+            // SAFETY: add_bias_kernel signature is
+            // `(float* output, const float* bias, size_t batch, size_t C, size_t spatial)`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, f32>,
+                    &DeviceSlice<'_, f32>,
+                    usize, usize, usize,
+                )>("add_bias_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("add_bias_kernel lookup failed: {}", e)))?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &launch_cfg,
+                    (
+                        output.data_f32_mut()?,
+                        bias.data_f32()?,
+                        batch_size, out_channels, spatial_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("add_bias launch failed: {}", e)))?;
+        }
+        DType::Float16 => {
+            // SAFETY: add_bias_f16_kernel signature is
+            // `(__half* output, const __half* bias, size_t batch, size_t C, size_t spatial)`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, half::f16>,
+                    &DeviceSlice<'_, half::f16>,
+                    usize, usize, usize,
+                )>("add_bias_f16_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("add_bias_f16_kernel lookup failed: {}", e))
+            })?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &launch_cfg,
+                    (
+                        output.data_f16_mut()?,
+                        bias.data_f16()?,
+                        batch_size, out_channels, spatial_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("add_bias_f16 launch failed: {}", e)))?;
+        }
+        dt => {
+            return Err(CudaError::Kernel(format!(
+                "add_bias: unsupported dtype {}",
+                dt.name()
+            )))
+        }
+    }
 
     Ok(())
 }

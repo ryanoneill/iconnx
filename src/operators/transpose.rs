@@ -57,6 +57,9 @@ impl Transpose {
             Tensor::UInt8(arr) => {
                 Tensor::UInt8(arr.clone().permuted_axes(perm))
             }
+            Tensor::Float16(arr) => {
+                Tensor::Float16(arr.clone().permuted_axes(perm))
+            }
         }
     }
 }

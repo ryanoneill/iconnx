@@ -61,14 +61,18 @@ impl Executor {
             "Where" => {
                 let (condition, x, y) = (inputs[0], inputs[1], inputs[2]);
 
-                // Cast condition to Float32 if it's Int32/Int64 (e.g., from Bool cast).
-                // Use Cow to avoid cloning when no cast is needed.
-                let condition: Cow<'_, GpuTensor> = if condition.dtype() != DType::Float32 {
+                // WS-3 M3.5 sub-B: Where consumes native Bool. Comparison
+                // ops produce Bool natively now, so the common path is
+                // already-Bool. For non-Bool conditions (e.g., a Cast→Bool
+                // that hasn't been lowered, or an Int32/Int64 mask passed
+                // by the graph author), insert a Cast→Bool. Cow elides the
+                // clone in the common case.
+                let condition: Cow<'_, GpuTensor> = if condition.dtype() != DType::Bool {
                     Cow::Owned(gpu_cast(
                         &self.ctx,
                         &self.ops_kernels,
                         condition,
-                        DType::Float32,
+                        DType::Bool,
                     )?)
                 } else {
                     Cow::Borrowed(condition)
@@ -141,10 +145,11 @@ impl Executor {
                     .get_int("to")
                     .ok_or_else(|| CudaError::Kernel("Cast: missing 'to' attribute".into()))?;
                 let target_dtype = match target_type {
-                    1 => DType::Float32, // FLOAT
-                    6 => DType::Int32,   // INT32
-                    7 => DType::Int64,   // INT64
-                    9 => DType::Int32,   // BOOL -> treat as Int32 (0 or 1)
+                    1 => DType::Float32,  // FLOAT
+                    6 => DType::Int32,    // INT32
+                    7 => DType::Int64,    // INT64
+                    9 => DType::Bool,     // BOOL (M3.5 sub-B: native Bool, was Int32 0/1)
+                    10 => DType::Float16, // FLOAT16 (M3.5 sub-A)
                     _ => {
                         return Err(CudaError::Kernel(format!(
                             "Cast: unsupported target type {}",

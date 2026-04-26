@@ -37,6 +37,14 @@ pub const KERNEL_NAMES: &[&str] = &[
     "cast_i64_to_i32_kernel",
     "cast_i32_to_f32_kernel",
     "cast_i32_to_i64_kernel",
+    // M3.5 sub-B Bool cast kernels: ONNX Cast→Bool produces native
+    // GpuTensor::Bool now (was Int32 0/1 with downstream f32 coercion).
+    "cast_f32_to_bool_kernel",
+    "cast_i32_to_bool_kernel",
+    "cast_i64_to_bool_kernel",
+    "cast_bool_to_f32_kernel",
+    "cast_bool_to_i32_kernel",
+    "cast_bool_to_i64_kernel",
     "greater_or_equal_kernel",
     "less_or_equal_kernel",
     "not_equal_kernel",
@@ -47,6 +55,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "expand_kernel",
     "expand_i64_kernel",
     "expand_i32_kernel",
+    "expand_bool_kernel",
     "pad_kernel",
     "pad_3d_scalar_kernel",
     "pad_4d_scalar_kernel",
@@ -283,136 +292,138 @@ extern "C" __global__ void slice_kernel(
     out[idx] = inp[start_offset + idx];
 }
 
-// Where: out = condition ? x : y (Float32)
+// Where: out = condition ? x : y (Float32 outputs).
+// WS-3 M3.5 sub-B: condition is now native Bool (`unsigned char`); upstream
+// comparison ops feed it directly without a Bool→Float32 cast bounce.
 extern "C" __global__ void where_kernel(
-    float* out, const float* condition, const float* x, const float* y, size_t n
+    float* out, const unsigned char* condition, const float* x, const float* y, size_t n
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (condition[idx] != 0.0f) ? x[idx] : y[idx];
+    out[idx] = condition[idx] ? x[idx] : y[idx];
 }
 
-// Where Int64: out = condition ? x : y (condition is float, x/y are int64)
+// Where Int64: out = condition ? x : y (condition is Bool, x/y are int64).
 extern "C" __global__ void where_i64_kernel(
-    long long* out, const float* condition, const long long* x, const long long* y, size_t n
+    long long* out, const unsigned char* condition, const long long* x, const long long* y, size_t n
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (condition[idx] != 0.0f) ? x[idx] : y[idx];
+    out[idx] = condition[idx] ? x[idx] : y[idx];
 }
 
-// Where Int32: out = condition ? x : y (condition is float, x/y are int32)
+// Where Int32: out = condition ? x : y (condition is Bool, x/y are int32).
 extern "C" __global__ void where_i32_kernel(
-    int* out, const float* condition, const int* x, const int* y, size_t n
+    int* out, const unsigned char* condition, const int* x, const int* y, size_t n
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (condition[idx] != 0.0f) ? x[idx] : y[idx];
+    out[idx] = condition[idx] ? x[idx] : y[idx];
 }
 
-// Equal: out = (a == b) ? 1.0 : 0.0
-extern "C" __global__ void equal_kernel(float* out, const float* a, const float* b, size_t n) {
+// Equal: out = (a == b) ? 1u : 0u (WS-3 M3.5 sub-B: native Bool output).
+extern "C" __global__ void equal_kernel(unsigned char* out, const float* a, const float* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] == b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] == b[idx]) ? 1u : 0u;
 }
 
-// Equal Int64: out = (a == b) ? 1.0 : 0.0
-extern "C" __global__ void equal_i64(float* out, const long long* a, const long long* b, size_t n) {
+// Equal Int64: out = (a == b) ? 1u : 0u
+extern "C" __global__ void equal_i64(unsigned char* out, const long long* a, const long long* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] == b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] == b[idx]) ? 1u : 0u;
 }
 
-// Less: out = (a < b) ? 1.0 : 0.0
-extern "C" __global__ void less_kernel(float* out, const float* a, const float* b, size_t n) {
+// Less: out = (a < b) ? 1u : 0u
+extern "C" __global__ void less_kernel(unsigned char* out, const float* a, const float* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] < b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] < b[idx]) ? 1u : 0u;
 }
 
-// Less Int64: out = (a < b) ? 1.0 : 0.0
-extern "C" __global__ void less_i64(float* out, const long long* a, const long long* b, size_t n) {
+// Less Int64: out = (a < b) ? 1u : 0u
+extern "C" __global__ void less_i64(unsigned char* out, const long long* a, const long long* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] < b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] < b[idx]) ? 1u : 0u;
 }
 
-// Greater: out = (a > b) ? 1.0 : 0.0
-extern "C" __global__ void greater_kernel(float* out, const float* a, const float* b, size_t n) {
+// Greater: out = (a > b) ? 1u : 0u
+extern "C" __global__ void greater_kernel(unsigned char* out, const float* a, const float* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] > b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] > b[idx]) ? 1u : 0u;
 }
 
-// Greater Int64: out = (a > b) ? 1.0 : 0.0
-extern "C" __global__ void greater_i64(float* out, const long long* a, const long long* b, size_t n) {
+// Greater Int64: out = (a > b) ? 1u : 0u
+extern "C" __global__ void greater_i64(unsigned char* out, const long long* a, const long long* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] > b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] > b[idx]) ? 1u : 0u;
 }
 
-// GreaterOrEqual Int64: out = (a >= b) ? 1.0 : 0.0
-extern "C" __global__ void greater_or_equal_i64(float* out, const long long* a, const long long* b, size_t n) {
+// GreaterOrEqual Int64: out = (a >= b) ? 1u : 0u
+extern "C" __global__ void greater_or_equal_i64(unsigned char* out, const long long* a, const long long* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] >= b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] >= b[idx]) ? 1u : 0u;
 }
 
-// LessOrEqual Int64: out = (a <= b) ? 1.0 : 0.0
-extern "C" __global__ void less_or_equal_i64(float* out, const long long* a, const long long* b, size_t n) {
+// LessOrEqual Int64: out = (a <= b) ? 1u : 0u
+extern "C" __global__ void less_or_equal_i64(unsigned char* out, const long long* a, const long long* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] <= b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] <= b[idx]) ? 1u : 0u;
 }
 
-// NotEqual Int64: out = (a != b) ? 1.0 : 0.0
-extern "C" __global__ void not_equal_i64(float* out, const long long* a, const long long* b, size_t n) {
+// NotEqual Int64: out = (a != b) ? 1u : 0u
+extern "C" __global__ void not_equal_i64(unsigned char* out, const long long* a, const long long* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] != b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] != b[idx]) ? 1u : 0u;
 }
 
-// Equal Int32: out = (a == b) ? 1.0 : 0.0
-extern "C" __global__ void equal_i32(float* out, const int* a, const int* b, size_t n) {
+// Equal Int32: out = (a == b) ? 1u : 0u
+extern "C" __global__ void equal_i32(unsigned char* out, const int* a, const int* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] == b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] == b[idx]) ? 1u : 0u;
 }
 
-// Less Int32: out = (a < b) ? 1.0 : 0.0
-extern "C" __global__ void less_i32(float* out, const int* a, const int* b, size_t n) {
+// Less Int32: out = (a < b) ? 1u : 0u
+extern "C" __global__ void less_i32(unsigned char* out, const int* a, const int* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] < b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] < b[idx]) ? 1u : 0u;
 }
 
-// Greater Int32: out = (a > b) ? 1.0 : 0.0
-extern "C" __global__ void greater_i32(float* out, const int* a, const int* b, size_t n) {
+// Greater Int32: out = (a > b) ? 1u : 0u
+extern "C" __global__ void greater_i32(unsigned char* out, const int* a, const int* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] > b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] > b[idx]) ? 1u : 0u;
 }
 
-// GreaterOrEqual Int32: out = (a >= b) ? 1.0 : 0.0
-extern "C" __global__ void greater_or_equal_i32(float* out, const int* a, const int* b, size_t n) {
+// GreaterOrEqual Int32: out = (a >= b) ? 1u : 0u
+extern "C" __global__ void greater_or_equal_i32(unsigned char* out, const int* a, const int* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] >= b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] >= b[idx]) ? 1u : 0u;
 }
 
-// LessOrEqual Int32: out = (a <= b) ? 1.0 : 0.0
-extern "C" __global__ void less_or_equal_i32(float* out, const int* a, const int* b, size_t n) {
+// LessOrEqual Int32: out = (a <= b) ? 1u : 0u
+extern "C" __global__ void less_or_equal_i32(unsigned char* out, const int* a, const int* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] <= b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] <= b[idx]) ? 1u : 0u;
 }
 
-// NotEqual Int32: out = (a != b) ? 1.0 : 0.0
-extern "C" __global__ void not_equal_i32(float* out, const int* a, const int* b, size_t n) {
+// NotEqual Int32: out = (a != b) ? 1u : 0u
+extern "C" __global__ void not_equal_i32(unsigned char* out, const int* a, const int* b, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] != b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (a[idx] != b[idx]) ? 1u : 0u;
 }
 
 // Cast f32 to i64 - round to nearest integer
@@ -457,46 +468,89 @@ extern "C" __global__ void cast_i32_to_i64_kernel(long long* out, const int* inp
     out[idx] = (long long)inp[idx];
 }
 
-// GreaterOrEqual: out = (a >= b) ? 1.0 : 0.0
-extern "C" __global__ void greater_or_equal_kernel(float* out, const float* a, const float* b, size_t n) {
+// ============================================================================
+// WS-3 M3.5 sub-B Bool boundary casts. ONNX Cast(to=BOOL) is "treat any
+// non-zero value as true"; the reverse (Bool→numeric) emits 0 / 1 only.
+// All six pairs use byte-level u8 storage for the Bool side, matching
+// `GpuTensor::Bool`'s `DeviceSlice<u8>` representation.
+// ============================================================================
+
+extern "C" __global__ void cast_f32_to_bool_kernel(unsigned char* out, const float* inp, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] >= b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (inp[idx] != 0.0f) ? 1u : 0u;
 }
 
-// LessOrEqual: out = (a <= b) ? 1.0 : 0.0
-extern "C" __global__ void less_or_equal_kernel(float* out, const float* a, const float* b, size_t n) {
+extern "C" __global__ void cast_i32_to_bool_kernel(unsigned char* out, const int* inp, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] <= b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (inp[idx] != 0) ? 1u : 0u;
 }
 
-// NotEqual: out = (a != b) ? 1.0 : 0.0
-extern "C" __global__ void not_equal_kernel(float* out, const float* a, const float* b, size_t n) {
+extern "C" __global__ void cast_i64_to_bool_kernel(unsigned char* out, const long long* inp, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] != b[idx]) ? 1.0f : 0.0f;
+    out[idx] = (inp[idx] != 0) ? 1u : 0u;
 }
 
-// And: out = (a != 0 && b != 0) ? 1.0 : 0.0
-extern "C" __global__ void and_kernel(float* out, const float* a, const float* b, size_t n) {
+extern "C" __global__ void cast_bool_to_f32_kernel(float* out, const unsigned char* inp, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] != 0.0f && b[idx] != 0.0f) ? 1.0f : 0.0f;
+    out[idx] = inp[idx] ? 1.0f : 0.0f;
 }
 
-// Or: out = (a != 0 || b != 0) ? 1.0 : 0.0
-extern "C" __global__ void or_kernel(float* out, const float* a, const float* b, size_t n) {
+extern "C" __global__ void cast_bool_to_i32_kernel(int* out, const unsigned char* inp, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] != 0.0f || b[idx] != 0.0f) ? 1.0f : 0.0f;
+    out[idx] = inp[idx] ? 1 : 0;
 }
 
-// Not: out = (a == 0) ? 1.0 : 0.0
-extern "C" __global__ void not_kernel(float* out, const float* a, size_t n) {
+extern "C" __global__ void cast_bool_to_i64_kernel(long long* out, const unsigned char* inp, size_t n) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    out[idx] = (a[idx] == 0.0f) ? 1.0f : 0.0f;
+    out[idx] = inp[idx] ? 1LL : 0LL;
+}
+
+// GreaterOrEqual: out = (a >= b) ? 1u : 0u
+extern "C" __global__ void greater_or_equal_kernel(unsigned char* out, const float* a, const float* b, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = (a[idx] >= b[idx]) ? 1u : 0u;
+}
+
+// LessOrEqual: out = (a <= b) ? 1u : 0u
+extern "C" __global__ void less_or_equal_kernel(unsigned char* out, const float* a, const float* b, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = (a[idx] <= b[idx]) ? 1u : 0u;
+}
+
+// NotEqual: out = (a != b) ? 1u : 0u
+extern "C" __global__ void not_equal_kernel(unsigned char* out, const float* a, const float* b, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = (a[idx] != b[idx]) ? 1u : 0u;
+}
+
+// And: out = (a && b) — Bool inputs and outputs, native u8 1/0.
+extern "C" __global__ void and_kernel(unsigned char* out, const unsigned char* a, const unsigned char* b, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = (a[idx] && b[idx]) ? 1u : 0u;
+}
+
+// Or: out = (a || b) — Bool inputs and outputs, native u8 1/0.
+extern "C" __global__ void or_kernel(unsigned char* out, const unsigned char* a, const unsigned char* b, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = (a[idx] || b[idx]) ? 1u : 0u;
+}
+
+// Not: out = !a — Bool input and output, native u8 1/0.
+extern "C" __global__ void not_kernel(unsigned char* out, const unsigned char* a, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = a[idx] ? 0u : 1u;
 }
 
 // Atan: out = atan(inp)
@@ -555,6 +609,33 @@ extern "C" __global__ void expand_i64_kernel(
 // Expand Int32: Broadcast input to output shape (up to 8 dims)
 extern "C" __global__ void expand_i32_kernel(
     int* out, const int* inp,
+    const size_t* out_shape, const size_t* out_strides,
+    const size_t* inp_shape, const size_t* inp_strides,
+    size_t ndim, size_t total_elements
+) {
+    size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out_idx >= total_elements) return;
+    size_t coords[8];
+    size_t remaining = out_idx;
+    for (size_t d = 0; d < ndim; d++) {
+        coords[d] = remaining / out_strides[d];
+        remaining = remaining % out_strides[d];
+    }
+    size_t inp_idx = 0;
+    for (size_t d = 0; d < ndim; d++) {
+        size_t coord = (inp_shape[d] == 1) ? 0 : coords[d];
+        inp_idx += coord * inp_strides[d];
+    }
+    out[out_idx] = inp[inp_idx];
+}
+
+// Expand Bool: Broadcast 1-byte payload to output shape (up to 8 dims).
+// `unsigned char*` matches GpuTensor::Bool's u8-per-element storage.
+// Memcpy-class — pure stride lookup, no value arithmetic — so byte-level
+// identity is sufficient. M3.7b: GPT-2 / DistilBERT-INT8 attention path
+// broadcasts a Bool mask via Expand.
+extern "C" __global__ void expand_bool_kernel(
+    unsigned char* out, const unsigned char* inp,
     const size_t* out_shape, const size_t* out_strides,
     const size_t* inp_shape, const size_t* inp_strides,
     size_t ndim, size_t total_elements

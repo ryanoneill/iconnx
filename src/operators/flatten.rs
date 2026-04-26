@@ -66,6 +66,7 @@ impl Flatten {
             ),
             Tensor::Int8(arr) => Tensor::from_vec_i8(arr.iter().copied().collect(), target),
             Tensor::UInt8(arr) => Tensor::from_vec_u8(arr.iter().copied().collect(), target),
+            Tensor::Float16(arr) => Tensor::from_vec_f16(arr.iter().copied().collect(), target),
         }
     }
 }

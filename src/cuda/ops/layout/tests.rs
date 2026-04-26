@@ -199,8 +199,8 @@ fn test_transpose_2d() {
 fn test_where() {
     let (ctx, cache, mut pool) = setup();
 
-    let cond_data = vec![1.0f32, 0.0, 1.0, 0.0, 1.0];
-    let condition = GpuTensor::from_host_f32(&ctx, &cond_data, vec![5]).unwrap();
+    // WS-3 M3.5 sub-B: condition is now native Bool.
+    let condition = GpuTensor::from_host_bool(&ctx, &[true, false, true, false, true], vec![5]).unwrap();
 
     let x_data = vec![10.0f32, 20.0, 30.0, 40.0, 50.0];
     let x = GpuTensor::from_host_f32(&ctx, &x_data, vec![5]).unwrap();
@@ -716,11 +716,40 @@ fn test_nonzero() {
 
 #[test]
 #[ignore = "requires CUDA GPU"]
+fn test_nonzero_bool() {
+    // M3.7c: Kokoro's istft chain feeds a Bool comparison output into
+    // NonZero. Pre-fix this site unconditionally read host bytes via
+    // `to_host_f32` and panicked. Bool input must be accepted.
+    let (ctx, _cache, _pool) = setup();
+
+    let input = GpuTensor::from_host_bool(
+        &ctx,
+        &[false, true, false, true, true, false],
+        vec![6],
+    )
+    .unwrap();
+    let output = gpu_nonzero(&ctx, &input).unwrap();
+    let result = output.to_host_i64(&ctx).unwrap();
+    assert_eq!(output.shape(), &[1, 3]);
+    assert_eq!(result, vec![1i64, 3, 4]);
+
+    // 2D Bool: [[true, false], [false, true]] → indices (0,0) and (1,1).
+    let input_2d =
+        GpuTensor::from_host_bool(&ctx, &[true, false, false, true], vec![2, 2]).unwrap();
+    let output_2d = gpu_nonzero(&ctx, &input_2d).unwrap();
+    let result_2d = output_2d.to_host_i64(&ctx).unwrap();
+    assert_eq!(output_2d.shape(), &[2, 2]);
+    // Row indices [0, 1], Col indices [0, 1].
+    assert_eq!(result_2d, vec![0i64, 1, 0, 1]);
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
 fn test_where_i32() {
     let (ctx, cache, mut pool) = setup();
 
-    let cond_data = vec![1.0f32, 0.0, 1.0, 0.0, 1.0];
-    let condition = GpuTensor::from_host_f32(&ctx, &cond_data, vec![5]).unwrap();
+    // WS-3 M3.5 sub-B: condition is native Bool.
+    let condition = GpuTensor::from_host_bool(&ctx, &[true, false, true, false, true], vec![5]).unwrap();
 
     let x_data = vec![10i32, 20, 30, 40, 50];
     let x = GpuTensor::from_host_i32(&ctx, &x_data, vec![5]).unwrap();
@@ -775,6 +804,45 @@ fn test_expand_i32() {
     assert_eq!(result, expected);
 
     println!("Expand Int32 test passed!");
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn test_expand_bool() {
+    // M3.7b: GPT-2 / DistilBERT-INT8 attention path broadcasts a Bool
+    // mask via Expand. Bool is u8 underneath, byte-mirror kernel
+    // produces identical broadcast.
+    let (ctx, cache, mut pool) = setup();
+
+    // Expand [1, 3] -> [2, 3]: each row repeats the input.
+    let input_data = vec![true, false, true];
+    let input = GpuTensor::from_host_bool(&ctx, &input_data, vec![1, 3]).unwrap();
+
+    let output = gpu_expand(&ctx, &cache, &mut pool, &input, vec![2, 3]).unwrap();
+    let result = output.to_host_bool(&ctx).unwrap();
+
+    assert_eq!(output.shape(), &[2, 3]);
+    assert_eq!(
+        result,
+        vec![true, false, true, true, false, true],
+        "Expand Bool [1,3]→[2,3] should repeat the row"
+    );
+
+    // Trailing-1 broadcast: [3, 1] -> [3, 4].
+    let trailing_data = vec![true, false, true];
+    let trailing = GpuTensor::from_host_bool(&ctx, &trailing_data, vec![3, 1]).unwrap();
+    let trailing_out = gpu_expand(&ctx, &cache, &mut pool, &trailing, vec![3, 4]).unwrap();
+    let trailing_result = trailing_out.to_host_bool(&ctx).unwrap();
+    assert_eq!(trailing_out.shape(), &[3, 4]);
+    assert_eq!(
+        trailing_result,
+        vec![
+            true, true, true, true,
+            false, false, false, false,
+            true, true, true, true,
+        ],
+        "Expand Bool [3,1]→[3,4] should broadcast each scalar across the new axis"
+    );
 }
 
 #[test]

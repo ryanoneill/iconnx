@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::cuda::inference::fusion::{FusedPatternInfo, detect_fused_patterns_from_cpu};
+use crate::cuda::inference::fusion::{FusedPattern, FusedPatternInfo, detect_fused_patterns_from_cpu};
 use crate::ir::graph::OptimizableGraph;
 
 /// Result of the fusion pass — attached to an `OptimizableGraph` so
@@ -25,6 +25,172 @@ pub fn detect_fusion(graph: &OptimizableGraph) -> FusionAnnotations {
     let (heads, skipped, dynamic_candidates) =
         detect_fused_patterns_from_cpu(&graph.nodes, &graph.initializers);
     FusionAnnotations { heads, skipped, dynamic_candidates }
+}
+
+/// Drop fused patterns whose participating static values (initializers
+/// or `Constant` node outputs) carry a non-Float32 dtype (notably
+/// Float16 for Whisper-FP16). `gpu_fused_div_rsqrt` and the other fused
+/// kernels are sealed to f32 today, so the op-by-op fallback is the
+/// only correct dispatch path for FP16 graphs. Gating here keeps fused
+/// dispatch correct rather than panicking inside
+/// `eps_tensor.to_host_f32(...)`. A full FP16 fused kernel suite is a
+/// separate post-Phase-3 effort.
+///
+/// Constant node outputs are inspected because Whisper-FP16 exports its
+/// LayerNorm `eps` as a `Constant` node (not an initializer). Only
+/// checking `graph.initializers` would miss this case. Both surfaces
+/// are valid producer locations for a "static" tensor.
+///
+/// Applies to both static heads and dynamic candidates. Static heads
+/// also have their interior nodes cleaned out of `skipped` so the
+/// fallback path can execute them.
+pub fn gate_fusion_to_float32(
+    mut annotations: FusionAnnotations,
+    graph: &OptimizableGraph,
+) -> FusionAnnotations {
+    let static_dtypes = collect_static_dtypes(graph);
+    drop_non_f32_patterns(
+        &mut annotations.heads,
+        &mut annotations.skipped,
+        &static_dtypes,
+        true,
+    );
+    drop_non_f32_patterns(
+        &mut annotations.dynamic_candidates,
+        &mut annotations.skipped,
+        &static_dtypes,
+        false,
+    );
+    annotations
+}
+
+/// Build a `name → dtype-name` map covering every static tensor in the
+/// graph: initializers and `Constant` node outputs. Dtype is recorded as
+/// the string from `Tensor::dtype()` so the helper can be dtype-agnostic.
+fn collect_static_dtypes(graph: &OptimizableGraph) -> HashMap<String, &'static str> {
+    let mut dtypes: HashMap<String, &'static str> = HashMap::new();
+    for (name, tensor) in &graph.initializers {
+        dtypes.insert(name.clone(), tensor.dtype());
+    }
+    for node in &graph.nodes {
+        if node.op_type != "Constant" {
+            continue;
+        }
+        if let Some(value) = node.attributes.resolve_constant_value() {
+            if let Some(out) = node.outputs.first() {
+                dtypes.insert(out.clone(), value.dtype());
+            }
+        }
+    }
+    dtypes
+}
+
+/// Remove patterns whose participating tensor names point at a static
+/// value (initializer or Constant node output) with non-Float32 dtype.
+/// Static patterns (`heads`) also clean their interior nodes out of
+/// `skipped` so the fallback path can execute them. Dynamic candidates
+/// don't contribute to `skipped` (per detector docs), so the
+/// `clean_skipped` flag flips that behavior.
+fn drop_non_f32_patterns(
+    patterns: &mut HashMap<String, FusedPatternInfo>,
+    skipped: &mut HashSet<String>,
+    static_dtypes: &HashMap<String, &'static str>,
+    clean_skipped: bool,
+) {
+    let drop_keys: Vec<String> = patterns
+        .iter()
+        .filter_map(|(head, info)| {
+            if pattern_touches_non_f32_static(&info.pattern, static_dtypes) {
+                Some(head.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for head in drop_keys {
+        let info = patterns.remove(&head).expect("just collected");
+        if clean_skipped {
+            for interior in &info.nodes_to_skip {
+                skipped.remove(interior);
+            }
+        }
+    }
+}
+
+/// True iff any of the pattern's input tensor names corresponds to a
+/// static value (initializer or Constant) whose dtype is not `"float32"`.
+/// Inputs not present in the static-dtype map (i.e. runtime values) are
+/// ignored — their dtype isn't known at IR-pass time, so they don't
+/// influence the gate.
+fn pattern_touches_non_f32_static(
+    pattern: &FusedPattern,
+    static_dtypes: &HashMap<String, &'static str>,
+) -> bool {
+    let inputs = pattern_input_names(pattern);
+    inputs.iter().any(|name| {
+        static_dtypes
+            .get(*name)
+            .map(|dt| *dt != "float32")
+            .unwrap_or(false)
+    })
+}
+
+/// All tensor input names referenced by a fused pattern. Output names
+/// are excluded — only inputs participate in the dtype gate.
+fn pattern_input_names(pattern: &FusedPattern) -> Vec<&str> {
+    match pattern {
+        FusedPattern::DivRsqrt {
+            numerator_input,
+            variance_input,
+            eps_input,
+            ..
+        } => vec![numerator_input, variance_input, eps_input],
+        FusedPattern::AddMulAdd {
+            x_input,
+            a_input,
+            b_input,
+            c_input,
+            ..
+        } => vec![x_input, a_input, b_input, c_input],
+        FusedPattern::Gelu { x_input, .. } => vec![x_input],
+        FusedPattern::MulAdd {
+            a_input,
+            b_input,
+            c_input,
+            ..
+        } => vec![a_input, b_input, c_input],
+        FusedPattern::AddMul {
+            a_input,
+            b_input,
+            c_input,
+            ..
+        } => vec![a_input, b_input, c_input],
+        FusedPattern::SubMul {
+            a_input,
+            b_input,
+            c_input,
+            ..
+        } => vec![a_input, b_input, c_input],
+        FusedPattern::DivMul {
+            a_input,
+            b_input,
+            c_input,
+            ..
+        } => vec![a_input, b_input, c_input],
+        FusedPattern::MulSinPowMulAdd {
+            x_input,
+            w0_input,
+            w1_input,
+            b_input,
+            p_input,
+            ..
+        } => vec![x_input, w0_input, w1_input, b_input, p_input],
+        FusedPattern::GeneralChain { input_name, .. } => vec![input_name],
+    }
+    .into_iter()
+    .map(String::as_str)
+    .collect()
 }
 
 #[cfg(test)]

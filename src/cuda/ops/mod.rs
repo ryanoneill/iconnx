@@ -12,6 +12,7 @@ mod cache;
 mod cast;
 mod comparison;
 mod kernels;
+mod kernels_fp16;
 mod layout;
 mod quantize;
 mod quantize_kernels;

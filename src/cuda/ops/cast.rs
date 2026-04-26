@@ -168,7 +168,104 @@ pub fn gpu_cast(
         | (DType::Int64, DType::Int64)
         | (DType::Int32, DType::Int32)
         | (DType::Int8, DType::Int8)
-        | (DType::UInt8, DType::UInt8) => unreachable!("Same-type cast handled above"),
+        | (DType::UInt8, DType::UInt8)
+        | (DType::Float16, DType::Float16)
+        | (DType::Bool, DType::Bool) => unreachable!("Same-type cast handled above"),
+
+        // WS-3 M3.5: FP16 boundary casts. Float16 ↔ Float32 is the
+        // primary boundary for Whisper's mixed-precision attention;
+        // Float16 ↔ Int32 / Int64 covers shape-arithmetic results being
+        // mixed back into FP16 paths.
+        (DType::Float16, DType::Float32) => {
+            let mut output = GpuTensor::zeros_f32(ctx, shape)?;
+            // SAFETY: cast_f16_to_f32_kernel: `(float* out, const __half* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<f32, half::f16>(
+                    ctx,
+                    cache,
+                    "cast_f16_to_f32_kernel",
+                    output.data_f32_mut()?,
+                    input.data_f16()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Float32, DType::Float16) => {
+            let mut output = GpuTensor::zeros_f16(ctx, shape)?;
+            // SAFETY: cast_f32_to_f16_kernel: `(__half* out, const float* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<half::f16, f32>(
+                    ctx,
+                    cache,
+                    "cast_f32_to_f16_kernel",
+                    output.data_f16_mut()?,
+                    input.data_f32()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Float16, DType::Int32) => {
+            let mut output = GpuTensor::zeros_i32(ctx, shape)?;
+            // SAFETY: cast_f16_to_i32_kernel: `(int* out, const __half* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<i32, half::f16>(
+                    ctx,
+                    cache,
+                    "cast_f16_to_i32_kernel",
+                    output.data_i32_mut()?,
+                    input.data_f16()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Int32, DType::Float16) => {
+            let mut output = GpuTensor::zeros_f16(ctx, shape)?;
+            // SAFETY: cast_i32_to_f16_kernel: `(__half* out, const int* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<half::f16, i32>(
+                    ctx,
+                    cache,
+                    "cast_i32_to_f16_kernel",
+                    output.data_f16_mut()?,
+                    input.data_i32()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Float16, DType::Int64) => {
+            let mut output = GpuTensor::zeros_i64(ctx, shape)?;
+            // SAFETY: cast_f16_to_i64_kernel: `(long long* out, const __half* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<i64, half::f16>(
+                    ctx,
+                    cache,
+                    "cast_f16_to_i64_kernel",
+                    output.data_i64_mut()?,
+                    input.data_f16()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Int64, DType::Float16) => {
+            let mut output = GpuTensor::zeros_f16(ctx, shape)?;
+            // SAFETY: cast_i64_to_f16_kernel: `(__half* out, const long long* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<half::f16, i64>(
+                    ctx,
+                    cache,
+                    "cast_i64_to_f16_kernel",
+                    output.data_f16_mut()?,
+                    input.data_i64()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
 
         // INT8/UINT8 casts: WS-4 quantization graph dequantizes via
         // DequantizeLinear (M4.5) and quantizes via DynamicQuantizeLinear
@@ -176,6 +273,113 @@ pub fn gpu_cast(
         (DType::Int8, _) | (DType::UInt8, _) | (_, DType::Int8) | (_, DType::UInt8) => {
             Err(CudaError::Kernel(format!(
                 "Cast does not support {} -> {} (WS-4 — INT8/UINT8 should use DequantizeLinear / DynamicQuantizeLinear, not Cast)",
+                src_dtype.name(),
+                target_dtype.name()
+            )))
+        }
+
+        // WS-3 M3.5 sub-B: ONNX Cast(to=BOOL) produces native
+        // GpuTensor::Bool. Reverse direction (Bool→numeric) emits 0/1.
+        // Float16 ↔ Bool stays unsupported — no active graph routes
+        // FP16 through a Bool cast and the round-trip would lose
+        // information (every non-zero f16 → 1, then 1 → 1.0_f16).
+        (DType::Float32, DType::Bool) => {
+            let mut output = GpuTensor::zeros_bool(ctx, shape)?;
+            // SAFETY: cast_f32_to_bool_kernel: `(unsigned char* out, const float* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<u8, f32>(
+                    ctx,
+                    cache,
+                    "cast_f32_to_bool_kernel",
+                    output.data_bool_mut()?,
+                    input.data_f32()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Int32, DType::Bool) => {
+            let mut output = GpuTensor::zeros_bool(ctx, shape)?;
+            // SAFETY: cast_i32_to_bool_kernel: `(unsigned char* out, const int* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<u8, i32>(
+                    ctx,
+                    cache,
+                    "cast_i32_to_bool_kernel",
+                    output.data_bool_mut()?,
+                    input.data_i32()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Int64, DType::Bool) => {
+            let mut output = GpuTensor::zeros_bool(ctx, shape)?;
+            // SAFETY: cast_i64_to_bool_kernel: `(unsigned char* out, const long long* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<u8, i64>(
+                    ctx,
+                    cache,
+                    "cast_i64_to_bool_kernel",
+                    output.data_bool_mut()?,
+                    input.data_i64()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Bool, DType::Float32) => {
+            let mut output = GpuTensor::zeros_f32(ctx, shape)?;
+            // SAFETY: cast_bool_to_f32_kernel: `(float* out, const unsigned char* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<f32, u8>(
+                    ctx,
+                    cache,
+                    "cast_bool_to_f32_kernel",
+                    output.data_f32_mut()?,
+                    input.data_bool()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Bool, DType::Int32) => {
+            let mut output = GpuTensor::zeros_i32(ctx, shape)?;
+            // SAFETY: cast_bool_to_i32_kernel: `(int* out, const unsigned char* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<i32, u8>(
+                    ctx,
+                    cache,
+                    "cast_bool_to_i32_kernel",
+                    output.data_i32_mut()?,
+                    input.data_bool()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Bool, DType::Int64) => {
+            let mut output = GpuTensor::zeros_i64(ctx, shape)?;
+            // SAFETY: cast_bool_to_i64_kernel: `(long long* out, const unsigned char* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<i64, u8>(
+                    ctx,
+                    cache,
+                    "cast_bool_to_i64_kernel",
+                    output.data_i64_mut()?,
+                    input.data_bool()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+
+        // Float16 ↔ Bool: no active graph routes FP16 through a Bool
+        // cast; round-trip would lose information (every non-zero f16 → 1,
+        // then 1 → 1.0_f16). Stay loud rather than silently truncating.
+        (DType::Float16, DType::Bool) | (DType::Bool, DType::Float16) => {
+            Err(CudaError::Kernel(format!(
+                "Cast does not support {} -> {} (no active model graph requires this; would lose information)",
                 src_dtype.name(),
                 target_dtype.name()
             )))
