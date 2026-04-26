@@ -446,15 +446,13 @@ Tests: `tests/softmax_float16_test.rs::softmax_float16_matches_ort_within_1e_3`.
 git commit -S -m "feat(cuda): add FP16 reduction (Softmax/ReduceMean) with f32 accumulator (WS-3 M3.4 sub-3)"
 ```
 
-- [ ] **Step 5: Conv FP16 path (sub-commit 4)**
+- [x] **Step 5: Conv FP16 path — deferred to M3.6**
 
-cuDNN supports FP16 conv natively. In `src/cuda/cudnn/conv.rs`: extend the descriptor builder to accept `DType::Float16` → `CUDNN_DATA_HALF`. Algorithm selection should still work; cuDNN handles FP16 algos transparently via the descriptor.
+**Original plan-text directed work at `src/cuda/cudnn/conv.rs` and `CUDNN_DATA_HALF` descriptor wiring. That file does not exist and the directive was a plan-author drift bug.** Conv in this codebase is **not** cuDNN-based — `gpu_conv2d` (`src/cuda/conv/forward.rs:147`) lowers via im2col + cuBLAS GEMM (`gpu_gemm`). FP16 conv is therefore structurally GEMM-dependent, not a descriptor knob, and the natural place for it is M3.6 alongside MatMul (which leadline confirmed: M3.6's milestone title is "MatMul + Conv FP16 GPU paths").
 
-Test: `tests/conv_float16_test.rs::conv_float16_3x3_matches_ort_within_1e_3` — small Whisper-shape conv (e.g., `[1, 80, 3000] × [1500, 80, 3]` style).
+When M3.6 lands the FP16 GEMM dispatch in `gpu_gemm`, Conv FP16 should light up automatically via the existing `gpu_conv2d → gpu_gemm` path. The M3.6 acceptance test (added by the M3.6 milestone) must explicitly assert that `gpu_conv2d` with FP16 inputs stays FP16 end-to-end — no silent f32 coercion at the `im2col → GEMM` seam.
 
-```bash
-git commit -S -m "feat(cuda): add Float16 to cuDNN Conv descriptor (WS-3 M3.4 sub-4)"
-```
+M3.4 closes at sub-3. The 19-op breadth target landed as: 7 memcpy (sub-1) + 7 elementwise (sub-2) + 2 reduction (sub-3) = 16 ops. The remaining 3 (Conv, MatMul, Cast) are routed to their natural milestones — Conv + MatMul → M3.6 (GEMM-bound), Cast → M3.5 (conversion-bound).
 
 - [ ] **Step 6: M3.4 acceptance — graph-level shape inference passes**
 
@@ -571,9 +569,10 @@ git commit -S -m "feat(ops): Cast FP16↔Float32 + Bool routing for comparison/W
 ## Milestone M3.6 — MatMul + Conv FP16 GPU paths
 
 **Files:**
-- Modify: `src/cuda/ops/matmul.rs` (FP16 GEMM dispatch)
-- Modify: `src/cuda/cudnn/conv.rs` (already updated in M3.4 sub-4; double-check)
+- Modify: `src/cuda/matmul.rs` (FP16 GEMM dispatch — adds Float16 arm to `gpu_gemm` / `gpu_matmul`)
+- Modify: `src/cuda/conv/forward.rs` (Conv FP16 — deferred from M3.4 sub-4; the path is `gpu_conv2d → gpu_im2col → gpu_gemm`, so FP16 lights up once `gpu_gemm` accepts Float16, plus the im2col kernel needs an FP16 mirror — memcpy-class, like M3.4 sub-1)
 - Test: `tests/matmul_float16_test.rs` (NEW)
+- Test: `tests/conv_float16_test.rs` (NEW — explicit FP16-end-to-end assertion at the `im2col → GEMM` seam, no silent f32 coercion)
 
 **Branch decision — garboard FP16 binding status:**
 - IF garboard ships its FP16 GEMM binding before M3.6 entry: use it. cuBLAS handles dispatch / Tensor Cores transparently.
