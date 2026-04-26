@@ -487,7 +487,7 @@ fn whisper_fp16_lowers_without_panic() {
 - Modify: `src/operators/cast.rs` (CPU forward)
 - Modify: `src/cuda/ops/cast.rs` (GPU dispatch)
 - Modify: `src/cuda/ops/comparison.rs` (Bool output)
-- Modify: `src/cuda/ops/sequence.rs` (Where consumes Bool)
+- Modify: `src/cuda/ops/layout/mod.rs` (Where consumes Bool — `gpu_where` lives here, around line 433, NOT in `sequence.rs`; `sequence.rs` is CumSum)
 - Test: `tests/cast_float16_test.rs` (NEW)
 - Test: `tests/bool_routing_test.rs` (NEW)
 
@@ -547,11 +547,13 @@ In `src/cuda/ops/cast.rs::dispatch_cast`: add the `(Float16, Float32)`, `(Float3
 
 - [ ] **Step 5: Comparison ops produce Bool natively**
 
-In `src/cuda/ops/comparison.rs`: change kernel output dtype from `f32` (1.0/0.0) to `u8` (1/0); wrap in `GpuTensor::Bool`. Update kernels' output pointer type. Existing f32-Bool consumers (only Where today, per audit) get updated in step 6.
+In `src/cuda/ops/comparison.rs`: change kernel output dtype from `f32` (1.0/0.0) to `u8` (1/0); wrap in `GpuTensor::Bool`. Update kernels' output pointer type. Existing f32-Bool consumers (only `gpu_where` today, per audit) get updated in step 6.
+
+**Enumerate every kernel site touched** (per leadline 2026-04-25 advisor pass — avoids missing one and surfacing as runtime panic in M3.7). Six comparison ops (Equal / Less / Greater / GreaterOrEqual / LessOrEqual / NotEqual), each with its three dtype arms (Float32 / Int64 / Int32) — **18 NVRTC kernel sites total**. The kernel source lives alongside the dispatch in `src/cuda/ops/comparison.rs`; rename each output-pointer type from `float*` to `unsigned char*` and the body's write from `out[i] = (cond ? 1.0f : 0.0f);` to `out[i] = (cond ? 1u : 0u);`. Confirm via `grep -c "extern \"C\" __global__ void" src/cuda/ops/comparison.rs` ≥ 18 (or check the kernel-name list against the count if it's structured differently).
 
 - [ ] **Step 6: Where consumes Bool**
 
-In `src/cuda/ops/sequence.rs::dispatch_where`: change condition input handling from `data_f32()?` to `data_bool()?`. Kernel reads the condition as `u8` (nonzero = true).
+In `src/cuda/ops/layout/mod.rs::gpu_where` (around line 433 — `gpu_where` is in `layout/mod.rs`, NOT in `sequence.rs` which is CumSum-only): change condition input handling from `data_f32()?` to `data_bool()?`. Kernel reads the condition as `u8` (nonzero = true).
 
 - [ ] **Step 7: Run all tests**
 
@@ -574,9 +576,11 @@ git commit -S -m "feat(ops): Cast FP16↔Float32 + Bool routing for comparison/W
 - Test: `tests/matmul_float16_test.rs` (NEW)
 
 **Branch decision — garboard FP16 binding status:**
-- IF garboard ships `cublasGemmEx` FP16 binding (FP16 IO + FP32 accumulate) before M3.6 entry: use it. cuBLAS handles dispatch / Tensor Cores transparently.
-- IF garboard binding slips: write NVRTC FP16 GEMM. Naive tiled `__half` × `__half` → FP32 accumulator → `__half` output. Adequate for correctness; perf falls behind cuBLAS but this is correctness-only per leadline.
-- DECISION POINT: at M3.6 entry, `cargo update -p garboard && grep -n "gemm_ex\|fp16\|f16" $(find ~/.cargo/registry/src -path '*garboard*' -name '*.rs' 2>/dev/null) | head -20`. If FP16 gemm function visible, take Path A (cuBLAS). Else Path B (NVRTC).
+- IF garboard ships its FP16 GEMM binding before M3.6 entry: use it. cuBLAS handles dispatch / Tensor Cores transparently.
+  - **Default:** `gemm_fp16_acc32` (CUBLAS_COMPUTE_32F — FP32 accumulator with FP16 IO). This is the correct primitive for Whisper attention's long-K matmuls (`[1, 1500, 384] × [384, 384]`); a pure-FP16 accumulator overflows on K=1500-class reductions. Per leadline advisor pass 2026-04-25.
+  - `gemm_fp16` (CUBLAS_COMPUTE_16F — FP16 accumulator) is **reserved for the perf workstream**, not used in WS-3 M3.6.
+- IF garboard binding slips: write NVRTC FP16 GEMM. Naive tiled `__half` × `__half` → FP32 accumulator → `__half` output (mirrors `gemm_fp16_acc32` semantics). Adequate for correctness; perf falls behind cuBLAS but this is correctness-only per leadline.
+- DECISION POINT: at M3.6 entry, `cargo update -p garboard && grep -n "gemm_fp16_acc32\|gemm_fp16\|fp16\|f16" $(find ~/.cargo/registry/src -path '*garboard*' -name '*.rs' 2>/dev/null) | head -20`. If `gemm_fp16_acc32` visible, take Path A (cuBLAS). Else Path B (NVRTC).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -609,7 +613,7 @@ fn matmul_float16_whisper_attention_shape() {
 
 - [ ] **Step 3a (Path A — garboard FP16 ready): cuBLAS dispatch**
 
-Wire `gpu_matmul` FP16 arm through garboard's FP16 GEMM binding. Pattern mirrors the existing f32 cuBLAS dispatch.
+Wire `gpu_matmul` FP16 arm through garboard's `gemm_fp16_acc32` (CUBLAS_COMPUTE_32F: FP16 IO + FP32 accumulator). Pattern mirrors the existing f32 cuBLAS dispatch. Do NOT use the pure-FP16 accumulator variant here — Whisper's K=1500 attention reductions need the f32 accumulator for numerical stability.
 
 - [ ] **Step 3b (Path B — garboard slip): NVRTC FP16 GEMM**
 
@@ -684,7 +688,7 @@ fn whisper_encoder_fp16_loads_and_lowers() {
 - [ ] **Step 3: leadline-bench prep**
 
 Cross-repo work in `rust-ai-explorations`:
-- Add `WhisperEncoderFp16` variant to `ModelProfile` in `leadline-bench/src/lib.rs` (mirror `DistilBertInt8` structure). Default tolerance 1e-2.
+- Add `WhisperEncoderFp16` variant to `ModelProfile` in `leadline-bench/src/model.rs` (NOT `src/lib.rs` — `ModelProfile` lives in the `model` submodule; mirror `DistilBertInt8` structure). Default tolerance 1e-2.
 - Probe-ops list already covers the 19 ops; no probe-ops change needed.
 
 These are signed chore commits on rust-ai-explorations main; leadline relay 2026-04-25 confirms the same prep cadence as WS-4 M4.7.
@@ -700,6 +704,8 @@ cargo run --release -p leadline-bench --bin compare -- \
 ```
 
 Acceptance: `Tolerance gate: PASS (max_abs_diff <= 0.01)`.
+
+**Tolerance-form contingency (informational, per leadline 2026-04-25 advisor pass):** Garboard's empirical FP16 study suggests that flat absolute tolerance (1e-2) under-fits long-K reductions where the per-element error scales with output magnitude. If the gate fails ONLY on outlier elements with large absolute values (high logit magnitudes — Whisper's encoder output is per-frame mel-scale features, so this is plausible), iterate at M3.7 entry to a `max(rel%, abs)` form: `max_abs_diff` ≤ 1e-2 OR (max_abs_diff / max_abs_value) ≤ 0.5%. Keep flat 1e-2 as the first-pass gate; only relax to relative-or-absolute if the data forces it. Document the swap in the M3.7 commit if used.
 
 If FAIL, expect surfaced gaps mirroring M4.7's pattern (silent-drop in upload_initializers, missing dispatch arms, fusion matchers needing tighter shape contracts). The plan-oversight checklist in M3.4 step 8 should have caught most of these; remaining ones get patches in this milestone with explicit "M3.7 surfaced X" entries in commit messages.
 
