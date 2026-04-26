@@ -20,6 +20,10 @@ prost = "0.13"
 # CPU tensors
 ndarray = "0.16"
 
+# IEEE binary16 (Float16 / FP16) support — `half::f16` element type for
+# `Tensor::Float16` and (post-M3.3) `GpuTensor::Float16`. WS-3 M3.1.
+half = "2"
+
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"

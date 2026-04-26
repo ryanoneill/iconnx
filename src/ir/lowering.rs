@@ -267,9 +267,12 @@ fn upload_initializers(
             Tensor::UInt8(_) => {
                 GpuTensor::from_host_u8(ctx, &tensor.as_slice_u8(), tensor.shape().to_vec())?
             }
-            // Float64 and Bool have no GPU dtype today; skip and let
-            // the first downstream consumer error explicitly.
-            Tensor::Float64(_) | Tensor::Bool(_) => continue,
+            // Float64 has no GPU dtype today; skip and let the first
+            // downstream consumer error explicitly. Float16 and Bool
+            // GPU paths land in WS-3 M3.3 — until then, the same
+            // explicit-skip pattern keeps the silent-drop visible to
+            // anyone touching the file.
+            Tensor::Float64(_) | Tensor::Bool(_) | Tensor::Float16(_) => continue,
         };
         out.insert(name.clone(), gpu);
     }
