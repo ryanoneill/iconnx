@@ -1,0 +1,94 @@
+# CPU-only CI for iconnx.
+#
+# What this gates:
+#   - cargo build --features cuda (default; compile errors)
+#   - cargo clippy --all-targets --features cuda -- -D warnings
+#   - cargo clippy --all-targets --features cuda,debug-inference -- -D warnings
+#   - cargo test --lib (CPU-side logic regressions)
+#
+# What this does NOT gate (manual + local-only):
+#   - GPU integration tests under tests/ (require CUDA-capable hardware)
+#   - End-to-end roster sweep via leadline-bench
+#
+# What this does NOT YET gate (deferred):
+#   - cargo build --no-default-features — currently broken in main
+#     (src/ir/plan.rs cuda imports leak through the cfg gates).
+#     Adding this step would render CI red on day one. Track as a
+#     separate cleanup workstream; once green, add a step here.
+#   - cargo fmt -- --check — main currently carries ~600 fmt diff
+#     blocks across ~168 files of pre-existing drift. Adding this
+#     step would render CI red on day one. Track as a separate
+#     `style: cargo fmt across tree` cleanup; once main is fmt-clean,
+#     add a step here.
+#
+# CI uses CPU-only ubuntu runners with CUDA development libraries
+# installed (no GPU driver). Build links against libcudart / libnvrtc /
+# libcublas / libcudnn but no kernel actually runs — sufficient to gate
+# compile + clippy + library-level test logic.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test:
+    name: build + clippy + lib tests (CUDA libs, no GPU)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache CUDA apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: cuda-apt-12.8-${{ runner.os }}-v1
+
+      - name: Install CUDA development libraries
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cuda-cudart-dev-12-8 \
+            cuda-nvrtc-dev-12-8 \
+            libcublas-dev-12-8 \
+            libcudnn9-dev-cuda-12
+
+      - name: Configure CUDA environment
+        run: |
+          echo "CUDA_PATH=/usr/local/cuda" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (default features = cuda)
+        run: cargo build --all-targets
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (cuda + debug-inference)
+        run: cargo clippy --all-targets --features debug-inference -- -D warnings
+
+      - name: Lib tests
+        # `--lib` skips integration tests under tests/ that require a
+        # real GPU at runtime (most are gated #[ignore = "requires
+        # CUDA GPU"] anyway, but --lib also avoids the link-and-skip
+        # cost).
+        run: cargo test --lib
