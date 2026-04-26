@@ -383,7 +383,7 @@ pub(super) fn store_outputs(
     // governed by `tensor_last_use` like any other intermediate tensor.
     if outputs_vec.len() > 1 {
         let names = &op.node.outputs;
-        for (name, tensor) in names.iter().zip(outputs_vec.into_iter()) {
+        for (name, tensor) in names.iter().zip(outputs_vec) {
             if !name.is_empty() {
                 values.insert(name.clone(), tensor);
             }

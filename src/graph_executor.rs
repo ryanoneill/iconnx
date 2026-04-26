@@ -192,7 +192,7 @@ impl GraphExecutor {
                     &node.attributes,
                     node.outputs.len(),
                 );
-                for (name, tensor) in node.outputs.iter().zip(split_outputs.into_iter()) {
+                for (name, tensor) in node.outputs.iter().zip(split_outputs) {
                     if !name.is_empty() {
                         values.insert(name.clone(), tensor);
                     }
@@ -207,7 +207,7 @@ impl GraphExecutor {
                     &input_tensors,
                     &node.attributes,
                 );
-                for (name, tensor) in node.outputs.iter().zip(outs.into_iter()) {
+                for (name, tensor) in node.outputs.iter().zip(outs) {
                     if !name.is_empty() {
                         values.insert(name.clone(), tensor);
                     }
@@ -499,7 +499,7 @@ impl GraphExecutor {
                     &node.attributes,
                     node.outputs.len(),
                 );
-                for (name, tensor) in node.outputs.iter().zip(split_outputs.into_iter()) {
+                for (name, tensor) in node.outputs.iter().zip(split_outputs) {
                     if !name.is_empty() {
                         values.insert(name.clone(), tensor);
                     }
@@ -514,7 +514,7 @@ impl GraphExecutor {
                     &input_tensors,
                     &node.attributes,
                 );
-                for (name, tensor) in node.outputs.iter().zip(outs.into_iter()) {
+                for (name, tensor) in node.outputs.iter().zip(outs) {
                     if !name.is_empty() {
                         values.insert(name.clone(), tensor);
                     }

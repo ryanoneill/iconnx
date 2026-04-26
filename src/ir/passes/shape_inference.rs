@@ -67,7 +67,7 @@ pub fn tensor_shapes_from_graph(graph: &OptimizableGraph) -> HashMap<String, Sha
     // topo-sorted by the time this runs).
     for node in &graph.nodes {
         let out_shapes = infer_node_output_shapes(node, &shapes, initializers);
-        for (name, shape) in node.outputs.iter().zip(out_shapes.into_iter()) {
+        for (name, shape) in node.outputs.iter().zip(out_shapes) {
             if !name.is_empty() {
                 shapes.insert(name.clone(), shape);
             }

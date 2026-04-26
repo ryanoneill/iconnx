@@ -136,7 +136,7 @@ impl ProfileData {
 
         eprintln!("\n=== Top Operators by Time ===");
         let mut sorted_ops: Vec<_> = self.op_times.iter().collect();
-        sorted_ops.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        sorted_ops.sort_by_key(|a| std::cmp::Reverse(a.1.0));
 
         for (op, (time_us, count)) in sorted_ops.iter().take(15) {
             let avg = *time_us as f64 / *count as f64;
@@ -149,7 +149,7 @@ impl ProfileData {
         if !self.gpu_op_times.is_empty() {
             eprintln!("\n=== Top Operators by GPU-Side Time (CUDA events) ===");
             let mut sorted_gpu: Vec<_> = self.gpu_op_times.iter().collect();
-            sorted_gpu.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            sorted_gpu.sort_by_key(|a| std::cmp::Reverse(a.1.0));
 
             for (op, (time_us, count)) in sorted_gpu.iter().take(15) {
                 let cpu_us = self.op_times.get(*op).map(|(t, _)| *t).unwrap_or(0);

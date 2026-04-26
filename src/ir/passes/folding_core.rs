@@ -44,7 +44,7 @@ pub fn fold_with_predicate(
 
     for node in graph.nodes.into_iter() {
         if let Some(outputs) = try_fold(&node, &graph.initializers, &folded, &extra_foldable) {
-            for (name, tensor) in node.outputs.iter().zip(outputs.into_iter()) {
+            for (name, tensor) in node.outputs.iter().zip(outputs) {
                 if !name.is_empty() {
                     folded.insert(name.clone(), tensor);
                 }

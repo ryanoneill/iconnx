@@ -559,8 +559,8 @@ impl Executor {
                 }
 
                 if let Some(idx) = neg_one_idx {
-                    if known_product > 0 {
-                        new_shape[idx] = input_len / known_product;
+                    if let Some(quot) = input_len.checked_div(known_product) {
+                        new_shape[idx] = quot;
                     }
                 }
 
