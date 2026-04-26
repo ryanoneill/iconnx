@@ -492,6 +492,13 @@ pub fn gpu_where(
     assert_eq!(x.len(), n, "x length mismatch");
     assert_eq!(y.len(), n, "y length mismatch");
 
+    if condition.dtype() != crate::cuda::tensor::DType::Bool {
+        return Err(CudaError::Kernel(format!(
+            "Where: condition must be Bool, got {} (WS-3 M3.5 — comparison/Cast→Bool produce native Bool now; non-Bool conditions need an explicit Cast→Bool upstream)",
+            condition.dtype().name()
+        )));
+    }
+
     let dtype = x.dtype();
     if y.dtype() != dtype {
         return Err(CudaError::Kernel(format!(
@@ -507,12 +514,12 @@ pub fn gpu_where(
     match dtype {
         crate::cuda::tensor::DType::Float32 => {
             let mut output = pool.get_tensor_f32(ctx, condition.shape().to_vec())?;
-            // SAFETY: where_kernel takes (float* out, const float* condition,
+            // SAFETY: where_kernel takes (float* out, const unsigned char* condition,
             //   const float* x, const float* y, size_t n).
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
                     &mut garboard::DeviceSlice<'_, f32>,
-                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u8>,
                     &garboard::DeviceSlice<'_, f32>,
                     &garboard::DeviceSlice<'_, f32>,
                     usize,
@@ -525,7 +532,7 @@ pub fn gpu_where(
                     &config,
                     (
                         output.data_f32_mut()?,
-                        condition.data_f32()?,
+                        condition.data_bool()?,
                         x.data_f32()?,
                         y.data_f32()?,
                         n,
@@ -536,12 +543,12 @@ pub fn gpu_where(
         }
         crate::cuda::tensor::DType::Int64 => {
             let mut output = pool.get_tensor_i64(ctx, condition.shape().to_vec())?;
-            // SAFETY: where_i64_kernel takes (long long* out, const float* condition,
+            // SAFETY: where_i64_kernel takes (long long* out, const unsigned char* condition,
             //   const long long* x, const long long* y, size_t n).
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
                     &mut garboard::DeviceSlice<'_, i64>,
-                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u8>,
                     &garboard::DeviceSlice<'_, i64>,
                     &garboard::DeviceSlice<'_, i64>,
                     usize,
@@ -554,7 +561,7 @@ pub fn gpu_where(
                     &config,
                     (
                         output.data_i64_mut()?,
-                        condition.data_f32()?,
+                        condition.data_bool()?,
                         x.data_i64()?,
                         y.data_i64()?,
                         n,
@@ -565,12 +572,12 @@ pub fn gpu_where(
         }
         crate::cuda::tensor::DType::Int32 => {
             let mut output = pool.get_tensor_i32(ctx, condition.shape().to_vec())?;
-            // SAFETY: where_i32_kernel takes (int* out, const float* condition,
+            // SAFETY: where_i32_kernel takes (int* out, const unsigned char* condition,
             //   const int* x, const int* y, size_t n).
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
                     &mut garboard::DeviceSlice<'_, i32>,
-                    &garboard::DeviceSlice<'_, f32>,
+                    &garboard::DeviceSlice<'_, u8>,
                     &garboard::DeviceSlice<'_, i32>,
                     &garboard::DeviceSlice<'_, i32>,
                     usize,
@@ -583,7 +590,7 @@ pub fn gpu_where(
                     &config,
                     (
                         output.data_i32_mut()?,
-                        condition.data_f32()?,
+                        condition.data_bool()?,
                         x.data_i32()?,
                         y.data_i32()?,
                         n,
@@ -600,7 +607,7 @@ pub fn gpu_where(
         }
         crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
             Err(CudaError::Kernel(format!(
-                "Where does not support {} (WS-3 M3.5 — Float16/Bool dispatch arm pending)",
+                "Where does not support {} for x/y (Whisper-FP16 doesn't route FP16 through Where; Bool x/y not on any active graph)",
                 dtype.name()
             )))
         }

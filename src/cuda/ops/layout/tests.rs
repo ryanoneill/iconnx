@@ -199,8 +199,8 @@ fn test_transpose_2d() {
 fn test_where() {
     let (ctx, cache, mut pool) = setup();
 
-    let cond_data = vec![1.0f32, 0.0, 1.0, 0.0, 1.0];
-    let condition = GpuTensor::from_host_f32(&ctx, &cond_data, vec![5]).unwrap();
+    // WS-3 M3.5 sub-B: condition is now native Bool.
+    let condition = GpuTensor::from_host_bool(&ctx, &[true, false, true, false, true], vec![5]).unwrap();
 
     let x_data = vec![10.0f32, 20.0, 30.0, 40.0, 50.0];
     let x = GpuTensor::from_host_f32(&ctx, &x_data, vec![5]).unwrap();
@@ -719,8 +719,8 @@ fn test_nonzero() {
 fn test_where_i32() {
     let (ctx, cache, mut pool) = setup();
 
-    let cond_data = vec![1.0f32, 0.0, 1.0, 0.0, 1.0];
-    let condition = GpuTensor::from_host_f32(&ctx, &cond_data, vec![5]).unwrap();
+    // WS-3 M3.5 sub-B: condition is native Bool.
+    let condition = GpuTensor::from_host_bool(&ctx, &[true, false, true, false, true], vec![5]).unwrap();
 
     let x_data = vec![10i32, 20, 30, 40, 50];
     let x = GpuTensor::from_host_i32(&ctx, &x_data, vec![5]).unwrap();

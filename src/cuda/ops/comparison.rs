@@ -1,11 +1,16 @@
 //! Comparison and logical operations for GPU tensors (garboard TypedKernel).
+//!
+//! WS-3 M3.5 sub-B: comparison and logical ops produce native
+//! [`GpuTensor::Bool`] (a `DeviceSlice<u8>` of `0`/`1` bytes) rather than
+//! `Float32` `0.0`/`1.0`. Logical ops also consume Bool inputs end-to-end.
+//! The kernels' C-side output type is `unsigned char*`, matching `u8`.
 
 use super::cache::OpsKernelCache;
 use crate::cuda::context::{CudaError, IconnxCudaContext};
 use crate::cuda::tensor::GpuTensor;
 use garboard::{DeviceSlice, LaunchConfig};
 
-/// GPU Equal: out = (a == b) ? 1.0 : 0.0.
+/// GPU Equal: out = (a == b) ? true : false.
 pub fn gpu_equal(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
@@ -65,40 +70,46 @@ pub fn gpu_not_equal(
     binary_comparison(ctx, cache, a, b, "not_equal_kernel")
 }
 
-/// GPU And: out = (a && b) where non-zero is true.
+/// GPU And: out = (a && b). Both inputs and output are native Bool.
 pub fn gpu_and(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
     a: &GpuTensor,
     b: &GpuTensor,
 ) -> Result<GpuTensor, CudaError> {
-    binary_comparison(ctx, cache, a, b, "and_kernel")
+    binary_logical(ctx, cache, a, b, "and_kernel")
 }
 
-/// GPU Or: out = (a || b) where non-zero is true.
+/// GPU Or: out = (a || b). Both inputs and output are native Bool.
 pub fn gpu_or(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
     a: &GpuTensor,
     b: &GpuTensor,
 ) -> Result<GpuTensor, CudaError> {
-    binary_comparison(ctx, cache, a, b, "or_kernel")
+    binary_logical(ctx, cache, a, b, "or_kernel")
 }
 
-/// GPU Not: out = !a where non-zero is true.
+/// GPU Not: out = !a, both as native Bool (`GpuTensor::Bool`).
 pub fn gpu_not(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
     a: &GpuTensor,
 ) -> Result<GpuTensor, CudaError> {
+    if a.dtype() != crate::cuda::tensor::DType::Bool {
+        return Err(CudaError::Kernel(format!(
+            "Not: input must be Bool, got {} (WS-3 M3.5 — comparison/logical chain operates on native Bool)",
+            a.dtype().name()
+        )));
+    }
     let n = a.len();
-    let mut output = GpuTensor::zeros_f32(ctx, a.shape().to_vec())?;
+    let mut output = GpuTensor::zeros_bool(ctx, a.shape().to_vec())?;
 
-    // SAFETY: not_kernel signature is `(float* out, const float* a, size_t n)`.
+    // SAFETY: not_kernel signature is `(unsigned char* out, const unsigned char* a, size_t n)`.
     let kernel = unsafe {
         cache.module().typed_kernel::<(
-            &mut DeviceSlice<'_, f32>,
-            &DeviceSlice<'_, f32>,
+            &mut DeviceSlice<'_, u8>,
+            &DeviceSlice<'_, u8>,
             usize,
         )>("not_kernel")
     }
@@ -108,15 +119,65 @@ pub fn gpu_not(
         .launch(
             ctx.garboard_stream(),
             &LaunchConfig::for_num_elems(n as u32),
-            (output.data_f32_mut()?, a.data_f32()?, n),
+            (output.data_bool_mut()?, a.data_bool()?, n),
         )
         .map_err(|e| CudaError::Kernel(format!("not launch failed: {}", e)))?;
 
     Ok(output)
 }
 
+/// Binary logical (And/Or) shared launch helper: both operands and the
+/// output are Bool. The C-side kernel signature is
+/// `(unsigned char* out, const unsigned char* a, const unsigned char* b, size_t n)`.
+fn binary_logical(
+    ctx: &IconnxCudaContext,
+    cache: &OpsKernelCache,
+    a: &GpuTensor,
+    b: &GpuTensor,
+    kernel_name: &'static str,
+) -> Result<GpuTensor, CudaError> {
+    let n = a.len();
+    assert_eq!(b.len(), n, "logical: b length mismatch");
+    if a.dtype() != crate::cuda::tensor::DType::Bool || b.dtype() != crate::cuda::tensor::DType::Bool {
+        return Err(CudaError::Kernel(format!(
+            "{}: both inputs must be Bool, got {} / {} (WS-3 M3.5)",
+            kernel_name,
+            a.dtype().name(),
+            b.dtype().name()
+        )));
+    }
+
+    let mut output = GpuTensor::zeros_bool(ctx, a.shape().to_vec())?;
+    let config = LaunchConfig::for_num_elems(n as u32);
+
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut DeviceSlice<'_, u8>,
+            &DeviceSlice<'_, u8>,
+            &DeviceSlice<'_, u8>,
+            usize,
+        )>(kernel_name)
+    }
+    .map_err(|e| CudaError::Kernel(format!("{} lookup failed: {}", kernel_name, e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (
+                output.data_bool_mut()?,
+                a.data_bool()?,
+                b.data_bool()?,
+                n,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("{} launch failed: {}", kernel_name, e)))?;
+
+    Ok(output)
+}
+
 /// Helper for binary comparison operations. Supports Float32, Int64, and
-/// Int32 input tensors; always outputs Float32 (0.0 or 1.0).
+/// Int32 input tensors; always outputs `GpuTensor::Bool` (`u8` 1/0 bytes).
 fn binary_comparison(
     ctx: &IconnxCudaContext,
     cache: &OpsKernelCache,
@@ -136,16 +197,16 @@ fn binary_comparison(
         )));
     }
 
-    let mut output = GpuTensor::zeros_f32(ctx, a.shape().to_vec())?;
+    let mut output = GpuTensor::zeros_bool(ctx, a.shape().to_vec())?;
     let config = LaunchConfig::for_num_elems(n as u32);
 
     match dtype {
         crate::cuda::tensor::DType::Float32 => {
             // SAFETY: f32 comparison kernels have signature
-            // `(float* out, const float* a, const float* b, size_t n)`.
+            // `(unsigned char* out, const float* a, const float* b, size_t n)`.
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
-                    &mut DeviceSlice<'_, f32>,
+                    &mut DeviceSlice<'_, u8>,
                     &DeviceSlice<'_, f32>,
                     &DeviceSlice<'_, f32>,
                     usize,
@@ -159,7 +220,7 @@ fn binary_comparison(
                 .launch(
                     ctx.garboard_stream(),
                     &config,
-                    (output.data_f32_mut()?, a.data_f32()?, b.data_f32()?, n),
+                    (output.data_bool_mut()?, a.data_f32()?, b.data_f32()?, n),
                 )
                 .map_err(|e| {
                     CudaError::Kernel(format!("{} launch failed: {}", kernel_name, e))
@@ -173,10 +234,10 @@ fn binary_comparison(
                 kernel_name.trim_end_matches("_kernel")
             );
             // SAFETY: i64 comparison kernels have signature
-            // `(float* out, const long long* a, const long long* b, size_t n)`.
+            // `(unsigned char* out, const long long* a, const long long* b, size_t n)`.
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
-                    &mut DeviceSlice<'_, f32>,
+                    &mut DeviceSlice<'_, u8>,
                     &DeviceSlice<'_, i64>,
                     &DeviceSlice<'_, i64>,
                     usize,
@@ -190,7 +251,7 @@ fn binary_comparison(
                 .launch(
                     ctx.garboard_stream(),
                     &config,
-                    (output.data_f32_mut()?, a.data_i64()?, b.data_i64()?, n),
+                    (output.data_bool_mut()?, a.data_i64()?, b.data_i64()?, n),
                 )
                 .map_err(|e| {
                     CudaError::Kernel(format!("{} launch failed: {}", i64_kernel_name, e))
@@ -203,10 +264,10 @@ fn binary_comparison(
                 kernel_name.trim_end_matches("_kernel")
             );
             // SAFETY: i32 comparison kernels have signature
-            // `(float* out, const int* a, const int* b, size_t n)`.
+            // `(unsigned char* out, const int* a, const int* b, size_t n)`.
             let kernel = unsafe {
                 cache.module().typed_kernel::<(
-                    &mut DeviceSlice<'_, f32>,
+                    &mut DeviceSlice<'_, u8>,
                     &DeviceSlice<'_, i32>,
                     &DeviceSlice<'_, i32>,
                     usize,
@@ -220,7 +281,7 @@ fn binary_comparison(
                 .launch(
                     ctx.garboard_stream(),
                     &config,
-                    (output.data_f32_mut()?, a.data_i32()?, b.data_i32()?, n),
+                    (output.data_bool_mut()?, a.data_i32()?, b.data_i32()?, n),
                 )
                 .map_err(|e| {
                     CudaError::Kernel(format!("{} launch failed: {}", i32_kernel_name, e))
@@ -234,7 +295,7 @@ fn binary_comparison(
         }
         crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
             return Err(CudaError::Kernel(format!(
-                "Comparison does not support {} (WS-3 M3.5 — Float16/Bool dispatch arm pending; M3.5 also migrates comparison output from f32 1.0/0.0 to native GpuTensor::Bool)",
+                "Comparison does not support {} (Whisper-FP16 doesn't compare FP16 directly; Bool inputs route through And/Or/Not, not the binary comparison helper)",
                 dtype.name()
             )));
         }
@@ -253,24 +314,27 @@ mod tests {
         (ctx, cache)
     }
 
+    fn bool_to_vec(t: &GpuTensor, ctx: &IconnxCudaContext) -> Vec<bool> {
+        t.to_host_bool(ctx).unwrap()
+    }
+
     #[test]
     #[ignore = "requires CUDA GPU"]
     fn test_comparison_ops() {
         let (ctx, cache) = setup();
         let a = GpuTensor::from_host_f32(&ctx, &[1.0f32, 2.0, 3.0, 4.0, 5.0], vec![5]).unwrap();
         let b = GpuTensor::from_host_f32(&ctx, &[1.0f32, 3.0, 2.0, 4.0, 6.0], vec![5]).unwrap();
-        assert_eq!(
-            gpu_equal(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![1.0, 0.0, 0.0, 1.0, 0.0]
-        );
-        assert_eq!(
-            gpu_less(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![0.0, 1.0, 0.0, 0.0, 1.0]
-        );
-        assert_eq!(
-            gpu_greater(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![0.0, 0.0, 1.0, 0.0, 0.0]
-        );
+
+        let eq = gpu_equal(&ctx, &cache, &a, &b).unwrap();
+        assert_eq!(eq.dtype(), crate::cuda::tensor::DType::Bool);
+        assert_eq!(bool_to_vec(&eq, &ctx), vec![true, false, false, true, false]);
+
+        let lt = gpu_less(&ctx, &cache, &a, &b).unwrap();
+        assert_eq!(lt.dtype(), crate::cuda::tensor::DType::Bool);
+        assert_eq!(bool_to_vec(&lt, &ctx), vec![false, true, false, false, true]);
+
+        let gt = gpu_greater(&ctx, &cache, &a, &b).unwrap();
+        assert_eq!(bool_to_vec(&gt, &ctx), vec![false, false, true, false, false]);
     }
 
     #[test]
@@ -280,16 +344,16 @@ mod tests {
         let a = GpuTensor::from_host_f32(&ctx, &[1.0f32, 2.0, 3.0, 4.0, 5.0], vec![5]).unwrap();
         let b = GpuTensor::from_host_f32(&ctx, &[1.0f32, 3.0, 2.0, 4.0, 6.0], vec![5]).unwrap();
         assert_eq!(
-            gpu_greater_or_equal(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![1.0, 0.0, 1.0, 1.0, 0.0]
+            bool_to_vec(&gpu_greater_or_equal(&ctx, &cache, &a, &b).unwrap(), &ctx),
+            vec![true, false, true, true, false]
         );
         assert_eq!(
-            gpu_less_or_equal(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![1.0, 1.0, 0.0, 1.0, 1.0]
+            bool_to_vec(&gpu_less_or_equal(&ctx, &cache, &a, &b).unwrap(), &ctx),
+            vec![true, true, false, true, true]
         );
         assert_eq!(
-            gpu_not_equal(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![0.0, 1.0, 1.0, 0.0, 1.0]
+            bool_to_vec(&gpu_not_equal(&ctx, &cache, &a, &b).unwrap(), &ctx),
+            vec![false, true, true, false, true]
         );
     }
 
@@ -297,19 +361,19 @@ mod tests {
     #[ignore = "requires CUDA GPU"]
     fn test_logical_ops() {
         let (ctx, cache) = setup();
-        let a = GpuTensor::from_host_f32(&ctx, &[1.0f32, 0.0, 1.0, 0.0], vec![4]).unwrap();
-        let b = GpuTensor::from_host_f32(&ctx, &[1.0f32, 1.0, 0.0, 0.0], vec![4]).unwrap();
+        let a = GpuTensor::from_host_bool(&ctx, &[true, false, true, false], vec![4]).unwrap();
+        let b = GpuTensor::from_host_bool(&ctx, &[true, true, false, false], vec![4]).unwrap();
         assert_eq!(
-            gpu_and(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![1.0, 0.0, 0.0, 0.0]
+            bool_to_vec(&gpu_and(&ctx, &cache, &a, &b).unwrap(), &ctx),
+            vec![true, false, false, false]
         );
         assert_eq!(
-            gpu_or(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![1.0, 1.0, 1.0, 0.0]
+            bool_to_vec(&gpu_or(&ctx, &cache, &a, &b).unwrap(), &ctx),
+            vec![true, true, true, false]
         );
         assert_eq!(
-            gpu_not(&ctx, &cache, &a).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![0.0, 1.0, 0.0, 1.0]
+            bool_to_vec(&gpu_not(&ctx, &cache, &a).unwrap(), &ctx),
+            vec![false, true, false, true]
         );
     }
 
@@ -320,16 +384,16 @@ mod tests {
         let a = GpuTensor::from_host_i32(&ctx, &[1i32, 2, 3, 4, 5], vec![5]).unwrap();
         let b = GpuTensor::from_host_i32(&ctx, &[1i32, 3, 2, 4, 6], vec![5]).unwrap();
         assert_eq!(
-            gpu_equal(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![1.0, 0.0, 0.0, 1.0, 0.0]
+            bool_to_vec(&gpu_equal(&ctx, &cache, &a, &b).unwrap(), &ctx),
+            vec![true, false, false, true, false]
         );
         assert_eq!(
-            gpu_less(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![0.0, 1.0, 0.0, 0.0, 1.0]
+            bool_to_vec(&gpu_less(&ctx, &cache, &a, &b).unwrap(), &ctx),
+            vec![false, true, false, false, true]
         );
         assert_eq!(
-            gpu_greater(&ctx, &cache, &a, &b).unwrap().to_host_f32(&ctx).unwrap(),
-            vec![0.0, 0.0, 1.0, 0.0, 0.0]
+            bool_to_vec(&gpu_greater(&ctx, &cache, &a, &b).unwrap(), &ctx),
+            vec![false, false, true, false, false]
         );
     }
 }
