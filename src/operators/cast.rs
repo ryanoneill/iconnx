@@ -3,6 +3,7 @@
 /// Type conversion operator
 /// ONNX spec: https://onnx.ai/onnx/operators/onnx__Cast.html
 use crate::tensor::Tensor;
+use half::f16;
 
 /// Cast operator - type conversion
 pub struct Cast;
@@ -12,6 +13,7 @@ const ONNX_FLOAT: i64 = 1;
 const ONNX_INT32: i64 = 6;
 const ONNX_INT64: i64 = 7;
 const ONNX_BOOL: i64 = 9;
+const ONNX_FLOAT16: i64 = 10;
 
 impl Cast {
     /// Forward pass: cast to different type
@@ -45,6 +47,10 @@ impl Cast {
                         let float_data: Vec<f32> = data.iter().map(|&x| x as f32).collect();
                         Tensor::from_vec(float_data, data.shape().to_vec())
                     }
+                    Tensor::Float16(data) => {
+                        let float_data: Vec<f32> = data.iter().map(|&x| x.to_f32()).collect();
+                        Tensor::from_vec(float_data, data.shape().to_vec())
+                    }
                     _ => panic!("Cast from {} to Float32 not implemented", inputs[0].dtype()),
                 }
             }
@@ -58,6 +64,10 @@ impl Cast {
                     }
                     Tensor::Int32(data) => {
                         let int_data: Vec<i64> = data.iter().map(|&x| x as i64).collect();
+                        Tensor::from_vec_i64(int_data, data.shape().to_vec())
+                    }
+                    Tensor::Float16(data) => {
+                        let int_data: Vec<i64> = data.iter().map(|&x| x.to_f32() as i64).collect();
                         Tensor::from_vec_i64(int_data, data.shape().to_vec())
                     }
                     _ => panic!("Cast from {} to Int64 not implemented", inputs[0].dtype()),
@@ -75,7 +85,34 @@ impl Cast {
                         let int_data: Vec<i32> = data.iter().map(|&x| x as i32).collect();
                         Tensor::from_vec_i32(int_data, data.shape().to_vec())
                     }
+                    Tensor::Float16(data) => {
+                        let int_data: Vec<i32> = data.iter().map(|&x| x.to_f32() as i32).collect();
+                        Tensor::from_vec_i32(int_data, data.shape().to_vec())
+                    }
                     _ => panic!("Cast from {} to Int32 not implemented", inputs[0].dtype()),
+                }
+            }
+            ONNX_FLOAT16 => {
+                // Convert to Float16. Round-half-to-even via half::f16::from_f32
+                // matches the GPU `__float2half_rn` semantics used in the
+                // M3.5 cast kernels.
+                match &inputs[0] {
+                    Tensor::Float16(_) => inputs[0].clone(),
+                    Tensor::Float32(data) => {
+                        let f16_data: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
+                        Tensor::from_vec_f16(f16_data, data.shape().to_vec())
+                    }
+                    Tensor::Int64(data) => {
+                        let f16_data: Vec<f16> =
+                            data.iter().map(|&x| f16::from_f32(x as f32)).collect();
+                        Tensor::from_vec_f16(f16_data, data.shape().to_vec())
+                    }
+                    Tensor::Int32(data) => {
+                        let f16_data: Vec<f16> =
+                            data.iter().map(|&x| f16::from_f32(x as f32)).collect();
+                        Tensor::from_vec_f16(f16_data, data.shape().to_vec())
+                    }
+                    _ => panic!("Cast from {} to Float16 not implemented", inputs[0].dtype()),
                 }
             }
             ONNX_BOOL => {

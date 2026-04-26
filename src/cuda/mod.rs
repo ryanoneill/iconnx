@@ -89,6 +89,9 @@ pub use ops::{
     gpu_and,
     // Math ops
     gpu_atan,
+    // Type conversion (WS-3 M3.5 surfaces FP16 ↔ Float32 / Int32 / Int64
+    // arms; integration tests need access to this entry point).
+    gpu_cast,
     gpu_copy,
     gpu_cumsum,
     // Quantization ops (WS-4)

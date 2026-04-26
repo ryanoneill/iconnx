@@ -20,11 +20,25 @@ pub const KERNEL_NAMES_FP16: &[&str] = &[
     "transpose_general_f16_kernel",
     "concat_f16_kernel",
     "gather_f16_kernel",
+    // M3.5 (Cast — FP16 boundary). FP16 ↔ Float32 is the primary boundary
+    // for Whisper's mixed-precision attention; FP16 ↔ Int32 / Int64 covers
+    // shape-arithmetic results being mixed back into FP16 paths.
+    "cast_f16_to_f32_kernel",
+    "cast_f32_to_f16_kernel",
+    "cast_f16_to_i32_kernel",
+    "cast_i32_to_f16_kernel",
+    "cast_f16_to_i64_kernel",
+    "cast_i64_to_f16_kernel",
 ];
 
 /// CUDA kernel source for the WS-3 FP16 op family. See module docs for
 /// why `unsigned short*` is the correct C type for memcpy-only kernels.
+/// `<cuda_fp16.h>` is supplied by NVRTC's default include path (it is
+/// already needed for the M3.5 Cast kernels below, which read FP values
+/// via `__half2float` / `__float2half_rn`).
 pub const OPS_KERNELS_FP16: &str = r#"
+#include <cuda_fp16.h>
+
 // ============================================================================
 // WS-3 M3.4 sub-1 Transpose (Float16). Mirrors `transpose_general_kernel`
 // in `kernels.rs` byte-for-byte with `unsigned short*` data pointers in
@@ -103,5 +117,71 @@ extern "C" __global__ void gather_f16_kernel(
     }
     size_t in_idx = actual_index * slice_size + offset_in_slice;
     out[idx] = inp[in_idx];
+}
+
+// ============================================================================
+// WS-3 M3.5 Cast — FP16 boundary kernels.
+//
+// `__float2half_rn` is round-to-nearest-even, matching IEEE binary16's
+// default rounding mode and `half::f16::from_f32` on the CPU side. The
+// integer ↔ FP16 pairs go through f32 (`(float)x` then `__float2half_rn`,
+// or `__half2float` then `(int)x` / `(long long)x`) — there's no
+// `__half`-typed integer conversion intrinsic, and going via f32 keeps
+// the same truncate-toward-zero semantics ONNX Cast specifies for
+// integer targets.
+// ============================================================================
+
+extern "C" __global__ void cast_f16_to_f32_kernel(
+    float* out, const __half* inp, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __half2float(inp[i]);
+    }
+}
+
+extern "C" __global__ void cast_f32_to_f16_kernel(
+    __half* out, const float* inp, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __float2half_rn(inp[i]);
+    }
+}
+
+extern "C" __global__ void cast_f16_to_i32_kernel(
+    int* out, const __half* inp, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = (int)__half2float(inp[i]);
+    }
+}
+
+extern "C" __global__ void cast_i32_to_f16_kernel(
+    __half* out, const int* inp, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __float2half_rn((float)inp[i]);
+    }
+}
+
+extern "C" __global__ void cast_f16_to_i64_kernel(
+    long long* out, const __half* inp, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = (long long)__half2float(inp[i]);
+    }
+}
+
+extern "C" __global__ void cast_i64_to_f16_kernel(
+    __half* out, const long long* inp, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __float2half_rn((float)inp[i]);
+    }
 }
 "#;
