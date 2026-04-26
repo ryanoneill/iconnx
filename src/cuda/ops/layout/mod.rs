@@ -1629,11 +1629,43 @@ pub fn gpu_expand(
             Ok(output)
         }
         crate::cuda::tensor::DType::Bool => {
-            Err(CudaError::Kernel(format!(
-                "Expand does not support {} (WS-3 M3.4 — Bool dispatch arm pending; \
-                 Whisper-FP16 doesn't exercise Bool expand)",
-                dtype.name()
-            )))
+            // M3.7b: GPT-2 and DistilBERT-INT8 attention paths broadcast a
+            // Bool mask via Expand. Memcpy-class — mirrors the f32 arm with
+            // `unsigned char*` data pointers backed by GpuTensor::Bool's
+            // u8-per-element storage (one byte: 0 = false, 1 = true).
+            let mut output = pool.get_tensor_bool(ctx, out_shape.clone())?;
+            // SAFETY: expand_bool_kernel mirrors expand_kernel byte-for-byte
+            // with `unsigned char*` data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, u8>,
+                    &garboard::DeviceSlice<'_, u8>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("expand_bool_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("expand_bool_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_bool_mut()?,
+                        input.data_bool()?,
+                        &out_shape_gpu,
+                        &out_strides_gpu,
+                        &inp_shape_gpu,
+                        &inp_strides_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("expand_bool launch failed: {}", e)))?;
+            Ok(output)
         }
     }
 }

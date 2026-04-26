@@ -55,6 +55,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "expand_kernel",
     "expand_i64_kernel",
     "expand_i32_kernel",
+    "expand_bool_kernel",
     "pad_kernel",
     "pad_3d_scalar_kernel",
     "pad_4d_scalar_kernel",
@@ -608,6 +609,33 @@ extern "C" __global__ void expand_i64_kernel(
 // Expand Int32: Broadcast input to output shape (up to 8 dims)
 extern "C" __global__ void expand_i32_kernel(
     int* out, const int* inp,
+    const size_t* out_shape, const size_t* out_strides,
+    const size_t* inp_shape, const size_t* inp_strides,
+    size_t ndim, size_t total_elements
+) {
+    size_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out_idx >= total_elements) return;
+    size_t coords[8];
+    size_t remaining = out_idx;
+    for (size_t d = 0; d < ndim; d++) {
+        coords[d] = remaining / out_strides[d];
+        remaining = remaining % out_strides[d];
+    }
+    size_t inp_idx = 0;
+    for (size_t d = 0; d < ndim; d++) {
+        size_t coord = (inp_shape[d] == 1) ? 0 : coords[d];
+        inp_idx += coord * inp_strides[d];
+    }
+    out[out_idx] = inp[inp_idx];
+}
+
+// Expand Bool: Broadcast 1-byte payload to output shape (up to 8 dims).
+// `unsigned char*` matches GpuTensor::Bool's u8-per-element storage.
+// Memcpy-class — pure stride lookup, no value arithmetic — so byte-level
+// identity is sufficient. M3.7b: GPT-2 / DistilBERT-INT8 attention path
+// broadcasts a Bool mask via Expand.
+extern "C" __global__ void expand_bool_kernel(
+    unsigned char* out, const unsigned char* inp,
     const size_t* out_shape, const size_t* out_strides,
     const size_t* inp_shape, const size_t* inp_strides,
     size_t ndim, size_t total_elements

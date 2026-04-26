@@ -779,6 +779,45 @@ fn test_expand_i32() {
 
 #[test]
 #[ignore = "requires CUDA GPU"]
+fn test_expand_bool() {
+    // M3.7b: GPT-2 / DistilBERT-INT8 attention path broadcasts a Bool
+    // mask via Expand. Bool is u8 underneath, byte-mirror kernel
+    // produces identical broadcast.
+    let (ctx, cache, mut pool) = setup();
+
+    // Expand [1, 3] -> [2, 3]: each row repeats the input.
+    let input_data = vec![true, false, true];
+    let input = GpuTensor::from_host_bool(&ctx, &input_data, vec![1, 3]).unwrap();
+
+    let output = gpu_expand(&ctx, &cache, &mut pool, &input, vec![2, 3]).unwrap();
+    let result = output.to_host_bool(&ctx).unwrap();
+
+    assert_eq!(output.shape(), &[2, 3]);
+    assert_eq!(
+        result,
+        vec![true, false, true, true, false, true],
+        "Expand Bool [1,3]→[2,3] should repeat the row"
+    );
+
+    // Trailing-1 broadcast: [3, 1] -> [3, 4].
+    let trailing_data = vec![true, false, true];
+    let trailing = GpuTensor::from_host_bool(&ctx, &trailing_data, vec![3, 1]).unwrap();
+    let trailing_out = gpu_expand(&ctx, &cache, &mut pool, &trailing, vec![3, 4]).unwrap();
+    let trailing_result = trailing_out.to_host_bool(&ctx).unwrap();
+    assert_eq!(trailing_out.shape(), &[3, 4]);
+    assert_eq!(
+        trailing_result,
+        vec![
+            true, true, true, true,
+            false, false, false, false,
+            true, true, true, true,
+        ],
+        "Expand Bool [3,1]→[3,4] should broadcast each scalar across the new axis"
+    );
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
 fn test_slice_nd_i32() {
     let (ctx, cache, mut pool) = setup();
 
