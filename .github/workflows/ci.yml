@@ -40,6 +40,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # CPU-only runners have no NVIDIA driver, so `-lcuda` (the driver
+  # API stub) isn't on the default linker search path. CUDA toolkit
+  # ships a compile-time stub at `lib64/stubs/libcuda.so`; point the
+  # linker at it. Runtime linking against this stub never happens
+  # because integration tests requiring a GPU stay local.
+  RUSTFLAGS: -L /usr/local/cuda/lib64/stubs
 
 jobs:
   build-test:
@@ -63,6 +69,7 @@ jobs:
             cuda-cudart-dev-12-8 \
             cuda-nvrtc-dev-12-8 \
             libcublas-dev-12-8 \
+            libcufft-dev-12-8 \
             libcudnn9-dev-cuda-12 \
             protobuf-compiler
 
