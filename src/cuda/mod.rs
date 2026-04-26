@@ -122,7 +122,7 @@ pub use reduction::{
 #[allow(unused_imports)]
 pub use memory_pool::GpuMemoryPool;
 #[allow(unused_imports)]
-pub use tensor::{GpuTensor, TypedSlice};
+pub use tensor::{DType, GpuTensor, TypedSlice};
 
 /// Check if CUDA is available on this system.
 ///

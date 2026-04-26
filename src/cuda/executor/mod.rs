@@ -564,6 +564,14 @@ pub(super) fn collect_outputs(
                 let data = gpu_tensor.to_host_u8(ctx)?;
                 Tensor::from_vec_u8(data, shape.clone())
             }
+            GpuTensor::Float16 { shape, .. } => {
+                let data = gpu_tensor.to_host_f16(ctx)?;
+                Tensor::from_vec_f16(data, shape.clone())
+            }
+            GpuTensor::Bool { shape, .. } => {
+                let data = gpu_tensor.to_host_bool(ctx)?;
+                Tensor::from_vec_bool(data, shape.clone())
+            }
         };
         outputs.insert((*name).to_string(), cpu_tensor);
     }

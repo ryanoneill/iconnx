@@ -235,6 +235,14 @@ impl IconnxCudaContext {
         self.zero_slice(slice)
     }
 
+    /// Zero out an f16 slice in place. WS-3 M3.3.
+    pub fn zero_f16(
+        &self,
+        slice: &mut GbDeviceSlice<'static, half::f16>,
+    ) -> Result<(), CudaError> {
+        self.zero_slice(slice)
+    }
+
     /// Internal helper: zero a garboard slice on the garboard user stream.
     ///
     /// Uses garboard's `Stream::memset_zero`, which enqueues

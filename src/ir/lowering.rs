@@ -267,12 +267,20 @@ fn upload_initializers(
             Tensor::UInt8(_) => {
                 GpuTensor::from_host_u8(ctx, &tensor.as_slice_u8(), tensor.shape().to_vec())?
             }
+            Tensor::Float16(_) => {
+                // WS-3 M3.3: Float16 GPU upload landed.
+                GpuTensor::from_host_f16(ctx, &tensor.as_slice_f16(), tensor.shape().to_vec())?
+            }
+            Tensor::Bool(_) => {
+                // WS-3 M3.3: Bool now uploads natively as `GpuTensor::Bool`
+                // (byte-per-element u8 storage). Pre-WS-3 the upload path
+                // cast to f32 1.0/0.0; consumers (Where) migrate to the
+                // native Bool dtype in M3.5.
+                GpuTensor::from_host_bool(ctx, &tensor.as_slice_bool(), tensor.shape().to_vec())?
+            }
             // Float64 has no GPU dtype today; skip and let the first
-            // downstream consumer error explicitly. Float16 and Bool
-            // GPU paths land in WS-3 M3.3 — until then, the same
-            // explicit-skip pattern keeps the silent-drop visible to
-            // anyone touching the file.
-            Tensor::Float64(_) | Tensor::Bool(_) | Tensor::Float16(_) => continue,
+            // downstream consumer error explicitly.
+            Tensor::Float64(_) => continue,
         };
         out.insert(name.clone(), gpu);
     }

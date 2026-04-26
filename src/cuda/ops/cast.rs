@@ -180,6 +180,20 @@ pub fn gpu_cast(
                 target_dtype.name()
             )))
         }
+
+        // Float16 / Bool casts: dispatch arms land in WS-3 M3.5 (the
+        // FP16 ↔ Float32 boundary cast specifically). Surface a clear
+        // pointer to the right milestone rather than silent fallback.
+        (DType::Float16, _)
+        | (DType::Bool, _)
+        | (_, DType::Float16)
+        | (_, DType::Bool) => {
+            Err(CudaError::Kernel(format!(
+                "Cast does not support {} -> {} (WS-3 M3.5 — Float16/Bool dispatch arm pending)",
+                src_dtype.name(),
+                target_dtype.name()
+            )))
+        }
     }
 }
 

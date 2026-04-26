@@ -421,6 +421,12 @@ pub fn gpu_transpose_nd(
                 input.dtype().name()
             )))
         }
+        GpuTensor::Float16 { .. } | GpuTensor::Bool { .. } => {
+            Err(CudaError::Kernel(format!(
+                "Transpose does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
+                input.dtype().name()
+            )))
+        }
     }
 }
 
@@ -543,6 +549,12 @@ pub fn gpu_where(
         crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
             Err(CudaError::Kernel(format!(
                 "Where does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Where)",
+                dtype.name()
+            )))
+        }
+        crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
+            Err(CudaError::Kernel(format!(
+                "Where does not support {} (WS-3 M3.5 — Float16/Bool dispatch arm pending)",
                 dtype.name()
             )))
         }
@@ -958,6 +970,12 @@ pub fn gpu_copy(
                 input.dtype().name()
             )))
         }
+        GpuTensor::Float16 { .. } | GpuTensor::Bool { .. } => {
+            Err(CudaError::Kernel(format!(
+                "gpu_copy does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
+                input.dtype().name()
+            )))
+        }
     }
 }
 
@@ -1195,6 +1213,12 @@ pub fn gpu_concat(
                 dtype.name()
             )))
         }
+        crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
+            Err(CudaError::Kernel(format!(
+                "Concat does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
+                dtype.name()
+            )))
+        }
     }
 }
 
@@ -1375,6 +1399,12 @@ pub fn gpu_expand(
         crate::cuda::tensor::DType::Int8 | crate::cuda::tensor::DType::UInt8 => {
             Err(CudaError::Kernel(format!(
                 "Expand does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Expand)",
+                dtype.name()
+            )))
+        }
+        crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
+            Err(CudaError::Kernel(format!(
+                "Expand does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
                 dtype.name()
             )))
         }
@@ -2382,6 +2412,12 @@ pub fn gpu_slice_nd(
                     dtype.name()
                 )))
             }
+            crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
+                Err(CudaError::Kernel(format!(
+                    "Slice does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
+                    dtype.name()
+                )))
+            }
         };
     }
 
@@ -2699,6 +2735,12 @@ pub fn gpu_slice_nd(
         (_, crate::cuda::tensor::DType::Int8) | (_, crate::cuda::tensor::DType::UInt8) => {
             Err(CudaError::Kernel(format!(
                 "Slice does not support {} (WS-4 — quantization graph should not route INT8/UINT8 through Slice)",
+                dtype.name()
+            )))
+        }
+        (_, crate::cuda::tensor::DType::Float16) | (_, crate::cuda::tensor::DType::Bool) => {
+            Err(CudaError::Kernel(format!(
+                "Slice does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
                 dtype.name()
             )))
         }

@@ -53,8 +53,12 @@ pub struct GpuMemoryPool {
     i32_pool: HashMap<usize, Vec<DeviceSlice<'static, i32>>>,
     /// Pool of i8 slices, keyed by size-class bucket.
     i8_pool: HashMap<usize, Vec<DeviceSlice<'static, i8>>>,
-    /// Pool of u8 slices, keyed by size-class bucket.
+    /// Pool of u8 slices, keyed by size-class bucket. Backs both
+    /// `GpuTensor::UInt8` and `GpuTensor::Bool` since Bool's GPU
+    /// representation is byte-per-element `u8`.
     u8_pool: HashMap<usize, Vec<DeviceSlice<'static, u8>>>,
+    /// Pool of f16 slices, keyed by size-class bucket. WS-3 M3.3.
+    f16_pool: HashMap<usize, Vec<DeviceSlice<'static, half::f16>>>,
     /// Number of successful pool hits.
     hits: usize,
     /// Number of pool misses (fresh allocations).
@@ -78,6 +82,7 @@ impl GpuMemoryPool {
             i32_pool: HashMap::new(),
             i8_pool: HashMap::new(),
             u8_pool: HashMap::new(),
+            f16_pool: HashMap::new(),
             hits: 0,
             misses: 0,
             max_per_bucket: 8, // Keep up to 8 slices per size.
@@ -298,6 +303,57 @@ impl GpuMemoryPool {
         })
     }
 
+    /// Get or allocate a Bool `GpuTensor` (convenience method).
+    ///
+    /// Bool's GPU representation is byte-per-element `u8`; this method
+    /// shares the underlying `u8_pool` with `get_tensor_u8`. Pooled
+    /// slices are zeroed (false) before being handed out.
+    pub fn get_tensor_bool(
+        &mut self,
+        ctx: &IconnxCudaContext,
+        shape: Vec<usize>,
+    ) -> Result<GpuTensor, CudaError> {
+        let len: usize = shape.iter().product();
+        let slice = self.get_u8(ctx, len)?;
+        Ok(GpuTensor::Bool {
+            data: Arc::new(slice),
+            shape,
+        })
+    }
+
+    /// Get or allocate a Float16 `DeviceSlice`. WS-3 M3.3.
+    pub fn get_f16(
+        &mut self,
+        ctx: &IconnxCudaContext,
+        len: usize,
+    ) -> Result<DeviceSlice<'static, half::f16>, CudaError> {
+        let bucket = size_class(len);
+        if let Some(slices) = self.f16_pool.get_mut(&bucket) {
+            if let Some(idx) = slices.iter().position(|s| s.len() >= len) {
+                let mut slice = slices.swap_remove(idx);
+                self.hits += 1;
+                ctx.zero_f16(&mut slice)?;
+                return Ok(slice);
+            }
+        }
+        self.misses += 1;
+        ctx.alloc_zeros::<half::f16>(bucket)
+    }
+
+    /// Get or allocate a Float16 `GpuTensor` (convenience method).
+    pub fn get_tensor_f16(
+        &mut self,
+        ctx: &IconnxCudaContext,
+        shape: Vec<usize>,
+    ) -> Result<GpuTensor, CudaError> {
+        let len: usize = shape.iter().product();
+        let slice = self.get_f16(ctx, len)?;
+        Ok(GpuTensor::Float16 {
+            data: Arc::new(slice),
+            shape,
+        })
+    }
+
     /// Return a Float32 slice to the pool.
     pub fn return_f32(&mut self, slice: DeviceSlice<'static, f32>) {
         let len = slice.len();
@@ -355,6 +411,16 @@ impl GpuMemoryPool {
         }
     }
 
+    /// Return a Float16 slice to the pool. WS-3 M3.3.
+    pub fn return_f16(&mut self, slice: DeviceSlice<'static, half::f16>) {
+        let len = slice.len();
+        let bucket_key = size_class(len);
+        let bucket = self.f16_pool.entry(bucket_key).or_default();
+        if bucket.len() < self.max_per_bucket {
+            bucket.push(slice);
+        }
+    }
+
     /// Return a `GpuTensor` to the pool (extracts slice if possible).
     ///
     /// Returns true if the tensor was successfully returned to the pool.
@@ -378,6 +444,16 @@ impl GpuMemoryPool {
                 true
             }
             Some(TypedSlice::UInt8(slice)) => {
+                self.return_u8(slice);
+                true
+            }
+            Some(TypedSlice::Float16(slice)) => {
+                self.return_f16(slice);
+                true
+            }
+            // Bool's GPU storage is byte-per-element u8 (the same shape
+            // as UInt8); reuse the u8_pool so the bytes recycle freely.
+            Some(TypedSlice::Bool(slice)) => {
                 self.return_u8(slice);
                 true
             }
@@ -410,6 +486,7 @@ impl GpuMemoryPool {
             + self.i32_pool.values().map(|v| v.len()).sum::<usize>()
             + self.i8_pool.values().map(|v| v.len()).sum::<usize>()
             + self.u8_pool.values().map(|v| v.len()).sum::<usize>()
+            + self.f16_pool.values().map(|v| v.len()).sum::<usize>()
     }
 
     /// Clear all pooled memory (frees GPU memory).
@@ -419,6 +496,7 @@ impl GpuMemoryPool {
         self.i32_pool.clear();
         self.i8_pool.clear();
         self.u8_pool.clear();
+        self.f16_pool.clear();
     }
 
     /// Reset statistics.

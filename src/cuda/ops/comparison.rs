@@ -232,6 +232,12 @@ fn binary_comparison(
                 dtype.name()
             )));
         }
+        crate::cuda::tensor::DType::Float16 | crate::cuda::tensor::DType::Bool => {
+            return Err(CudaError::Kernel(format!(
+                "Comparison does not support {} (WS-3 M3.5 — Float16/Bool dispatch arm pending; M3.5 also migrates comparison output from f32 1.0/0.0 to native GpuTensor::Bool)",
+                dtype.name()
+            )));
+        }
     }
 
     Ok(output)
