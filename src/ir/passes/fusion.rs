@@ -29,17 +29,21 @@ pub fn detect_fusion(graph: &OptimizableGraph) -> FusionAnnotations {
 
 /// Drop fused patterns whose participating static values (initializers
 /// or `Constant` node outputs) carry a non-Float32 dtype (notably
-/// Float16 for Whisper-FP16). `gpu_fused_div_rsqrt` and the other fused
-/// kernels are sealed to f32 today, so the op-by-op fallback is the
-/// only correct dispatch path for FP16 graphs. Gating here keeps fused
-/// dispatch correct rather than panicking inside
-/// `eps_tensor.to_host_f32(...)`. A full FP16 fused kernel suite is a
-/// separate post-Phase-3 effort.
+/// Float16 for Whisper-FP16 and BFloat16 for WS-3.5 BF16 roster).
+/// `gpu_fused_div_rsqrt` and the other fused kernels are sealed to f32
+/// today, so the op-by-op fallback is the only correct dispatch path
+/// for any reduced-precision graph. Gating here keeps fused dispatch
+/// correct rather than panicking inside `eps_tensor.to_host_f32(...)`.
+/// A full reduced-precision fused-kernel suite is a separate post-Y(3)
+/// effort.
 ///
-/// Constant node outputs are inspected because Whisper-FP16 exports its
-/// LayerNorm `eps` as a `Constant` node (not an initializer). Only
+/// Constant node outputs are inspected because Whisper-FP16 exports
+/// its LayerNorm `eps` as a `Constant` node (not an initializer). Only
 /// checking `graph.initializers` would miss this case. Both surfaces
-/// are valid producer locations for a "static" tensor.
+/// are valid producer locations for a "static" tensor. The same applies
+/// to BFloat16 graphs (WS-3.5 Y(3)) — any non-`float32` dtype reported
+/// by `Tensor::dtype()` triggers the gate, so BF16 inherits the
+/// suppression for free without a dedicated `is_bfloat16` helper.
 ///
 /// Applies to both static heads and dynamic candidates. Static heads
 /// also have their interior nodes cleaned out of `skipped` so the
@@ -340,5 +344,93 @@ mod tests {
                 node
             );
         }
+    }
+
+    /// WS-3.5 Y(3) — verify `gate_fusion_to_float32` drops a fused
+    /// pattern whose initializer is BFloat16. Mirrors the FP16 logic
+    /// already covered implicitly by `whisper_fp16` integration tests;
+    /// this is the unit-level cover for the BF16 case so the gate's
+    /// behaviour is locked in even without a Phase-4 BF16 e2e roster.
+    #[test]
+    fn gate_drops_pattern_with_bfloat16_initializer() {
+        use half::bf16;
+        use ndarray::ArrayD;
+        use crate::cuda::inference::fusion::{FusedPattern, FusedPatternInfo};
+
+        // Build a minimal graph state with one BF16 initializer named
+        // "x_bf16". The fusion-gate logic only looks at the initializer
+        // dtype map and the pattern's input names — we don't need a
+        // detector run, just the post-detection state.
+        let mut b = OptimizableGraphBuilder::new();
+        b.add_initializer(
+            "x_bf16".into(),
+            Tensor::BFloat16(
+                ArrayD::from_shape_vec(ndarray::IxDyn(&[1]), vec![bf16::from_f32(0.5)])
+                    .expect("bf16 init"),
+            ),
+        );
+        b.add_initializer(
+            "x_f32".into(),
+            Tensor::from_vec_f32(vec![0.5], vec![1]),
+        );
+        let graph = b.build();
+
+        // Synthesize two GELU patterns:
+        //  - "head_bf16" sources its `x_input` from the BF16 initializer
+        //  - "head_f32"  sources its `x_input` from a Float32 initializer
+        // The gate must drop the BF16 head and keep the f32 head.
+        let mut heads: HashMap<String, FusedPatternInfo> = HashMap::new();
+        heads.insert(
+            "head_bf16".to_string(),
+            FusedPatternInfo {
+                pattern: FusedPattern::Gelu {
+                    x_input: "x_bf16".to_string(),
+                    output_name: "out_bf16".to_string(),
+                },
+                nodes_to_skip: vec!["interior_bf16".to_string()],
+                head_node: "head_bf16".to_string(),
+            },
+        );
+        heads.insert(
+            "head_f32".to_string(),
+            FusedPatternInfo {
+                pattern: FusedPattern::Gelu {
+                    x_input: "x_f32".to_string(),
+                    output_name: "out_f32".to_string(),
+                },
+                nodes_to_skip: vec!["interior_f32".to_string()],
+                head_node: "head_f32".to_string(),
+            },
+        );
+
+        let mut skipped: HashSet<String> = HashSet::new();
+        skipped.insert("interior_bf16".to_string());
+        skipped.insert("interior_f32".to_string());
+
+        let annotations = FusionAnnotations {
+            heads,
+            skipped,
+            dynamic_candidates: HashMap::new(),
+        };
+
+        let gated = gate_fusion_to_float32(annotations, &graph);
+
+        assert!(
+            !gated.heads.contains_key("head_bf16"),
+            "BF16-rooted fused head must be dropped"
+        );
+        assert!(
+            gated.heads.contains_key("head_f32"),
+            "Float32-rooted fused head must be retained"
+        );
+        assert!(
+            !gated.skipped.contains("interior_bf16"),
+            "interior of dropped BF16 pattern must be cleared from skipped \
+             so the op-by-op fallback can execute it"
+        );
+        assert!(
+            gated.skipped.contains("interior_f32"),
+            "interior of retained f32 pattern must remain skipped (fused dispatch claims it)"
+        );
     }
 }

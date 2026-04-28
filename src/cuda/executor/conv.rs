@@ -78,12 +78,16 @@ impl Executor {
                             )?,
                             DType::Float16 => {
                                 if group != 1 {
-                                    return Err(CudaError::Kernel(format!(
-                                        "Float16 1D Conv with groups={} not supported \
-                                         (garboard cuDNN binding is f32-only; in-tree \
-                                         gpu_conv1d does not support groups)",
-                                        group
-                                    )));
+                                    return Err(CudaError::UnsupportedDtype {
+                                        op: "Conv1D",
+                                        dtype: "float16",
+                                        reason: format!(
+                                            "groups={} not supported (in-tree gpu_conv1d \
+                                             requires groups=1; cuDNN FP16 binding pending \
+                                             garboard upstream)",
+                                            group
+                                        ),
+                                    });
                                 }
                                 let kernel_size = inputs[1].shape()[2];
                                 let params = Conv1dParams {
@@ -106,6 +110,50 @@ impl Executor {
                                 // gpu_conv1d folds bias inline; skip the
                                 // explicit add_bias step below by returning
                                 // early.
+                                return Ok(out);
+                            }
+                            DType::BFloat16 => {
+                                // WS-3.5 Y(3): mirrors the FP16 1D conv arm.
+                                // garboard's cuDNN conv binding is f32-only,
+                                // so BF16 routes through the in-tree
+                                // im2col + gemm_bf16 path. Grouped conv has
+                                // no in-tree implementation on any reduced-
+                                // precision dtype today; reject loudly with
+                                // typed `UnsupportedDtype` (Y(2)-introduced
+                                // variant) so callers get a structured
+                                // signal rather than a `Kernel`-string
+                                // match.
+                                if group != 1 {
+                                    return Err(CudaError::UnsupportedDtype {
+                                        op: "Conv1D",
+                                        dtype: "bfloat16",
+                                        reason: format!(
+                                            "groups={} not supported (in-tree gpu_conv1d \
+                                             requires groups=1; cuDNN BF16 binding pending \
+                                             garboard upstream)",
+                                            group
+                                        ),
+                                    });
+                                }
+                                let kernel_size = inputs[1].shape()[2];
+                                let params = Conv1dParams {
+                                    kernel_size,
+                                    stride,
+                                    padding,
+                                    dilation,
+                                };
+                                let bias =
+                                    if inputs.len() > 2 { Some(inputs[2]) } else { None };
+                                let out = gpu_conv1d(
+                                    &self.ctx,
+                                    &self.conv_kernels,
+                                    &mut pool,
+                                    inputs[0],
+                                    inputs[1],
+                                    bias,
+                                    &params,
+                                )?;
+                                // gpu_conv1d folds bias inline.
                                 return Ok(out);
                             }
                             dt => {

@@ -9,7 +9,7 @@
 
 use core::ffi::c_longlong;
 
-use garboard::{GemmConfig, GemmFp16Acc32Config, GemmStridedBatchedConfig, Transpose};
+use garboard::{GemmBf16Config, GemmConfig, GemmFp16Acc32Config, GemmStridedBatchedConfig, Transpose};
 
 use super::context::{CudaError, IconnxCudaContext};
 use super::memory_pool::GpuMemoryPool;
@@ -83,6 +83,17 @@ fn gpu_matmul_2d(
     );
 
     if a.dtype() != b.dtype() {
+        // WS-3.5 Y(3): typed `DtypeMismatch` when either operand is BF16
+        // (parallel to the FP16 typed-error stance landed in WS-3 M3.6).
+        // Older Float32/Float16-only mismatches keep the legacy
+        // `Kernel(format!())` surface for backwards compatibility with
+        // existing match-on-message tests.
+        if a.dtype() == DType::BFloat16 || b.dtype() == DType::BFloat16 {
+            return Err(CudaError::DtypeMismatch {
+                expected: a.dtype().name(),
+                actual: b.dtype().name(),
+            });
+        }
         return Err(CudaError::Kernel(format!(
             "MatMul: dtype mismatch (A: {}, B: {})",
             a.dtype().name(),
@@ -147,8 +158,38 @@ fn gpu_matmul_2d(
                 .map_err(|e| CudaError::Cublas(e.to_string()))?;
             Ok(c)
         }
+        DType::BFloat16 => {
+            // WS-3.5 Y(3): garboard `gemm_bf16` — `CUBLAS_COMPUTE_32F`
+            // single-flavor (cuBLAS exposes no BF16-accumulator mode;
+            // BF16's design assumes a wider FP32 accumulator). alpha/beta
+            // are f32 per `GemmBf16Config`. Same row-major↔col-major
+            // swap as the f32 / FP16 paths.
+            let mut c = pool.get_tensor_bf16(ctx, vec![m, n])?;
+            let config = GemmBf16Config {
+                transa: Transpose::NoTrans,
+                transb: Transpose::NoTrans,
+                m: n as i32,
+                n: m as i32,
+                k: k as i32,
+                alpha: 1.0_f32,
+                lda: n as i32,
+                ldb: k as i32,
+                beta: 0.0_f32,
+                ldc: n as i32,
+            };
+            ctx.blas()
+                .gemm_bf16(
+                    ctx.garboard_stream(),
+                    &config,
+                    b.data_bf16()?,
+                    a.data_bf16()?,
+                    c.data_bf16_mut()?,
+                )
+                .map_err(|e| CudaError::Cublas(e.to_string()))?;
+            Ok(c)
+        }
         dt => Err(CudaError::Kernel(format!(
-            "MatMul: unsupported dtype {} (Float32 + Float16 supported; Int* paths route through MatMulInteger)",
+            "MatMul: unsupported dtype {} (Float32 + Float16 + BFloat16 supported; Int* paths route through MatMulInteger)",
             dt.name()
         ))),
     }
@@ -174,6 +215,12 @@ pub fn gpu_gemm(
     assert_eq!(b.ndim(), 2, "Gemm: B must be 2D");
 
     if a.dtype() != b.dtype() {
+        if a.dtype() == DType::BFloat16 || b.dtype() == DType::BFloat16 {
+            return Err(CudaError::DtypeMismatch {
+                expected: a.dtype().name(),
+                actual: b.dtype().name(),
+            });
+        }
         return Err(CudaError::Kernel(format!(
             "Gemm: A/B dtype mismatch ({} vs {})",
             a.dtype().name(),
@@ -182,6 +229,12 @@ pub fn gpu_gemm(
     }
     if let Some(c_tensor) = c {
         if c_tensor.dtype() != a.dtype() {
+            if a.dtype() == DType::BFloat16 || c_tensor.dtype() == DType::BFloat16 {
+                return Err(CudaError::DtypeMismatch {
+                    expected: a.dtype().name(),
+                    actual: c_tensor.dtype().name(),
+                });
+            }
             return Err(CudaError::Kernel(format!(
                 "Gemm: C dtype must match A/B (got C={}, A={})",
                 c_tensor.dtype().name(),
@@ -282,6 +335,35 @@ pub fn gpu_gemm(
                 .map_err(|e| CudaError::Cublas(e.to_string()))?;
             Ok(output)
         }
+        DType::BFloat16 => {
+            // WS-3.5 Y(3): mirrors the FP16 Gemm arm, calling
+            // `gemm_bf16` instead of `gemm_fp16_acc32`. alpha/beta are
+            // f32 (matching `CUBLAS_COMPUTE_32F`); cuBLAS down-converts
+            // to BF16 only at the C write-back.
+            let mut output = gemm_init_output_bf16(ctx, pool, c, beta, m, n)?;
+            let config = GemmBf16Config {
+                transa,
+                transb,
+                m: n as i32,
+                n: m as i32,
+                k: k as i32,
+                alpha,
+                lda,
+                ldb,
+                beta,
+                ldc,
+            };
+            ctx.blas()
+                .gemm_bf16(
+                    ctx.garboard_stream(),
+                    &config,
+                    b.data_bf16()?,
+                    a.data_bf16()?,
+                    output.data_bf16_mut()?,
+                )
+                .map_err(|e| CudaError::Cublas(e.to_string()))?;
+            Ok(output)
+        }
         dt => Err(CudaError::Kernel(format!(
             "Gemm: unsupported dtype {}",
             dt.name()
@@ -354,6 +436,28 @@ fn gemm_init_output_f16(
     pool.get_tensor_f16(ctx, vec![m, n])
 }
 
+/// WS-3.5 Y(3): BFloat16 mirror of `gemm_init_output_f16`. ONNX Gemm's
+/// `C` broadcasts via the same shape vocabulary; the host detour for
+/// `beta != 0.0` is unavoidable because we don't have a GPU-side
+/// expand-and-add helper for BF16 yet.
+fn gemm_init_output_bf16(
+    ctx: &IconnxCudaContext,
+    pool: &mut GpuMemoryPool,
+    c: Option<&GpuTensor>,
+    beta: f32,
+    m: usize,
+    n: usize,
+) -> Result<GpuTensor, CudaError> {
+    if let Some(c_tensor) = c {
+        if beta != 0.0 {
+            let c_host = c_tensor.to_host_bf16(ctx)?;
+            let expanded = broadcast_c(&c_host, c_tensor.shape(), m, n)?;
+            return GpuTensor::from_host_bf16(ctx, &expanded, vec![m, n]);
+        }
+    }
+    pool.get_tensor_bf16(ctx, vec![m, n])
+}
+
 /// GPU MatMul 2D x 3D: A[M, K] @ B[batch, K, N] = C[batch, M, N].
 ///
 /// Broadcasts the 2D matrix A across all batches of B. The Float32
@@ -384,6 +488,12 @@ pub fn gpu_matmul_2d_3d(
         k, k_b
     );
     if a.dtype() != b.dtype() {
+        if a.dtype() == DType::BFloat16 || b.dtype() == DType::BFloat16 {
+            return Err(CudaError::DtypeMismatch {
+                expected: a.dtype().name(),
+                actual: b.dtype().name(),
+            });
+        }
         return Err(CudaError::Kernel(format!(
             "MatMul2D3D: dtype mismatch (A: {}, B: {})",
             a.dtype().name(),
@@ -456,6 +566,27 @@ pub fn gpu_matmul_2d_3d(
             }
             GpuTensor::from_host_f16(ctx, &out_host, vec![batch, m, n])
         }
+        DType::BFloat16 => {
+            // WS-3.5 Y(3): per-batch fallback over `gemm_bf16`. garboard
+            // does not yet expose `gemm_strided_batched_bf16` — Tracked
+            // Follow-Up #2 (cross-repo ask). Numerically identical to a
+            // fused strided-batched call; only batched-throughput is
+            // suboptimal. For Whisper-Tiny encoder shapes (batch=1) this
+            // is a no-op; broader-batch case pays one D2H+H2D round-trip
+            // per batch slab. Documented perf gap, not correctness.
+            let b_host = b.to_host_bf16(ctx)?;
+            let mut out_host: Vec<half::bf16> = Vec::with_capacity(batch * m * n);
+            let slab = k * n;
+
+            for batch_idx in 0..batch {
+                let b_slab = &b_host[batch_idx * slab..(batch_idx + 1) * slab];
+                let b_slab_gpu = GpuTensor::from_host_bf16(ctx, b_slab, vec![k, n])?;
+                let c_slab = gpu_matmul_2d(ctx, pool, a, &b_slab_gpu)?;
+                let c_slab_host = c_slab.to_host_bf16(ctx)?;
+                out_host.extend_from_slice(&c_slab_host);
+            }
+            GpuTensor::from_host_bf16(ctx, &out_host, vec![batch, m, n])
+        }
         dt => Err(CudaError::Kernel(format!(
             "MatMul2D3D: unsupported dtype {}",
             dt.name()
@@ -509,6 +640,12 @@ pub fn gpu_batched_matmul(
         b.shape()[1]
     );
     if a.dtype() != b.dtype() {
+        if a.dtype() == DType::BFloat16 || b.dtype() == DType::BFloat16 {
+            return Err(CudaError::DtypeMismatch {
+                expected: a.dtype().name(),
+                actual: b.dtype().name(),
+            });
+        }
         return Err(CudaError::Kernel(format!(
             "BatchedMatMul: dtype mismatch (A: {}, B: {})",
             a.dtype().name(),
@@ -571,6 +708,27 @@ pub fn gpu_batched_matmul(
                 out_host.extend_from_slice(&c_slab_host);
             }
             GpuTensor::from_host_f16(ctx, &out_host, vec![batch, m, n])
+        }
+        DType::BFloat16 => {
+            // WS-3.5 Y(3): per-batch fallback over `gemm_bf16` mirroring
+            // the FP16 loop above. `gemm_strided_batched_bf16` is
+            // Tracked Follow-Up #2 — until then, correctness > perf.
+            let a_host = a.to_host_bf16(ctx)?;
+            let b_host = b.to_host_bf16(ctx)?;
+            let a_slab = m * k;
+            let b_slab = k * n;
+            let mut out_host: Vec<half::bf16> = Vec::with_capacity(batch * m * n);
+
+            for batch_idx in 0..batch {
+                let a_data = &a_host[batch_idx * a_slab..(batch_idx + 1) * a_slab];
+                let b_data = &b_host[batch_idx * b_slab..(batch_idx + 1) * b_slab];
+                let a_gpu = GpuTensor::from_host_bf16(ctx, a_data, vec![m, k])?;
+                let b_gpu = GpuTensor::from_host_bf16(ctx, b_data, vec![k, n])?;
+                let c_slab = gpu_matmul_2d(ctx, pool, &a_gpu, &b_gpu)?;
+                let c_slab_host = c_slab.to_host_bf16(ctx)?;
+                out_host.extend_from_slice(&c_slab_host);
+            }
+            GpuTensor::from_host_bf16(ctx, &out_host, vec![batch, m, n])
         }
         dt => Err(CudaError::Kernel(format!(
             "BatchedMatMul: unsupported dtype {}",

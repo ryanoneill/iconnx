@@ -14,6 +14,18 @@ pub const KERNEL_NAMES: &[&str] = &[
     "im2col_f16_kernel",
     "im2col_1d_f16_kernel",
     "add_bias_f16_kernel",
+    // WS-3.5 Y(3) — BF16 mirrors of im2col / im2col_1d / add_bias.
+    // im2col[/_1d] are pure memcpy + zero-fill (no FP arithmetic), so
+    // the C parameter type is `unsigned short*` matching `half::bf16`'s
+    // `repr(transparent) u16` byte layout (BF16 +0 bit pattern is also
+    // `(unsigned short)0`). add_bias_bf16 needs FP arithmetic, so it
+    // pulls in `<cuda_bf16.h>` for `__nv_bfloat16` and rounds through
+    // f32 (no `__hadd` overload exists for bf16 below sm_80; we already
+    // gate at `GpuTensor::check_bf16_hardware`, but the f32 round-trip
+    // also matches `gemm_bf16`'s CUBLAS_COMPUTE_32F accumulator policy).
+    "im2col_bf16_kernel",
+    "im2col_1d_bf16_kernel",
+    "add_bias_bf16_kernel",
 ];
 
 /// Convolution CUDA kernel source code
@@ -389,5 +401,137 @@ extern "C" __global__ void add_bias_f16_kernel(
     size_t channel = (idx / spatial_size) % channels;
     float sum = __half2float(output[idx]) + __half2float(bias[channel]);
     output[idx] = __float2half_rn(sum);
+}
+
+// ============================================================================
+// WS-3.5 Y(3) — BF16 conv-side kernels.
+//
+// im2col / im2col_1d are pure memcpy + zero-fill on padding, so the BF16
+// mirrors operate on `unsigned short*` (byte-identical to `half::bf16`'s
+// `repr(transparent) u16`). The padding zero-fill `(unsigned short)0` is
+// the BF16 +0 bit pattern (sign+exponent+mantissa all zero) — identical
+// to `__float2bfloat16(0.0f)`. The implementation is shape-for-shape
+// identical to the FP16 kernels; only the kernel name changes.
+//
+// add_bias_bf16_kernel needs FP arithmetic. cuBLAS' `gemm_bf16` already
+// accumulates in f32; we mirror that here by rounding through f32 for
+// the bias add. Avoids reliance on `__hadd(__nv_bfloat16, ...)` (sm_80+
+// only — already gated at `GpuTensor::check_bf16_hardware`).
+// ============================================================================
+#include <cuda_bf16.h>
+
+extern "C" __global__ void im2col_bf16_kernel(
+    unsigned short* col_matrix,
+    const unsigned short* input,
+    size_t batch_size,
+    size_t channels,
+    size_t height,
+    size_t width,
+    size_t kernel_h,
+    size_t kernel_w,
+    size_t stride_h,
+    size_t stride_w,
+    size_t pad_h,
+    size_t pad_w,
+    size_t out_h,
+    size_t out_w
+) {
+    size_t col_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_cols = batch_size * out_h * out_w;
+    if (col_idx >= total_cols) return;
+
+    size_t batch = col_idx / (out_h * out_w);
+    size_t spatial_idx = col_idx % (out_h * out_w);
+    size_t out_y = spatial_idx / out_w;
+    size_t out_x = spatial_idx % out_w;
+
+    size_t in_y_start = out_y * stride_h;
+    size_t in_x_start = out_x * stride_w;
+
+    size_t row_idx = 0;
+
+    for (size_t c = 0; c < channels; c++) {
+        for (size_t ky = 0; ky < kernel_h; ky++) {
+            for (size_t kx = 0; kx < kernel_w; kx++) {
+                size_t in_y = in_y_start + ky;
+                size_t in_x = in_x_start + kx;
+
+                unsigned short val = (unsigned short)0; // bf16 +0 bit pattern.
+
+                if (in_y >= pad_h && in_y < height + pad_h &&
+                    in_x >= pad_w && in_x < width + pad_w) {
+                    size_t actual_y = in_y - pad_h;
+                    size_t actual_x = in_x - pad_w;
+                    size_t input_idx = batch * (channels * height * width) +
+                                       c * (height * width) +
+                                       actual_y * width +
+                                       actual_x;
+                    val = input[input_idx];
+                }
+
+                col_matrix[row_idx * total_cols + col_idx] = val;
+                row_idx++;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void im2col_1d_bf16_kernel(
+    unsigned short* col_matrix,
+    const unsigned short* input,
+    size_t batch_size,
+    size_t channels,
+    size_t length,
+    size_t kernel_size,
+    size_t stride,
+    size_t padding,
+    size_t dilation,
+    size_t out_length
+) {
+    size_t col_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_cols = batch_size * out_length;
+    if (col_idx >= total_cols) return;
+
+    size_t batch = col_idx / out_length;
+    size_t out_pos = col_idx % out_length;
+
+    size_t in_pos_start = out_pos * stride;
+    size_t row_idx = 0;
+
+    for (size_t c = 0; c < channels; c++) {
+        for (size_t k = 0; k < kernel_size; k++) {
+            size_t in_pos = in_pos_start + k * dilation;
+
+            unsigned short val = (unsigned short)0;
+            if (in_pos >= padding && in_pos < length + padding) {
+                size_t actual_pos = in_pos - padding;
+                size_t input_idx = batch * (channels * length) + c * length + actual_pos;
+                val = input[input_idx];
+            }
+
+            col_matrix[row_idx * total_cols + col_idx] = val;
+            row_idx++;
+        }
+    }
+}
+
+// add_bias_bf16: per-channel bias add. BF16 IO; the running sum stays
+// in f32 to match `gemm_bf16`'s CUBLAS_COMPUTE_32F accumulator policy
+// and to dodge the lack of a stable `__hadd` for bf16 on sub-Ampere
+// drivers (we already gate at sm_80+).
+extern "C" __global__ void add_bias_bf16_kernel(
+    __nv_bfloat16* output,
+    const __nv_bfloat16* bias,
+    size_t batch_size,
+    size_t channels,
+    size_t spatial_size
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch_size * channels * spatial_size;
+    if (idx >= total) return;
+
+    size_t channel = (idx / spatial_size) % channels;
+    float sum = __bfloat162float(output[idx]) + __bfloat162float(bias[channel]);
+    output[idx] = __float2bfloat16_rn(sum);
 }
 "#;
