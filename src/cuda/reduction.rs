@@ -52,16 +52,28 @@ const KERNEL_NAMES: &[&str] = &[
     // reduction; the f32 accumulator pattern matches gemm_fp16_acc32.
     "reduce_mean_f16_kernel",
     "softmax_f16_kernel",
+    // WS-3.5 Y(2) sub-2c: BF16 IO with f32 accumulator. Same f32
+    // accumulator strategy as the FP16 path — BF16's wider exponent
+    // (8-bit, FP32-range) means accumulation overflow is less likely
+    // than FP16, but the coarser 7-bit mantissa makes pure-BF16
+    // accumulation lose precision rapidly. f32 accumulator is the
+    // correctness-stable choice. LayerNorm is NEW for BF16 (no FP16
+    // LayerNorm kernel exists today — see commit body for context).
+    "reduce_mean_bf16_kernel",
+    "softmax_bf16_kernel",
+    "layer_norm_bf16_kernel",
 ];
 
 /// Reduction CUDA kernel source code.
 ///
 /// `CUDART_INF_F` comes from `math_constants.h`, auto-included by
 /// garboard's `compile_for_device`. `<cuda_fp16.h>` is needed for the
-/// WS-3 M3.4 sub-3 FP16 reductions and is supplied by NVRTC's default
-/// include path.
+/// WS-3 M3.4 sub-3 FP16 reductions; `<cuda_bf16.h>` is needed for the
+/// WS-3.5 Y(2) sub-2c BF16 reductions. Both are supplied by NVRTC's
+/// default include path.
 const REDUCTION_KERNELS: &str = r#"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 // Block-level reduction using shared memory
 // Each block reduces its portion, then atomically adds to output
@@ -301,6 +313,123 @@ extern "C" __global__ void softmax_f16_kernel(
         }
     }
 }
+
+// =============================================================================
+// WS-3.5 Y(2) sub-2c BF16 reductions: BF16 IO with f32 accumulator.
+//
+// Same f32-accumulator pattern as the FP16 reductions above. BF16's
+// 8-bit exponent (FP32-range) makes overflow less likely than FP16, but
+// its 7-bit mantissa loses precision faster — pure-BF16 accumulation
+// would alias adjacent activations on long axes. f32 accumulator is the
+// correctness-stable choice, mirroring gemm_bf16_acc32.
+//
+// LayerNorm scale/bias are typed as `const float*` (f32) — no FP16
+// LayerNorm kernel exists today to mirror, and the principled choice
+// for a wider-exponent dtype's affine params is f32 (matches the f32
+// LayerNorm kernel above; ONNX's LayerNormalization spec doesn't
+// require scale/bias dtype = data dtype).
+// =============================================================================
+
+extern "C" __global__ void reduce_mean_bf16_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* inp,
+    size_t outer_size,
+    size_t axis_size
+) {
+    size_t outer_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (outer_idx < outer_size) {
+        float sum = 0.0f;
+        const __nv_bfloat16* row = inp + outer_idx * axis_size;
+        for (size_t i = 0; i < axis_size; i++) {
+            sum += __bfloat162float(row[i]);
+        }
+        out[outer_idx] = __float2bfloat16_rn(sum / (float)axis_size);
+    }
+}
+
+// Numerically stable softmax along last axis, BF16 IO + f32 accumulator.
+//   softmax(x)_i = exp(x_i - max(x)) / sum(exp(x - max(x)))
+// Stages exp(x - max) into out_row in BF16 (one round-trip ULP) so the
+// normalize pass can read it back without a second device-memory scratch.
+extern "C" __global__ void softmax_bf16_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* inp,
+    size_t outer_size,
+    size_t axis_size
+) {
+    size_t outer_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (outer_idx < outer_size) {
+        const __nv_bfloat16* in_row = inp + outer_idx * axis_size;
+        __nv_bfloat16* out_row = out + outer_idx * axis_size;
+
+        // Find max in float (faster than __hgt and avoids any sNaN
+        // propagation issues with attention logits).
+        float max_val = -CUDART_INF_F;
+        for (size_t i = 0; i < axis_size; i++) {
+            float v = __bfloat162float(in_row[i]);
+            if (v > max_val) max_val = v;
+        }
+
+        // Exp(x - max) — stage f32 result into out_row (one round-trip
+        // through bf16 so the value survives the second pass).
+        float sum = 0.0f;
+        for (size_t i = 0; i < axis_size; i++) {
+            float e = expf(__bfloat162float(in_row[i]) - max_val);
+            out_row[i] = __float2bfloat16_rn(e);
+            sum += e;
+        }
+
+        // Normalize. Read the staged bf16, divide in f32, round once.
+        for (size_t i = 0; i < axis_size; i++) {
+            float e = __bfloat162float(out_row[i]);
+            out_row[i] = __float2bfloat16_rn(e / sum);
+        }
+    }
+}
+
+// LayerNorm BF16: y = (x - mean) / sqrt(var + eps) * gamma + beta
+// Inputs/outputs BF16; mean/var/scale/bias all f32 internally.
+extern "C" __global__ void layer_norm_bf16_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* inp,
+    const float* gamma,  // scale, size = axis_size (f32 — see comment block above)
+    const float* beta,   // bias, size = axis_size (f32 — see comment block above)
+    size_t outer_size,
+    size_t axis_size,
+    float eps
+) {
+    size_t outer_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (outer_idx < outer_size) {
+        const __nv_bfloat16* in_row = inp + outer_idx * axis_size;
+        __nv_bfloat16* out_row = out + outer_idx * axis_size;
+
+        // Mean in f32 — accumulate via __bfloat162float lifts.
+        float mean = 0.0f;
+        for (size_t i = 0; i < axis_size; i++) {
+            mean += __bfloat162float(in_row[i]);
+        }
+        mean /= (float)axis_size;
+
+        // Variance in f32.
+        float var = 0.0f;
+        for (size_t i = 0; i < axis_size; i++) {
+            float d = __bfloat162float(in_row[i]) - mean;
+            var += d * d;
+        }
+        var /= (float)axis_size;
+        float inv_std = rsqrtf(var + eps);
+
+        // Normalize, scale, bias — all f32 then round once on store.
+        for (size_t i = 0; i < axis_size; i++) {
+            float normalized = (__bfloat162float(in_row[i]) - mean) * inv_std;
+            float scaled = normalized * gamma[i] + beta[i];
+            out_row[i] = __float2bfloat16_rn(scaled);
+        }
+    }
+}
 "#;
 
 // =============================================================================
@@ -324,6 +453,39 @@ fn launch_axis_reduction(
         kernels.module().typed_kernel::<(
             &mut DeviceSlice<'_, f32>,
             &DeviceSlice<'_, f32>,
+            usize,
+            usize,
+        )>(name)
+    }
+    .map_err(|e| CudaError::Kernel(format!("{} lookup failed: {}", name, e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(outer_size as u32),
+            (out, inp, outer_size, axis_size),
+        )
+        .map_err(|e| CudaError::Kernel(format!("{} launch failed: {}", name, e)))
+}
+
+/// Unary BF16 axis reduction: `(out, in, outer_size, axis_size)`.
+/// Covers reduce_mean_bf16 and softmax_bf16. The C kernel parameter
+/// type is `__nv_bfloat16*`, ABI-compatible with `half::bf16`.
+fn launch_axis_reduction_bf16(
+    ctx: &IconnxCudaContext,
+    kernels: &ReductionKernelCache,
+    name: &'static str,
+    out: &mut DeviceSlice<'static, half::bf16>,
+    inp: &DeviceSlice<'static, half::bf16>,
+    outer_size: usize,
+    axis_size: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: kernel signature is
+    // `(__nv_bfloat16* out, const __nv_bfloat16* inp, size_t outer_size, size_t axis_size)`.
+    let kernel = unsafe {
+        kernels.module().typed_kernel::<(
+            &mut DeviceSlice<'_, half::bf16>,
+            &DeviceSlice<'_, half::bf16>,
             usize,
             usize,
         )>(name)
@@ -516,6 +678,22 @@ pub fn gpu_reduce_mean_axis(
             )?;
             Ok(out)
         }
+        super::tensor::DType::BFloat16 => {
+            if outer_size == 0 {
+                return pool.get_tensor_bf16(ctx, vec![1]);
+            }
+            let mut out = pool.get_tensor_bf16(ctx, out_shape)?;
+            launch_axis_reduction_bf16(
+                ctx,
+                kernels,
+                "reduce_mean_bf16_kernel",
+                out.data_bf16_mut()?,
+                input.data_bf16()?,
+                outer_size,
+                axis_size,
+            )?;
+            Ok(out)
+        }
         dt => Err(CudaError::Kernel(format!(
             "ReduceMean: unsupported dtype {}",
             dt.name()
@@ -571,6 +749,19 @@ pub fn gpu_softmax(
             )?;
             Ok(out)
         }
+        super::tensor::DType::BFloat16 => {
+            let mut out = pool.get_tensor_bf16(ctx, shape.to_vec())?;
+            launch_axis_reduction_bf16(
+                ctx,
+                kernels,
+                "softmax_bf16_kernel",
+                out.data_bf16_mut()?,
+                input.data_bf16()?,
+                outer_size,
+                axis_size,
+            )?;
+            Ok(out)
+        }
         dt => Err(CudaError::Kernel(format!(
             "Softmax: unsupported dtype {}",
             dt.name()
@@ -601,41 +792,109 @@ pub fn gpu_layer_norm(
     assert_eq!(gamma.len(), axis_size, "gamma must match axis size");
     assert_eq!(beta.len(), axis_size, "beta must match axis size");
 
-    let mut out = pool.get_tensor_f32(ctx, shape.to_vec())?;
+    match input.dtype() {
+        super::tensor::DType::Float32 => {
+            let mut out = pool.get_tensor_f32(ctx, shape.to_vec())?;
 
-    // SAFETY: layer_norm_kernel signature is
-    // `(float* out, const float* inp, const float* gamma, const float* beta,
-    //   size_t outer_size, size_t axis_size, float eps)`.
-    let kernel = unsafe {
-        kernels.module().typed_kernel::<(
-            &mut DeviceSlice<'_, f32>,
-            &DeviceSlice<'_, f32>,
-            &DeviceSlice<'_, f32>,
-            &DeviceSlice<'_, f32>,
-            usize,
-            usize,
-            f32,
-        )>("layer_norm_kernel")
+            // SAFETY: layer_norm_kernel signature is
+            // `(float* out, const float* inp, const float* gamma, const float* beta,
+            //   size_t outer_size, size_t axis_size, float eps)`.
+            let kernel = unsafe {
+                kernels.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, f32>,
+                    &DeviceSlice<'_, f32>,
+                    &DeviceSlice<'_, f32>,
+                    &DeviceSlice<'_, f32>,
+                    usize,
+                    usize,
+                    f32,
+                )>("layer_norm_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("layer_norm_kernel lookup failed: {}", e))
+            })?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &LaunchConfig::for_num_elems(outer_size as u32),
+                    (
+                        out.data_f32_mut()?,
+                        input.data_f32()?,
+                        gamma.data_f32()?,
+                        beta.data_f32()?,
+                        outer_size,
+                        axis_size,
+                        eps,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("layer_norm_kernel launch failed: {}", e))
+                })?;
+
+            Ok(out)
+        }
+        super::tensor::DType::BFloat16 => {
+            // WS-3.5 Y(2) sub-2c: BF16 IO with f32 accumulator. scale +
+            // bias remain f32 — see the kernel-source comment block for
+            // why (no FP16 LayerNorm to mirror; principled choice for a
+            // wider-exponent dtype's affine params is f32).
+            assert_eq!(
+                gamma.dtype(),
+                super::tensor::DType::Float32,
+                "BF16 LayerNorm: gamma must be f32 (affine params stay in f32)"
+            );
+            assert_eq!(
+                beta.dtype(),
+                super::tensor::DType::Float32,
+                "BF16 LayerNorm: beta must be f32 (affine params stay in f32)"
+            );
+            let mut out = pool.get_tensor_bf16(ctx, shape.to_vec())?;
+
+            // SAFETY: layer_norm_bf16_kernel signature is
+            // `(__nv_bfloat16* out, const __nv_bfloat16* inp,
+            //   const float* gamma, const float* beta,
+            //   size_t outer_size, size_t axis_size, float eps)`.
+            let kernel = unsafe {
+                kernels.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, half::bf16>,
+                    &DeviceSlice<'_, half::bf16>,
+                    &DeviceSlice<'_, f32>,
+                    &DeviceSlice<'_, f32>,
+                    usize,
+                    usize,
+                    f32,
+                )>("layer_norm_bf16_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("layer_norm_bf16_kernel lookup failed: {}", e))
+            })?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &LaunchConfig::for_num_elems(outer_size as u32),
+                    (
+                        out.data_bf16_mut()?,
+                        input.data_bf16()?,
+                        gamma.data_f32()?,
+                        beta.data_f32()?,
+                        outer_size,
+                        axis_size,
+                        eps,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("layer_norm_bf16_kernel launch failed: {}", e))
+                })?;
+
+            Ok(out)
+        }
+        dt => Err(CudaError::Kernel(format!(
+            "LayerNorm: unsupported dtype {}",
+            dt.name()
+        ))),
     }
-    .map_err(|e| CudaError::Kernel(format!("layer_norm_kernel lookup failed: {}", e)))?;
-
-    kernel
-        .launch(
-            ctx.garboard_stream(),
-            &LaunchConfig::for_num_elems(outer_size as u32),
-            (
-                out.data_f32_mut()?,
-                input.data_f32()?,
-                gamma.data_f32()?,
-                beta.data_f32()?,
-                outer_size,
-                axis_size,
-                eps,
-            ),
-        )
-        .map_err(|e| CudaError::Kernel(format!("layer_norm_kernel launch failed: {}", e)))?;
-
-    Ok(out)
 }
 
 #[cfg(test)]
