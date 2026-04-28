@@ -36,6 +36,12 @@ pub struct IconnxCudaContext {
     /// operations take `&mut self` (workspace auto-grows), but
     /// `IconnxCudaContext` is passed as `&ctx` at inference sites.
     dnn: RefCell<DnnContext<'static>>,
+    /// Compute capability `(major, minor)` queried once at construction
+    /// from the garboard device's `DeviceProperties`. WS-3.5 introduced
+    /// this cache because BF16 hardware-capability gating needs constant-
+    /// time access (one-time-per-graph-load check, zero per-op overhead).
+    /// Pre-WS-3.5 iconnx never queried compute capability.
+    compute_capability: (i32, i32),
 }
 
 impl IconnxCudaContext {
@@ -70,12 +76,17 @@ impl IconnxCudaContext {
         let dnn = garboard_device
             .create_dnn_context()
             .map_err(|e| CudaError::Cudnn(e.to_string()))?;
+        let compute_capability = garboard_device
+            .properties()
+            .map_err(|e| CudaError::DeviceInit(e.to_string()))?
+            .compute_capability;
 
         Ok(Self {
             garboard_device,
             garboard_stream,
             blas,
             dnn: RefCell::new(dnn),
+            compute_capability,
         })
     }
 
@@ -105,6 +116,18 @@ impl IconnxCudaContext {
     /// Used for async transfers and TypedKernel launches.
     pub fn garboard_stream(&self) -> &GbStream<'static> {
         &self.garboard_stream
+    }
+
+    /// Compute capability of the underlying CUDA device, returned as
+    /// `(major, minor)`. Cached at context construction so each call is
+    /// O(1) (no `cuDeviceGetAttribute` round-trip).
+    ///
+    /// Used by WS-3.5 BF16 hardware-capability gate (`sm_80+` required
+    /// for native bfloat16 intrinsics) at `GpuTensor::zeros_bf16` /
+    /// `GpuTensor::from_host_bf16`. iconnx didn't query compute
+    /// capability anywhere prior to WS-3.5.
+    pub fn compute_capability(&self) -> (i32, i32) {
+        self.compute_capability
     }
 
     // ==================== Memory API (garboard) ====================
@@ -243,6 +266,14 @@ impl IconnxCudaContext {
         self.zero_slice(slice)
     }
 
+    /// Zero out a bf16 slice in place. WS-3.5 Y(1).
+    pub fn zero_bf16(
+        &self,
+        slice: &mut GbDeviceSlice<'static, half::bf16>,
+    ) -> Result<(), CudaError> {
+        self.zero_slice(slice)
+    }
+
     /// Internal helper: zero a garboard slice on the garboard user stream.
     ///
     /// Uses garboard's `Stream::memset_zero`, which enqueues
@@ -284,6 +315,28 @@ pub enum CudaError {
     /// This is a sentinel, not a hard error: the executor catches it and
     /// runs the individual ops instead.
     FusionShapeMismatch(String),
+    /// Hardware does not meet the minimum compute capability for the
+    /// requested dtype. WS-3.5 introduced this for BF16 (sm_80+); future
+    /// dtypes that pin a higher floor will reuse the same variant.
+    UnsupportedHardware {
+        dtype: &'static str,
+        required_compute_capability: &'static str,
+        device_compute_capability: String,
+    },
+    /// Shape and data length disagree at GPU upload. WS-3.5 introduced
+    /// this typed variant to replace the previous `assert_eq!`-on-shape-
+    /// mismatch panic in the per-dtype `from_host_*` constructors. Older
+    /// constructors keep the assert for backward compatibility; new BF16
+    /// path uses this typed error from the start.
+    ShapeMismatch { data_len: usize, expected: usize },
+    /// Operation called on a tensor of the wrong dtype. WS-3.5 typed
+    /// variant for the BF16 surface; older surfaces use the generic
+    /// `Kernel(String)` path which carries the same information as a
+    /// formatted message.
+    DtypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
 }
 
 impl std::fmt::Display for CudaError {
@@ -300,6 +353,23 @@ impl std::fmt::Display for CudaError {
             CudaError::Memory(s) => write!(f, "CUDA memory operation failed: {}", s),
             CudaError::FusionShapeMismatch(s) => {
                 write!(f, "Fusion shape mismatch (fallback): {}", s)
+            }
+            CudaError::UnsupportedHardware {
+                dtype,
+                required_compute_capability,
+                device_compute_capability,
+            } => write!(
+                f,
+                "hardware does not support {}: requires {}, device is {}",
+                dtype, required_compute_capability, device_compute_capability
+            ),
+            CudaError::ShapeMismatch { data_len, expected } => write!(
+                f,
+                "shape mismatch: data has {} elements but expected {}",
+                data_len, expected
+            ),
+            CudaError::DtypeMismatch { expected, actual } => {
+                write!(f, "dtype mismatch: expected {}, got {}", expected, actual)
             }
         }
     }

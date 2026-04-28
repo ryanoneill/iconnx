@@ -299,6 +299,15 @@ fn binary_comparison(
                 dtype.name()
             )));
         }
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5 Y(1) R3 punch list. BF16 not yet exercised by any
+            // active roster comparison op; if BERT-base BF16 / Whisper-
+            // Tiny BF16 e2e surfaces a need, Y(2) will wire a real kernel
+            // (BF16's 8-bit exponent makes direct comparison meaningful).
+            return Err(CudaError::Kernel(
+                "Comparison does not yet support bfloat16 (WS-3.5 Y(2) lights up if a roster model exercises it)".to_string(),
+            ));
+        }
     }
 
     Ok(output)

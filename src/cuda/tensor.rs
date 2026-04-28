@@ -19,6 +19,11 @@ use super::context::{CudaError, IconnxCudaContext};
 pub enum DType {
     Float32,
     Float16,
+    /// IEEE bfloat16 — 8-bit exponent (FP32-compatible range), 7-bit
+    /// mantissa. Bit-compatible with CUDA `__nv_bfloat16`. Native
+    /// compute requires sm_80+ (Ampere); see
+    /// `GpuTensor::check_bf16_hardware`. Added in WS-3.5.
+    BFloat16,
     Int64,
     Int32,
     Int8,
@@ -32,6 +37,7 @@ impl DType {
         match self {
             DType::Float32 => 4,
             DType::Float16 => 2,
+            DType::BFloat16 => 2,
             DType::Int64 => 8,
             DType::Int32 => 4,
             DType::Int8 => 1,
@@ -45,6 +51,7 @@ impl DType {
         match self {
             DType::Float32 => "float32",
             DType::Float16 => "float16",
+            DType::BFloat16 => "bfloat16",
             DType::Int64 => "int64",
             DType::Int32 => "int32",
             DType::Int8 => "int8",
@@ -61,6 +68,8 @@ impl DType {
 pub enum TypedSlice {
     Float32(DeviceSlice<'static, f32>),
     Float16(DeviceSlice<'static, half::f16>),
+    /// IEEE bfloat16 — element type is `half::bf16`. Added in WS-3.5.
+    BFloat16(DeviceSlice<'static, half::bf16>),
     Int64(DeviceSlice<'static, i64>),
     Int32(DeviceSlice<'static, i32>),
     Int8(DeviceSlice<'static, i8>),
@@ -83,6 +92,15 @@ pub enum GpuTensor {
     /// for FP16 model support (Whisper-Tiny encoder FP16, BERT-FP16).
     Float16 {
         data: Arc<DeviceSlice<'static, half::f16>>,
+        shape: Vec<usize>,
+    },
+    /// IEEE bfloat16 — element type is `half::bf16`. Added in WS-3.5
+    /// for BF16 model support (BERT-base BF16, Whisper-Tiny BF16). Native
+    /// compute requires sm_80+ (Ampere); checked at construction in
+    /// `zeros_bf16` / `from_host_bf16`. Bit-compatible with CUDA
+    /// `__nv_bfloat16` for kernel pointer-cast.
+    BFloat16 {
+        data: Arc<DeviceSlice<'static, half::bf16>>,
         shape: Vec<usize>,
     },
     Int64 {
@@ -120,6 +138,7 @@ impl GpuTensor {
         match self {
             GpuTensor::Float32 { shape, .. } => shape,
             GpuTensor::Float16 { shape, .. } => shape,
+            GpuTensor::BFloat16 { shape, .. } => shape,
             GpuTensor::Int64 { shape, .. } => shape,
             GpuTensor::Int32 { shape, .. } => shape,
             GpuTensor::Int8 { shape, .. } => shape,
@@ -148,6 +167,7 @@ impl GpuTensor {
         match self {
             GpuTensor::Float32 { .. } => DType::Float32,
             GpuTensor::Float16 { .. } => DType::Float16,
+            GpuTensor::BFloat16 { .. } => DType::BFloat16,
             GpuTensor::Int64 { .. } => DType::Int64,
             GpuTensor::Int32 { .. } => DType::Int32,
             GpuTensor::Int8 { .. } => DType::Int8,
@@ -170,6 +190,7 @@ impl GpuTensor {
         match self {
             GpuTensor::Float32 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::Float16 { data, .. } => data.as_raw_device_ptr(),
+            GpuTensor::BFloat16 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::Int64 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::Int32 { data, .. } => data.as_raw_device_ptr(),
             GpuTensor::Int8 { data, .. } => data.as_raw_device_ptr(),
@@ -761,6 +782,148 @@ impl GpuTensor {
         matches!(self, GpuTensor::Float16 { .. })
     }
 
+    // ==================== BFloat16 methods ====================
+    //
+    // WS-3.5 Y(1). Mirror of the Float16 methods section above with
+    // `half::f16` → `half::bf16` substitution. Two semantic differences
+    // from the FP16 surface:
+    //
+    //  - Hardware-capability gate: `zeros_bf16` and `from_host_bf16` call
+    //    `check_bf16_hardware` to enforce the sm_80+ floor at the single
+    //    ctor entry. Downstream dispatch sites can assume any
+    //    `GpuTensor::BFloat16` they receive came through this gate.
+    //
+    //  - Typed `CudaError::ShapeMismatch` instead of the older
+    //    `assert_eq!`-on-shape panic — newer-pattern error contract for
+    //    the BF16 surface, parallel to the WS-3 M3.6 typed-error stance.
+
+    /// Create a new BFloat16 GPU tensor from shape and GPU data.
+    ///
+    /// Caller is responsible for ensuring the device data is sized
+    /// appropriately for the shape; this constructor performs no GPU
+    /// allocation, so no hardware check (the slice was already created
+    /// elsewhere — typically by the memory pool, which gates BF16
+    /// allocation paths through `check_bf16_hardware`).
+    pub fn new_bf16(data: DeviceSlice<'static, half::bf16>, shape: Vec<usize>) -> Self {
+        GpuTensor::BFloat16 {
+            data: Arc::new(data),
+            shape,
+        }
+    }
+
+    /// Create a BFloat16 GPU tensor from host data.
+    ///
+    /// Hardware-capability gate: BF16 native compute requires sm_80+.
+    /// Returns `CudaError::UnsupportedHardware` on older devices.
+    pub fn from_host_bf16(
+        ctx: &IconnxCudaContext,
+        data: &[half::bf16],
+        shape: Vec<usize>,
+    ) -> Result<Self, CudaError> {
+        Self::check_bf16_hardware(ctx)?;
+        let expected_len: usize = shape.iter().product();
+        if data.len() != expected_len {
+            return Err(CudaError::ShapeMismatch {
+                data_len: data.len(),
+                expected: expected_len,
+            });
+        }
+        let gpu_data = ctx.htod(data)?;
+        Ok(GpuTensor::BFloat16 {
+            data: Arc::new(gpu_data),
+            shape,
+        })
+    }
+
+    /// Create a zeroed BFloat16 GPU tensor with given shape.
+    ///
+    /// Hardware-capability gate: see `from_host_bf16`.
+    pub fn zeros_bf16(
+        ctx: &IconnxCudaContext,
+        shape: Vec<usize>,
+    ) -> Result<Self, CudaError> {
+        Self::check_bf16_hardware(ctx)?;
+        let len: usize = shape.iter().product();
+        let gpu_data = ctx.alloc_zeros::<half::bf16>(len)?;
+        Ok(GpuTensor::BFloat16 {
+            data: Arc::new(gpu_data),
+            shape,
+        })
+    }
+
+    /// Copy BFloat16 tensor data back to host.
+    pub fn to_host_bf16(&self, ctx: &IconnxCudaContext) -> Result<Vec<half::bf16>, CudaError> {
+        match self {
+            GpuTensor::BFloat16 { data, shape } => {
+                let mut full = ctx.dtoh(data)?;
+                let len: usize = shape.iter().product();
+                full.truncate(len);
+                Ok(full)
+            }
+            _ => Err(CudaError::DtypeMismatch {
+                expected: "bfloat16",
+                actual: self.dtype().name(),
+            }),
+        }
+    }
+
+    /// Get a reference to the underlying BFloat16 `DeviceSlice`.
+    pub fn data_bf16(&self) -> Result<&DeviceSlice<'static, half::bf16>, CudaError> {
+        match self {
+            GpuTensor::BFloat16 { data, .. } => Ok(data),
+            _ => Err(CudaError::DtypeMismatch {
+                expected: "bfloat16",
+                actual: self.dtype().name(),
+            }),
+        }
+    }
+
+    /// Get a mutable reference to the underlying BFloat16 `DeviceSlice`.
+    /// See [`GpuTensor::data_f32_mut`] for the shared-Arc note.
+    pub fn data_bf16_mut(&mut self) -> Result<&mut DeviceSlice<'static, half::bf16>, CudaError> {
+        match self {
+            GpuTensor::BFloat16 { data, .. } => Arc::get_mut(data).ok_or_else(|| {
+                CudaError::Kernel(
+                    "data_bf16_mut: tensor is shared (Arc refcount > 1); \
+                     cannot obtain mutable access without aliasing"
+                        .to_string(),
+                )
+            }),
+            _ => Err(CudaError::DtypeMismatch {
+                expected: "bfloat16",
+                actual: self.dtype().name(),
+            }),
+        }
+    }
+
+    /// Check if this is a BFloat16 tensor.
+    pub fn is_bf16(&self) -> bool {
+        matches!(self, GpuTensor::BFloat16 { .. })
+    }
+
+    /// Hardware-capability check for BF16 native compute.
+    ///
+    /// BF16 native compute requires sm_80+ (Ampere and later: A100, H100,
+    /// RTX 30/40-series). Older Turing (sm_75) compiles bf16 NVRTC but
+    /// emulates with significant perf loss; some intrinsics
+    /// (`__bfloat162float`, `__hadd` on `__nv_bfloat16`) require sm_80+
+    /// outright. Volta (sm_70, V100) has no BF16 support at all.
+    ///
+    /// One-time-per-graph-load check (called from `zeros_bf16` /
+    /// `from_host_bf16`). Downstream dispatch sites can assume any
+    /// `GpuTensor::BFloat16` they receive is hardware-capable.
+    fn check_bf16_hardware(ctx: &IconnxCudaContext) -> Result<(), CudaError> {
+        let (major, minor) = ctx.compute_capability();
+        if major < 8 {
+            return Err(CudaError::UnsupportedHardware {
+                dtype: "bfloat16",
+                required_compute_capability: "sm_80",
+                device_compute_capability: format!("sm_{major}{minor}"),
+            });
+        }
+        Ok(())
+    }
+
     // ==================== Bool methods ====================
 
     /// Create a new Bool GPU tensor from shape and GPU data.
@@ -892,6 +1055,10 @@ impl GpuTensor {
                 data,
                 shape: new_shape,
             }),
+            GpuTensor::BFloat16 { data, .. } => Some(GpuTensor::BFloat16 {
+                data,
+                shape: new_shape,
+            }),
             GpuTensor::Int64 { data, .. } => Some(GpuTensor::Int64 {
                 data,
                 shape: new_shape,
@@ -927,6 +1094,9 @@ impl GpuTensor {
             }
             GpuTensor::Float16 { data, .. } => {
                 Arc::try_unwrap(data).ok().map(TypedSlice::Float16)
+            }
+            GpuTensor::BFloat16 { data, .. } => {
+                Arc::try_unwrap(data).ok().map(TypedSlice::BFloat16)
             }
             GpuTensor::Int64 { data, .. } => {
                 Arc::try_unwrap(data).ok().map(TypedSlice::Int64)

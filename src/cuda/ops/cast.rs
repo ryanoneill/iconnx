@@ -384,6 +384,17 @@ pub fn gpu_cast(
                 target_dtype.name()
             )))
         }
+
+        // WS-3.5 Y(1) R3 punch list: BFloat16 Cast pairs are deferred to
+        // Y(2) sub-2d (10 dtype-pair arms — FP32↔BF16, FP16↔BF16,
+        // Int32↔BF16, Int64↔BF16, plus (Bool, BFloat16) explicit-
+        // unsupported). Same-type case `(DType::BFloat16, DType::BFloat16)`
+        // is already handled by the early-return at the top of `gpu_cast`.
+        (DType::BFloat16, _) | (_, DType::BFloat16) => Err(CudaError::Kernel(format!(
+            "Cast does not yet support {} -> {} (WS-3.5 Y(2) sub-2d will land BF16 Cast pairs; no implementation available in Y(1))",
+            src_dtype.name(),
+            target_dtype.name()
+        ))),
     }
 }
 

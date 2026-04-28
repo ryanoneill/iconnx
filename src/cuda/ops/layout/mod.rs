@@ -473,6 +473,16 @@ pub fn gpu_transpose_nd(
                 input.dtype().name()
             )))
         }
+        GpuTensor::BFloat16 { .. } => {
+            // WS-3.5 Y(1) R3 punch list: BF16 Transpose lights up in
+            // Y(2) sub-1 (memcpy-class). BERT-base BF16 + Whisper-Tiny
+            // BF16 attention paths exercise this op heavily; placeholder
+            // arm here surfaces as a typed error pre-Y(2) rather than
+            // silently dropping into the FP16 path.
+            Err(CudaError::Kernel(
+                "Transpose does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
+            ))
+        }
     }
 }
 
@@ -610,6 +620,14 @@ pub fn gpu_where(
                 "Where does not support {} for x/y (Whisper-FP16 doesn't route FP16 through Where; Bool x/y not on any active graph)",
                 dtype.name()
             )))
+        }
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5 Y(1) R3 punch list. BF16 not yet exercised by any
+            // active roster Where op; if BERT-base BF16 / Whisper-Tiny
+            // BF16 e2e surfaces a need, Y(2) lights up.
+            Err(CudaError::Kernel(
+                "Where does not yet support bfloat16 for x/y (not yet implemented in WS-3.5 — Y(2) lights up if a roster model exercises it)".to_string(),
+            ))
         }
     }
 }
@@ -799,6 +817,14 @@ pub fn gpu_gather(
             "Gather: unsupported input dtype {} (WS-3 M3.4 sub-2+ for Bool; Int32/Int8 not on any active model graph)",
             input.dtype().name()
         ))),
+        GpuTensor::BFloat16 { .. } => {
+            // WS-3.5 Y(1) R3 punch list: BF16 Gather lights up in Y(2)
+            // sub-1 (memcpy-class). BERT-base BF16 token embedding Gather
+            // is a roster-exercised op.
+            Err(CudaError::Kernel(
+                "Gather does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
+            ))
+        }
     }
 }
 
@@ -971,6 +997,13 @@ pub fn gpu_gather_from_gpu(
             "Gather: unsupported input dtype {} (WS-3 M3.4 sub-2+ for Bool; Int32/Int8 not on any active model graph)",
             input.dtype().name()
         ))),
+        GpuTensor::BFloat16 { .. } => {
+            // WS-3.5 Y(1) R3 punch list: BF16 GPU-indices Gather lights up
+            // in Y(2) sub-1 (memcpy-class) — same lift as on-host Gather.
+            Err(CudaError::Kernel(
+                "Gather (GPU indices) does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
+            ))
+        }
     }
 }
 
@@ -1103,6 +1136,15 @@ pub fn gpu_copy(
                 "gpu_copy does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
                 input.dtype().name()
             )))
+        }
+        GpuTensor::BFloat16 { .. } => {
+            // WS-3.5 Y(1) R3 punch list: BF16 gpu_copy lights up in Y(2)
+            // sub-2a (per WS-1 M1.4 commit `01213c5` non-polymorphism note,
+            // a dedicated `copy_bf16_kernel` plus dispatch arm is the
+            // shape Y(2) needs).
+            Err(CudaError::Kernel(
+                "gpu_copy does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
+            ))
         }
     }
 }
@@ -1404,6 +1446,15 @@ pub fn gpu_concat(
                 dtype.name()
             )))
         }
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5 Y(1) R3 punch list: BF16 Concat lights up in Y(2)
+            // sub-1 (memcpy-class). Whisper-Tiny BF16 encoder concatenates
+            // BF16 activations along the time axis at the same shape FP16
+            // exercises.
+            Err(CudaError::Kernel(
+                "Concat does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
+            ))
+        }
     }
 }
 
@@ -1666,6 +1717,14 @@ pub fn gpu_expand(
                 )
                 .map_err(|e| CudaError::Kernel(format!("expand_bool launch failed: {}", e)))?;
             Ok(output)
+        }
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5 Y(1) R3 punch list: BF16 Expand lights up in Y(2)
+            // sub-1 (memcpy-class). Memcpy-class layout-broadcast op
+            // mirrors the FP16 arm structurally; placeholder pre-Y(2).
+            Err(CudaError::Kernel(
+                "Expand does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
+            ))
         }
     }
 }
@@ -2539,6 +2598,16 @@ pub fn gpu_nonzero(ctx: &IconnxCudaContext, input: &GpuTensor) -> Result<GpuTens
             .map(|v| v != 0)
             .collect(),
         crate::cuda::tensor::DType::Bool => input.to_host_bool(ctx)?,
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5 Y(1) R3 punch list: BF16 NonZero lights up in Y(2)
+            // sub-1 (memcpy-class). NonZero is dtype-input-polymorphic
+            // per M3.7c (always returns Int64 indices) so the BF16 arm
+            // is straightforward — defer to Y(2) for symmetry with the
+            // rest of the layout-op BF16 wave.
+            return Err(CudaError::Kernel(
+                "NonZero does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
+            ));
+        }
     };
 
     let mut all_indices: Vec<Vec<i64>> = vec![Vec::new(); ndim];
@@ -2715,6 +2784,13 @@ pub fn gpu_slice_nd(
                     "Slice does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
                     dtype.name()
                 )))
+            }
+            crate::cuda::tensor::DType::BFloat16 => {
+                // WS-3.5 Y(1) R3 punch list: BF16 zero-element Slice
+                // lights up in Y(2) sub-1 (memcpy-class).
+                Err(CudaError::Kernel(
+                    "Slice does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
+                ))
             }
         };
     }
@@ -3041,6 +3117,14 @@ pub fn gpu_slice_nd(
                 "Slice does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
                 dtype.name()
             )))
+        }
+        (_, crate::cuda::tensor::DType::BFloat16) => {
+            // WS-3.5 Y(1) R3 punch list: BF16 ND-Slice lights up in
+            // Y(2) sub-1 (memcpy-class). BERT-base BF16 attention slicing
+            // is roster-exercised; placeholder pre-Y(2).
+            Err(CudaError::Kernel(
+                "Slice does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
+            ))
         }
     }
 }

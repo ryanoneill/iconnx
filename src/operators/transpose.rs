@@ -60,6 +60,9 @@ impl Transpose {
             Tensor::Float16(arr) => {
                 Tensor::Float16(arr.clone().permuted_axes(perm))
             }
+            Tensor::BFloat16(arr) => {
+                Tensor::BFloat16(arr.clone().permuted_axes(perm))
+            }
         }
     }
 }

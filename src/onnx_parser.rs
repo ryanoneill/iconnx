@@ -364,6 +364,17 @@ impl OnnxModel {
                     let final_shape = self.correct_shape(&name, &shape, expected_len, data.len())?;
                     crate::tensor::Tensor::from_vec_f16(data, final_shape)
                 }
+                16 => {
+                    // BFLOAT16 (bf16) — WS-3.5 Y(1). Wire format mirrors
+                    // FLOAT16 (data_type = 10): int32_data carries one
+                    // i32 per element with the low 16 bits = bf16 bit
+                    // pattern, or raw_data carries 2 bytes per element
+                    // little-endian. Bit-compatible with CUDA
+                    // `__nv_bfloat16` for zero-copy GPU upload.
+                    let data = Self::decode_bf16_payload(&name, tensor_proto)?;
+                    let final_shape = self.correct_shape(&name, &shape, expected_len, data.len())?;
+                    crate::tensor::Tensor::from_vec_bf16(data, final_shape)
+                }
                 other => {
                     return Err(ParseError::UnsupportedInitializerDType {
                         name,
@@ -601,6 +612,47 @@ impl OnnxModel {
             .collect())
     }
 
+    fn decode_bf16_payload(
+        name: &str,
+        tensor_proto: &onnx_proto::TensorProto,
+    ) -> Result<Vec<half::bf16>, ParseError> {
+        // ONNX wire format: BFLOAT16 carries elements in int32_data
+        // (one i32 per element; low 16 bits are the bf16 bit pattern,
+        // high 16 bits ignored) or raw_data (2 bytes per element,
+        // little-endian bf16 bit pattern). WS-3.5 Y(1). Mirrors the
+        // FLOAT16 decode path with `half::bf16` instead of `half::f16`.
+        if !tensor_proto.int32_data.is_empty() {
+            return Ok(tensor_proto
+                .int32_data
+                .iter()
+                .map(|&v| half::bf16::from_bits(v as u16))
+                .collect());
+        }
+        let raw = tensor_proto.raw_data.as_ref().ok_or_else(|| ParseError::InvalidTensorData {
+            name: name.to_string(),
+            reason: "no int32_data and no raw_data".to_string(),
+        })?;
+        if raw.is_empty() {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: "empty raw_data for BFLOAT16 tensor".to_string(),
+            });
+        }
+        if raw.len() % 2 != 0 {
+            return Err(ParseError::InvalidTensorData {
+                name: name.to_string(),
+                reason: format!(
+                    "raw_data length {} not a multiple of 2 for BFLOAT16",
+                    raw.len()
+                ),
+            });
+        }
+        Ok(raw
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]))
+            .collect())
+    }
+
     /// Reconcile declared shape with actual data length.
     ///
     /// * Default / strict: any mismatch becomes
@@ -773,6 +825,7 @@ impl OnnxModel {
                 3 => Ok(crate::tensor::Tensor::from_vec_i8(Vec::new(), shape)),
                 2 => Ok(crate::tensor::Tensor::from_vec_u8(Vec::new(), shape)),
                 10 => Ok(crate::tensor::Tensor::from_vec_f16(Vec::new(), shape)),
+                16 => Ok(crate::tensor::Tensor::from_vec_bf16(Vec::new(), shape)),
                 other => Err(ParseError::UnsupportedDType {
                     name,
                     dtype_id: other,
@@ -1055,6 +1108,53 @@ impl OnnxModel {
                     });
                 }
                 Ok(crate::tensor::Tensor::from_vec_f16(data, shape))
+            }
+            16 => {
+                // BFLOAT16 (bf16) — WS-3.5 Y(1). Wire format mirrors
+                // FLOAT16 (data_type = 10): int32_data carries one i32
+                // per element with low 16 bits = bf16 bit pattern, or
+                // raw_data carries 2 bytes per element little-endian.
+                let data: Vec<half::bf16> = if !tensor_proto.int32_data.is_empty() {
+                    tensor_proto
+                        .int32_data
+                        .iter()
+                        .map(|&v| half::bf16::from_bits(v as u16))
+                        .collect()
+                } else if let Some(raw) = &tensor_proto.raw_data {
+                    if raw.is_empty() {
+                        return Err(ParseError::InvalidTensorData {
+                            name,
+                            reason: "empty raw_data for BFLOAT16 tensor".to_string(),
+                        });
+                    }
+                    if raw.len() % 2 != 0 {
+                        return Err(ParseError::InvalidTensorData {
+                            name,
+                            reason: format!(
+                                "raw_data length {} not a multiple of 2 for BFLOAT16",
+                                raw.len()
+                            ),
+                        });
+                    }
+                    raw.chunks_exact(2)
+                        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]))
+                        .collect()
+                } else {
+                    return Err(ParseError::InvalidTensorData {
+                        name,
+                        reason: "no int32_data and no raw_data".to_string(),
+                    });
+                };
+
+                if data.len() != expected_len {
+                    return Err(ParseError::ShapeMismatch {
+                        name,
+                        declared: shape,
+                        declared_len: expected_len,
+                        actual_len: data.len(),
+                    });
+                }
+                Ok(crate::tensor::Tensor::from_vec_bf16(data, shape))
             }
             other => Err(ParseError::UnsupportedDType {
                 name,
@@ -1353,41 +1453,103 @@ mod tests {
     }
 
     #[test]
-    fn extract_weights_unsupported_dtype_returns_error() {
-        // dtype 16 = BFLOAT16 — not representable in today's Tensor
-        // enum; must be an Err per WS-1, not silently dropped. (FP16
-        // moved into the supported set in WS-3 M3.2; BFLOAT16 is the
-        // natural still-unsupported example.)
-        let mut init = init_proto("bf16_weights", 16, vec![4]);
-        init.raw_data = Some(vec![0u8; 8]);
+    fn extract_weights_decodes_bfloat16_via_raw_data() {
+        // WS-3.5 Y(1): BFLOAT16 (data_type = 16) parses successfully.
+        // Wire format mirrors FLOAT16: raw_data carries 2 bytes per
+        // element, little-endian bf16 bit pattern.
+        use half::bf16;
+        let mut init = init_proto("bf16_weights", 16, vec![3]);
+        let vals = [bf16::from_f32(1.5), bf16::from_f32(-2.0), bf16::from_f32(0.0)];
+        let mut bytes = Vec::with_capacity(6);
+        for v in &vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        init.raw_data = Some(bytes);
         let model = model_with_initializer(init);
 
-        match model.extract_weights() {
-            Err(ParseError::UnsupportedInitializerDType { name, dtype_id }) => {
-                assert_eq!(name, "bf16_weights");
-                assert_eq!(dtype_id, 16);
+        let weights = model
+            .extract_weights()
+            .expect("bf16 raw_data should decode");
+        match weights.get("bf16_weights").unwrap() {
+            Tensor::BFloat16(arr) => {
+                assert_eq!(arr.shape(), &[3]);
+                let v: Vec<f32> = arr.iter().map(|x| x.to_f32()).collect();
+                assert_eq!(v, vec![1.5, -2.0, 0.0]);
             }
-            other => panic!("expected UnsupportedInitializerDType, got {:?}", other),
+            other => panic!("expected Tensor::BFloat16, got {:?}", other),
         }
     }
 
     #[test]
-    fn parse_tensor_proto_unsupported_dtype_returns_error() {
-        // Use a dtype the parser does not yet decode. BFLOAT16 (16)
-        // remains out of scope; FP16 (10) was added in WS-3 M3.2.
+    fn parse_tensor_proto_bfloat16_via_raw_data() {
+        // WS-3.5 Y(1): BFLOAT16 attribute-level tensors decode via
+        // parse_tensor_proto for Constant nodes, etc.
+        use half::bf16;
+        let vals = [bf16::from_f32(2.5), bf16::from_f32(-0.25)];
+        let mut bytes = Vec::with_capacity(4);
+        for v in &vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
         let proto = onnx_proto::TensorProto {
-            name: Some("bf16_weights".to_string()),
+            name: Some("bf16_attr".into()),
             data_type: Some(16),
-            dims: vec![4],
-            raw_data: Some(vec![0u8; 8]),
+            dims: vec![2],
+            raw_data: Some(bytes),
+            ..Default::default()
+        };
+        let tensor = OnnxModel::parse_tensor_proto(&proto).expect("bf16 attr decode");
+        if let Tensor::BFloat16(arr) = tensor {
+            let v: Vec<f32> = arr.iter().map(|x| x.to_f32()).collect();
+            assert_eq!(v, vec![2.5, -0.25]);
+        } else {
+            panic!("expected BFloat16");
+        }
+    }
+
+    #[test]
+    fn parse_tensor_proto_bfloat16_invalid_raw_data_length() {
+        // 3 bytes is not a multiple of 2 → ParseError::InvalidTensorData.
+        // Mirrors FP16 malformed-raw_data test pattern.
+        let proto = onnx_proto::TensorProto {
+            name: Some("bad_bf16".into()),
+            data_type: Some(16),
+            dims: vec![2],
+            raw_data: Some(vec![0x00, 0x3C, 0x00]),
             ..Default::default()
         };
         match OnnxModel::parse_tensor_proto(&proto) {
-            Err(ParseError::UnsupportedDType { name, dtype_id }) => {
-                assert_eq!(name, "bf16_weights");
-                assert_eq!(dtype_id, 16);
+            Err(ParseError::InvalidTensorData { name, reason }) => {
+                assert_eq!(name, "bad_bf16");
+                assert!(
+                    reason.contains("multiple of 2"),
+                    "reason should call out the 2-byte alignment: {reason}"
+                );
             }
-            other => panic!("expected UnsupportedDType, got {:?}", other),
+            other => panic!("expected InvalidTensorData, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_weights_decodes_bfloat16_via_int32_data() {
+        // WS-3.5 Y(1): int32_data path — low 16 bits = bf16 bit pattern,
+        // mirrors FP16's int32_data path for completeness.
+        use half::bf16;
+        let mut init = init_proto("bf16_int32", 16, vec![2]);
+        init.int32_data = vec![
+            bf16::from_f32(0.5).to_bits() as i32,
+            bf16::from_f32(-1.0).to_bits() as i32,
+        ];
+        let model = model_with_initializer(init);
+
+        let weights = model
+            .extract_weights()
+            .expect("bf16 int32_data should decode");
+        match weights.get("bf16_int32").unwrap() {
+            Tensor::BFloat16(arr) => {
+                let v: Vec<f32> = arr.iter().map(|x| x.to_f32()).collect();
+                assert_eq!(v, vec![0.5, -1.0]);
+            }
+            other => panic!("expected Tensor::BFloat16, got {:?}", other),
         }
     }
 
@@ -1578,24 +1740,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_tensor_proto_zero_element_unsupported_dtype_still_errors() {
-        // Zero-element refinement must not mask unsupported dtypes —
-        // a BFLOAT16 tensor with dims=[0] should still surface as
-        // UnsupportedDType rather than silently succeeding. (FP16
-        // moved into the supported set in WS-3 M3.2; BFLOAT16 remains
-        // out of scope and is the natural still-unsupported example.)
+    fn parse_tensor_proto_zero_element_bfloat16_succeeds() {
+        // WS-3.5 Y(1): BFLOAT16 zero-element tensors parse symmetrically
+        // with FP16 zero-element tensors. Pre-WS-3.5 this was the
+        // UnsupportedDType sentinel test for dtype 16.
         let proto = onnx_proto::TensorProto {
             name: Some("empty_bf16".to_string()),
             data_type: Some(16), // BFLOAT16
             dims: vec![0],
             ..Default::default()
         };
-        match OnnxModel::parse_tensor_proto(&proto) {
-            Err(ParseError::UnsupportedDType { name, dtype_id }) => {
-                assert_eq!(name, "empty_bf16");
-                assert_eq!(dtype_id, 16);
+        let tensor =
+            OnnxModel::parse_tensor_proto(&proto).expect("zero-element BFLOAT16 should parse");
+        match tensor {
+            Tensor::BFloat16(arr) => {
+                assert_eq!(arr.shape(), &[0]);
+                assert_eq!(arr.len(), 0);
             }
-            other => panic!("expected UnsupportedDType, got {:?}", other),
+            other => panic!("expected Tensor::BFloat16, got {:?}", other),
         }
     }
 

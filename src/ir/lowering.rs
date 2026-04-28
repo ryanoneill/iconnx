@@ -279,6 +279,13 @@ fn upload_initializers(
                 // WS-3 M3.3: Float16 GPU upload landed.
                 GpuTensor::from_host_f16(ctx, &tensor.as_slice_f16(), tensor.shape().to_vec())?
             }
+            Tensor::BFloat16(_) => {
+                // WS-3.5 Y(1): BFloat16 GPU upload — parallel to Float16.
+                // Hardware-capability check (sm_80+) lives inside
+                // `from_host_bf16`; pre-sm_80 devices error here at graph
+                // load time rather than at first dispatch call.
+                GpuTensor::from_host_bf16(ctx, &tensor.as_slice_bf16(), tensor.shape().to_vec())?
+            }
             Tensor::Bool(_) => {
                 // WS-3 M3.3: Bool now uploads natively as `GpuTensor::Bool`
                 // (byte-per-element u8 storage). Pre-WS-3 the upload path

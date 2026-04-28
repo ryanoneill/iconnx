@@ -254,6 +254,14 @@ pub fn gpu_cumsum(
                 dtype.name()
             )))
         }
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5 Y(1) R3 punch list: BF16 CumSum lights up in Y(2)
+            // sub-3 (reductions, f32 accumulator). No active roster
+            // model exercises this path on BF16 today; placeholder.
+            Err(CudaError::Kernel(
+                "CumSum does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
+            ))
+        }
     }
 }
 

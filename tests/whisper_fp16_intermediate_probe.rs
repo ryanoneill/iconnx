@@ -59,6 +59,7 @@ fn report(name: &str, t: &Tensor) {
     let v: Vec<f32> = match t {
         Tensor::Float32(a) => a.iter().copied().collect(),
         Tensor::Float16(a) => a.iter().map(|h| h.to_f32()).collect(),
+        Tensor::BFloat16(a) => a.iter().map(|h| h.to_f32()).collect(),
         Tensor::Int64(a) => a.iter().map(|&x| x as f32).collect(),
         Tensor::Int32(a) => a.iter().map(|&x| x as f32).collect(),
         Tensor::Int8(a) => a.iter().map(|&x| x as f32).collect(),

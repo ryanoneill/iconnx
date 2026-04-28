@@ -498,6 +498,14 @@ pub(super) fn upload_tensor(
             let data = tensor.as_slice_f16();
             GpuTensor::from_host_f16(ctx, &data, tensor.shape().to_vec())
         }
+        Tensor::BFloat16(_) => {
+            // WS-3.5 Y(1): BFloat16 upload path. Hardware-capability
+            // gate (sm_80+) lives inside `from_host_bf16`; pre-sm_80
+            // devices error here at executor entry rather than at first
+            // dispatch call — fail-fast at graph-load time per spec §5.
+            let data = tensor.as_slice_bf16();
+            GpuTensor::from_host_bf16(ctx, &data, tensor.shape().to_vec())
+        }
         Tensor::Int64(_) => {
             let data = tensor.as_slice_i64();
             GpuTensor::from_host_i64(ctx, &data, tensor.shape().to_vec())
@@ -571,6 +579,12 @@ pub(super) fn collect_outputs(
             GpuTensor::Float16 { shape, .. } => {
                 let data = gpu_tensor.to_host_f16(ctx)?;
                 Tensor::from_vec_f16(data, shape.clone())
+            }
+            GpuTensor::BFloat16 { shape, .. } => {
+                // WS-3.5 Y(1): BFloat16 collect path. Symmetric with FP16:
+                // download host bf16 vector, wrap in `Tensor::BFloat16`.
+                let data = gpu_tensor.to_host_bf16(ctx)?;
+                Tensor::from_vec_bf16(data, shape.clone())
             }
             GpuTensor::Bool { shape, .. } => {
                 let data = gpu_tensor.to_host_bool(ctx)?;
