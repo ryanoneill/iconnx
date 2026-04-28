@@ -337,6 +337,25 @@ pub enum CudaError {
         expected: &'static str,
         actual: &'static str,
     },
+    /// Operation does not support the requested dtype. Y(2) introduced
+    /// this typed variant so the BF16 dispatch-arm wave can replace
+    /// `CudaError::Kernel(format!("... bfloat16 not yet implemented ..."))`
+    /// placeholders with a structured error that carries the op name,
+    /// the unsupported dtype, and a concrete reason string. Distinct
+    /// from `DtypeMismatch` (caller passed the wrong dtype to a typed
+    /// accessor) — `UnsupportedDtype` means the op itself has no kernel
+    /// for that dtype on the current code path.
+    UnsupportedDtype {
+        /// Operator or function name (`"Transpose"`, `"gpu_copy"`, etc).
+        op: &'static str,
+        /// Dtype that triggered the rejection (`"bfloat16"`, etc).
+        dtype: &'static str,
+        /// Concrete reason — what's missing or why this dtype-pair is
+        /// rejected. Avoid generic phrasing like "not yet implemented";
+        /// surface the underlying constraint (e.g. "no FP16 LayerNorm
+        /// kernel exists; BF16 follows the same scope").
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for CudaError {
@@ -371,6 +390,11 @@ impl std::fmt::Display for CudaError {
             CudaError::DtypeMismatch { expected, actual } => {
                 write!(f, "dtype mismatch: expected {}, got {}", expected, actual)
             }
+            CudaError::UnsupportedDtype { op, dtype, reason } => write!(
+                f,
+                "{} does not support {}: {}",
+                op, dtype, reason
+            ),
         }
     }
 }
@@ -418,5 +442,59 @@ mod tests {
 
         // Verify.
         assert_eq!(result, host_data);
+    }
+
+    /// WS-3.5 Y(2) prelude: `CudaError::UnsupportedDtype` exposes the
+    /// op name, dtype, and concrete reason in its `Display`. Distinct
+    /// from `DtypeMismatch` (caller-side typo) — the op itself has no
+    /// kernel for that dtype on the current code path.
+    #[test]
+    fn unsupported_dtype_display_carries_op_dtype_and_reason() {
+        let err = CudaError::UnsupportedDtype {
+            op: "Transpose",
+            dtype: "bfloat16",
+            reason: "memcpy-class BF16 transpose kernel will land in Y(2) sub-2a"
+                .to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Transpose"),
+            "Display must include op name: {}",
+            msg
+        );
+        assert!(
+            msg.contains("bfloat16"),
+            "Display must include dtype: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Y(2) sub-2a"),
+            "Display must include reason: {}",
+            msg
+        );
+    }
+
+    /// WS-3.5 Y(2) prelude: `UnsupportedDtype` participates in the
+    /// `Debug` format too — error matchers in tests rely on Debug,
+    /// not Display.
+    #[test]
+    fn unsupported_dtype_debug_format_includes_variant_name() {
+        let err = CudaError::UnsupportedDtype {
+            op: "Cast",
+            dtype: "bfloat16",
+            reason: "BF16 Cast pair fp32 -> bfloat16 will land in Y(2) sub-2d"
+                .to_string(),
+        };
+        let dbg = format!("{:?}", err);
+        assert!(
+            dbg.contains("UnsupportedDtype"),
+            "Debug must include variant name: {}",
+            dbg
+        );
+        assert!(
+            dbg.contains("Cast"),
+            "Debug must include op name: {}",
+            dbg
+        );
     }
 }

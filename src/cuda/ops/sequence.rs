@@ -255,12 +255,17 @@ pub fn gpu_cumsum(
             )))
         }
         crate::cuda::tensor::DType::BFloat16 => {
-            // WS-3.5 Y(1) R3 punch list: BF16 CumSum lights up in Y(2)
-            // sub-3 (reductions, f32 accumulator). No active roster
-            // model exercises this path on BF16 today; placeholder.
-            Err(CudaError::Kernel(
-                "CumSum does not yet support bfloat16 (not yet implemented in WS-3.5 — Y(2) lights up in next milestone)".to_string(),
-            ))
+            // WS-3.5: BF16 is FP16-touched-surfaces only (spec §1 R3).
+            // CumSum has no FP16 kernel today (the FP16/Bool arm above
+            // returns the same kind of unsupported error), so BF16
+            // inherits the same scope. A roster-driven BF16 CumSum
+            // kernel would land alongside an FP16 CumSum kernel.
+            Err(CudaError::UnsupportedDtype {
+                op: "CumSum",
+                dtype: "bfloat16",
+                reason: "no FP16 CumSum kernel exists today; BF16 inherits the same scope per WS-3.5 spec §1 R3"
+                    .to_string(),
+            })
         }
     }
 }
