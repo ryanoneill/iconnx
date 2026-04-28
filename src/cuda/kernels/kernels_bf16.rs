@@ -32,6 +32,7 @@
 /// creation alongside `super::KERNEL_NAMES` and
 /// `super::kernels_fp16::KERNEL_NAMES_FP16`.
 pub const KERNEL_NAMES_BF16: &[&str] = &[
+    // Y(2) sub-2b — elementwise BF16 ops:
     "add_bf16_kernel",
     "sub_bf16_kernel",
     "mul_bf16_kernel",
@@ -39,6 +40,10 @@ pub const KERNEL_NAMES_BF16: &[&str] = &[
     "sqrt_bf16_kernel",
     "pow_bf16_kernel",
     "erf_bf16_kernel",
+    // Y(2) sub-2e — broadcast-scalar Add + Sin/Cos:
+    "add_bf16_scalar_ptr_kernel",
+    "sin_bf16_kernel",
+    "cos_bf16_kernel",
 ];
 
 /// CUDA kernel source for the WS-3.5 BF16 elementwise op family.
@@ -125,6 +130,44 @@ extern "C" __global__ void erf_bf16_kernel(__nv_bfloat16* out, const __nv_bfloat
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = __float2bfloat16_rn(erff(__bfloat162float(x[i])));
+    }
+}
+
+// =============================================================================
+// WS-3.5 Y(2) sub-2e — BF16 scalar-broadcast Add: out[i] = a[i] + scalar_ptr[0].
+//
+// Mirrors `add_scalar_ptr_kernel` (Float32) and `add_f16_scalar_ptr_kernel`
+// (FP16). The scalar lives on-device so gpu_add avoids a D2H round-trip
+// when one operand is a length-1 tensor. Pure BF16 add via `__hadd` —
+// single op, no accumulation.
+// =============================================================================
+extern "C" __global__ void add_bf16_scalar_ptr_kernel(
+    __nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* scalar_ptr, size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __hadd(a[i], scalar_ptr[0]);
+    }
+}
+
+// =============================================================================
+// WS-3.5 Y(2) sub-2e — BF16 Sin / Cos for Whisper-BF16 positional encoding.
+//
+// No native bf16 sin/cos intrinsic; round through f32 via __bfloat162float
+// + sinf/cosf + __float2bfloat16_rn. Same pattern as the f32 sin/cos
+// kernels above and as the FP16-via-f32 round-trips for pow/erf.
+// =============================================================================
+extern "C" __global__ void sin_bf16_kernel(__nv_bfloat16* out, const __nv_bfloat16* x, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __float2bfloat16_rn(sinf(__bfloat162float(x[i])));
+    }
+}
+
+extern "C" __global__ void cos_bf16_kernel(__nv_bfloat16* out, const __nv_bfloat16* x, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __float2bfloat16_rn(cosf(__bfloat162float(x[i])));
     }
 }
 "#;

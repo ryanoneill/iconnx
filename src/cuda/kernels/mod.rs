@@ -824,6 +824,19 @@ fn gpu_add_broadcast_scalar(
             )?;
             Ok(out)
         }
+        (super::tensor::DType::BFloat16, super::tensor::DType::BFloat16) => {
+            let mut out = pool.get_tensor_bf16(ctx, tensor.shape().to_vec())?;
+            launch_binary_bf16(
+                ctx,
+                kernels,
+                "add_bf16_scalar_ptr_kernel",
+                out.data_bf16_mut()?,
+                tensor.data_bf16()?,
+                scalar.data_bf16()?,
+                n,
+            )?;
+            Ok(out)
+        }
         (t_dt, s_dt) => Err(CudaError::Kernel(format!(
             "Add (scalar broadcast): unsupported dtype combination ({} + {})",
             t_dt.name(),
@@ -1344,6 +1357,10 @@ pub fn gpu_pow(
 }
 
 /// GPU Sin: out = sin(x).
+///
+/// Float32 path uses `sinf` directly. BF16 path (WS-3.5 Y(2) sub-2e —
+/// Whisper-BF16 positional encoding) rounds through f32 because there
+/// is no `__nv_bfloat16`-typed sin intrinsic.
 pub fn gpu_sin(
     ctx: &IconnxCudaContext,
     kernels: &KernelCache,
@@ -1351,19 +1368,39 @@ pub fn gpu_sin(
     input: &GpuTensor,
 ) -> Result<GpuTensor, CudaError> {
     let n = input.len();
-    let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
-    launch_unary_f32(
-        ctx,
-        kernels,
-        "sin_kernel",
-        out.data_f32_mut()?,
-        input.data_f32()?,
-        n,
-    )?;
-    Ok(out)
+    match input.dtype() {
+        super::tensor::DType::Float32 => {
+            let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
+            launch_unary_f32(
+                ctx,
+                kernels,
+                "sin_kernel",
+                out.data_f32_mut()?,
+                input.data_f32()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        super::tensor::DType::BFloat16 => {
+            let mut out = pool.get_tensor_bf16(ctx, input.shape().to_vec())?;
+            launch_unary_bf16(
+                ctx,
+                kernels,
+                "sin_bf16_kernel",
+                out.data_bf16_mut()?,
+                input.data_bf16()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        dt => Err(CudaError::Kernel(format!("Sin: unsupported dtype {}", dt.name()))),
+    }
 }
 
 /// GPU Cos: out = cos(x).
+///
+/// Same dispatch shape as `gpu_sin`. Whisper-BF16 positional encoding
+/// produces sin/cos pairs over the same input.
 pub fn gpu_cos(
     ctx: &IconnxCudaContext,
     kernels: &KernelCache,
@@ -1371,16 +1408,33 @@ pub fn gpu_cos(
     input: &GpuTensor,
 ) -> Result<GpuTensor, CudaError> {
     let n = input.len();
-    let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
-    launch_unary_f32(
-        ctx,
-        kernels,
-        "cos_kernel",
-        out.data_f32_mut()?,
-        input.data_f32()?,
-        n,
-    )?;
-    Ok(out)
+    match input.dtype() {
+        super::tensor::DType::Float32 => {
+            let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
+            launch_unary_f32(
+                ctx,
+                kernels,
+                "cos_kernel",
+                out.data_f32_mut()?,
+                input.data_f32()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        super::tensor::DType::BFloat16 => {
+            let mut out = pool.get_tensor_bf16(ctx, input.shape().to_vec())?;
+            launch_unary_bf16(
+                ctx,
+                kernels,
+                "cos_bf16_kernel",
+                out.data_bf16_mut()?,
+                input.data_bf16()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        dt => Err(CudaError::Kernel(format!("Cos: unsupported dtype {}", dt.name()))),
+    }
 }
 
 /// GPU Abs: out = |x|.
