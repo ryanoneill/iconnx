@@ -145,11 +145,12 @@ impl Executor {
                     .get_int("to")
                     .ok_or_else(|| CudaError::Kernel("Cast: missing 'to' attribute".into()))?;
                 let target_dtype = match target_type {
-                    1 => DType::Float32,  // FLOAT
-                    6 => DType::Int32,    // INT32
-                    7 => DType::Int64,    // INT64
-                    9 => DType::Bool,     // BOOL (M3.5 sub-B: native Bool, was Int32 0/1)
-                    10 => DType::Float16, // FLOAT16 (M3.5 sub-A)
+                    1 => DType::Float32,   // FLOAT
+                    6 => DType::Int32,     // INT32
+                    7 => DType::Int64,     // INT64
+                    9 => DType::Bool,      // BOOL (M3.5 sub-B: native Bool, was Int32 0/1)
+                    10 => DType::Float16,  // FLOAT16 (M3.5 sub-A)
+                    16 => DType::BFloat16, // BFLOAT16 (WS-3.5 hotfix — kernel-level cast.rs arms exist; this dispatch tier was missed by R3 wildcard-removal)
                     _ => {
                         return Err(CudaError::Kernel(format!(
                             "Cast: unsupported target type {}",

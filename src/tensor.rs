@@ -1,8 +1,8 @@
 /// Tensor implementation for Iconnx
 ///
 /// Multi-dtype support for ONNX compatibility
-/// Supports: Float32, Float64, Float16, Int64, Int32, Int8, UInt8, Bool
-use half::f16;
+/// Supports: Float32, Float64, Float16, BFloat16, Int64, Int32, Int8, UInt8, Bool
+use half::{bf16, f16};
 use ndarray::{ArrayD, IxDyn};
 
 /// N-dimensional tensor with multiple data types
@@ -33,6 +33,11 @@ pub enum Tensor {
     /// IEEE-754 binary16 semantics including round-half-to-even when
     /// quantizing from f32 via `f16::from_f32`.
     Float16(ArrayD<f16>),
+    /// IEEE bfloat16 — Float16-alternative with 8-bit exponent (FP32-compatible
+    /// range) and 7-bit mantissa. Common in transformer training and inference
+    /// (Google TPU origin; A100/H100 native). Bit-compatible with CUDA
+    /// `__nv_bfloat16`. Added in WS-3.5.
+    BFloat16(ArrayD<bf16>),
 }
 
 impl Tensor {
@@ -238,6 +243,34 @@ impl Tensor {
         Tensor::Float16(array)
     }
 
+    /// Create BFloat16 tensor from flat vector and shape.
+    ///
+    /// Added in WS-3.5 for BF16 model support (BERT-base BF16, Whisper-Tiny
+    /// BF16). `bf16` is from the `half` crate; round-half-to-even quantization
+    /// happens at `bf16::from_f32` call sites. Bit-compatible with CUDA
+    /// `__nv_bfloat16` for zero-copy GPU upload.
+    pub fn from_vec_bf16(data: Vec<bf16>, shape: Vec<usize>) -> Self {
+        let expected_len: usize = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product()
+        };
+
+        if data.len() != expected_len {
+            panic!(
+                "Shape mismatch: data has {} elements but shape {:?} requires {}",
+                data.len(),
+                shape,
+                expected_len
+            );
+        }
+
+        let array = ArrayD::from_shape_vec(IxDyn(&shape), data)
+            .expect("Failed to create array from shape and data");
+
+        Tensor::BFloat16(array)
+    }
+
     /// Legacy: Create Float32 tensor (backward compatibility)
     pub fn from_vec(data: Vec<f32>, shape: Vec<usize>) -> Self {
         Self::from_vec_f32(data, shape)
@@ -263,6 +296,11 @@ impl Tensor {
         Tensor::Float16(array)
     }
 
+    /// Create tensor from existing BFloat16 ndarray
+    pub fn from_array_bf16(array: ArrayD<bf16>) -> Self {
+        Tensor::BFloat16(array)
+    }
+
     // ========== Type introspection ==========
 
     /// Get data type as string
@@ -271,6 +309,7 @@ impl Tensor {
             Tensor::Float32(_) => "float32",
             Tensor::Float64(_) => "float64",
             Tensor::Float16(_) => "float16",
+            Tensor::BFloat16(_) => "bfloat16",
             Tensor::Int64(_) => "int64",
             Tensor::Int32(_) => "int32",
             Tensor::Bool(_) => "bool",
@@ -292,6 +331,11 @@ impl Tensor {
     /// Check if tensor is Float16
     pub fn is_float16(&self) -> bool {
         matches!(self, Tensor::Float16(_))
+    }
+
+    /// Check if tensor is BFloat16
+    pub fn is_bfloat16(&self) -> bool {
+        matches!(self, Tensor::BFloat16(_))
     }
 
     /// Check if tensor is Int64
@@ -327,6 +371,7 @@ impl Tensor {
             Tensor::Float32(a) => a.shape(),
             Tensor::Float64(a) => a.shape(),
             Tensor::Float16(a) => a.shape(),
+            Tensor::BFloat16(a) => a.shape(),
             Tensor::Int64(a) => a.shape(),
             Tensor::Int32(a) => a.shape(),
             Tensor::Bool(a) => a.shape(),
@@ -341,6 +386,7 @@ impl Tensor {
             Tensor::Float32(a) => a.ndim(),
             Tensor::Float64(a) => a.ndim(),
             Tensor::Float16(a) => a.ndim(),
+            Tensor::BFloat16(a) => a.ndim(),
             Tensor::Int64(a) => a.ndim(),
             Tensor::Int32(a) => a.ndim(),
             Tensor::Bool(a) => a.ndim(),
@@ -355,6 +401,7 @@ impl Tensor {
             Tensor::Float32(a) => a.len(),
             Tensor::Float64(a) => a.len(),
             Tensor::Float16(a) => a.len(),
+            Tensor::BFloat16(a) => a.len(),
             Tensor::Int64(a) => a.len(),
             Tensor::Int32(a) => a.len(),
             Tensor::Bool(a) => a.len(),
@@ -543,6 +590,38 @@ impl Tensor {
         }
     }
 
+    /// Get data as flat BFloat16 slice (panics if wrong type)
+    ///
+    /// Added in WS-3.5 for BF16 model support. BF16 and FP16 are NOT
+    /// interchangeable formats; calling `as_slice_f16()` on a BFloat16
+    /// tensor panics, and vice versa.
+    pub fn as_slice_bf16(&self) -> Vec<bf16> {
+        match self {
+            Tensor::BFloat16(a) => {
+                if let Some(slice) = a.as_slice() {
+                    slice.to_vec()
+                } else {
+                    a.iter().copied().collect()
+                }
+            }
+            _ => panic!(
+                "as_slice_bf16() called on non-BFloat16 tensor ({})",
+                self.dtype()
+            ),
+        }
+    }
+
+    /// Get reference to BFloat16 array (panics if wrong type)
+    pub fn to_array_bf16(&self) -> &ArrayD<bf16> {
+        match self {
+            Tensor::BFloat16(a) => a,
+            _ => panic!(
+                "to_array_bf16() called on non-BFloat16 tensor ({})",
+                self.dtype()
+            ),
+        }
+    }
+
     /// Get data as flat Bool slice (panics if wrong type)
     ///
     /// Added in WS-3 M3.1's Bool surface audit. Closes the L2.1/L3.5
@@ -610,6 +689,10 @@ impl Tensor {
                 let data: Vec<f32> = a.iter().map(|x| x.to_f32()).collect();
                 Tensor::from_vec_f32(data, a.shape().to_vec())
             }
+            Tensor::BFloat16(a) => {
+                let data: Vec<f32> = a.iter().map(|x| x.to_f32()).collect();
+                Tensor::from_vec_f32(data, a.shape().to_vec())
+            }
         }
     }
 
@@ -642,6 +725,10 @@ impl Tensor {
                 Tensor::from_vec_i64(data, a.shape().to_vec())
             }
             Tensor::Float16(a) => {
+                let data: Vec<i64> = a.iter().map(|x| x.to_f32() as i64).collect();
+                Tensor::from_vec_i64(data, a.shape().to_vec())
+            }
+            Tensor::BFloat16(a) => {
                 let data: Vec<i64> = a.iter().map(|x| x.to_f32() as i64).collect();
                 Tensor::from_vec_i64(data, a.shape().to_vec())
             }
@@ -712,6 +799,16 @@ impl Tensor {
                 let as_f32 = arr.mapv(|x| x.to_f32());
                 let result_f32 = f32_op(&as_f32);
                 Tensor::Float16(result_f32.mapv(f16::from_f32))
+            }
+            Tensor::BFloat16(arr) => {
+                // Convert to f32, operate, convert back to bf16. BFloat16
+                // ops follow the FP16 pattern — CPU-side shape-class ops
+                // (Concat / Reshape / Transpose / etc.) funnel through f32;
+                // GPU dispatch lives in dedicated BF16 NVRTC kernels (Y(2)).
+                // This CPU path is the constant-folding fallback.
+                let as_f32 = arr.mapv(|x| x.to_f32());
+                let result_f32 = f32_op(&as_f32);
+                Tensor::BFloat16(result_f32.mapv(bf16::from_f32))
             }
         }
     }
@@ -878,5 +975,55 @@ mod tests {
         assert_eq!(t.dtype(), "float64");
         assert!(t.is_float64());
         assert!(!t.is_float32());
+    }
+
+    // ========== WS-3.5: BFloat16 surface audit ==========
+
+    #[test]
+    fn tensor_bfloat16_constructor_and_accessors() {
+        use half::bf16;
+        let v = vec![bf16::from_f32(1.5), bf16::from_f32(-2.0), bf16::from_f32(0.0)];
+        let t = Tensor::from_vec_bf16(v.clone(), vec![3]);
+        assert_eq!(t.dtype(), "bfloat16");
+        assert!(t.is_bfloat16());
+        assert_eq!(t.shape(), &[3]);
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.as_slice_bf16(), v);
+    }
+
+    #[test]
+    fn tensor_bfloat16_round_half_to_even_parity() {
+        use half::bf16;
+        // 1.0 + 1/256 = 1.00390625 sits exactly halfway between BF16's 1.0
+        // (mantissa LSB = 0, even) and 1.0 + 2^-7 = 1.0078125 (mantissa LSB
+        // = 1, odd). Round-half-to-even resolves to the even-LSB value, so
+        // bf16::from_f32 must return 1.0 — not 1.0078125, and certainly
+        // never 1.003_906_3 (which isn't representable in BF16).
+        let v = vec![bf16::from_f32(1.0_f32 + (1.0_f32 / 256.0))];
+        let t = Tensor::from_vec_bf16(v.clone(), vec![1]);
+        let back: f32 = t.as_slice_bf16()[0].to_f32();
+        assert!(
+            (back - 1.0).abs() < 1e-9,
+            "round-half-to-even should resolve 1.00390625 to 1.0 (even LSB), got {back}"
+        );
+    }
+
+    #[test]
+    fn tensor_bfloat16_panic_on_wrong_accessor() {
+        use half::bf16;
+        let t = Tensor::from_vec_bf16(vec![bf16::from_f32(0.0)], vec![1]);
+        let result = std::panic::catch_unwind(|| t.as_slice());
+        assert!(result.is_err(), "f32-strict accessor on BFloat16 must panic");
+    }
+
+    #[test]
+    fn tensor_bfloat16_panic_on_f16_accessor() {
+        use half::bf16;
+        let t = Tensor::from_vec_bf16(vec![bf16::from_f32(0.0)], vec![1]);
+        let result = std::panic::catch_unwind(|| t.as_slice_f16());
+        assert!(
+            result.is_err(),
+            "f16 accessor on BFloat16 must panic — formats are not interchangeable"
+        );
     }
 }

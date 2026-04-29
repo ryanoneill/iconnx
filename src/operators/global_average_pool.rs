@@ -92,6 +92,14 @@ fn reduce_mean_last_axis(t: Tensor, last_axis: usize) -> Tensor {
             let summed = as_f32.sum_axis(Axis(last_axis));
             Tensor::Float16(summed.mapv(|v| f16::from_f32(v / axis_size)))
         }
+        Tensor::BFloat16(arr) => {
+            // f32 accumulator — same precision contract WS-3.5 Y(2) uses
+            // for BF16 reductions (Softmax / ReduceMean) on GPU.
+            let axis_size = arr.shape()[last_axis] as f32;
+            let as_f32 = arr.mapv(|v| v.to_f32());
+            let summed = as_f32.sum_axis(Axis(last_axis));
+            Tensor::BFloat16(summed.mapv(|v| half::bf16::from_f32(v / axis_size)))
+        }
     }
 }
 
@@ -121,6 +129,9 @@ fn reshape_preserving_dtype(t: Tensor, new_shape: Vec<usize>) -> Tensor {
         }
         Tensor::Float16(arr) => {
             Tensor::Float16(arr.into_shape_with_order(IxDyn(&new_shape)).expect("reshape f16"))
+        }
+        Tensor::BFloat16(arr) => {
+            Tensor::BFloat16(arr.into_shape_with_order(IxDyn(&new_shape)).expect("reshape bf16"))
         }
     }
 }

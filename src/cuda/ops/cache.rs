@@ -4,12 +4,14 @@
 //! via the typed-kernel API on garboard's user stream. Source is composed
 //! from per-category constants — `kernels::OPS_KERNELS` for layout/utility
 //! ops, `quantize_kernels::QUANTIZE_KERNELS` for the WS-4 quantization
-//! family, and `kernels_fp16::OPS_KERNELS_FP16` for the WS-3 FP16 op
-//! family — concatenated at startup before NVRTC compilation. This keeps
-//! per-file source within the project's 1000-line guideline as the kernel
+//! family, `kernels_fp16::OPS_KERNELS_FP16` for the WS-3 FP16 op family,
+//! and `kernels_bf16::OPS_KERNELS_BF16` for the WS-3.5 BF16 op family —
+//! concatenated at startup before NVRTC compilation. This keeps per-file
+//! source within the project's 1000-line guideline as the kernel
 //! catalogue grows.
 
 use super::kernels::{KERNEL_NAMES, OPS_KERNELS};
+use super::kernels_bf16::{KERNEL_NAMES_BF16, OPS_KERNELS_BF16};
 use super::kernels_fp16::{KERNEL_NAMES_FP16, OPS_KERNELS_FP16};
 use super::quantize_kernels::{QUANTIZE_KERNEL_NAMES, QUANTIZE_KERNELS};
 use crate::cuda::context::{CudaError, IconnxCudaContext};
@@ -26,8 +28,8 @@ impl OpsKernelCache {
     /// single translation unit.
     pub fn new(ctx: &IconnxCudaContext) -> Result<Self, CudaError> {
         let combined_src = format!(
-            "{}\n{}\n{}",
-            OPS_KERNELS, QUANTIZE_KERNELS, OPS_KERNELS_FP16
+            "{}\n{}\n{}\n{}",
+            OPS_KERNELS, QUANTIZE_KERNELS, OPS_KERNELS_FP16, OPS_KERNELS_BF16
         );
         let garboard_program =
             Program::compile_for_device(&combined_src, ctx.garboard_device(), &[]).map_err(
@@ -41,6 +43,7 @@ impl OpsKernelCache {
             .iter()
             .chain(QUANTIZE_KERNEL_NAMES.iter())
             .chain(KERNEL_NAMES_FP16.iter())
+            .chain(KERNEL_NAMES_BF16.iter())
         {
             garboard_module.function(name).map_err(|e| {
                 CudaError::Kernel(format!("Failed to load kernel '{}': {}", name, e))

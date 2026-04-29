@@ -254,6 +254,19 @@ pub fn gpu_cumsum(
                 dtype.name()
             )))
         }
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5: BF16 is FP16-touched-surfaces only (spec §1 R3).
+            // CumSum has no FP16 kernel today (the FP16/Bool arm above
+            // returns the same kind of unsupported error), so BF16
+            // inherits the same scope. A roster-driven BF16 CumSum
+            // kernel would land alongside an FP16 CumSum kernel.
+            Err(CudaError::UnsupportedDtype {
+                op: "CumSum",
+                dtype: "bfloat16",
+                reason: "no FP16 CumSum kernel exists today; BF16 inherits the same scope per WS-3.5 spec §1 R3"
+                    .to_string(),
+            })
+        }
     }
 }
 

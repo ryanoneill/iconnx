@@ -59,6 +59,8 @@ pub struct GpuMemoryPool {
     u8_pool: HashMap<usize, Vec<DeviceSlice<'static, u8>>>,
     /// Pool of f16 slices, keyed by size-class bucket. WS-3 M3.3.
     f16_pool: HashMap<usize, Vec<DeviceSlice<'static, half::f16>>>,
+    /// Pool of bf16 slices, keyed by size-class bucket. WS-3.5 Y(1).
+    bf16_pool: HashMap<usize, Vec<DeviceSlice<'static, half::bf16>>>,
     /// Number of successful pool hits.
     hits: usize,
     /// Number of pool misses (fresh allocations).
@@ -83,6 +85,7 @@ impl GpuMemoryPool {
             i8_pool: HashMap::new(),
             u8_pool: HashMap::new(),
             f16_pool: HashMap::new(),
+            bf16_pool: HashMap::new(),
             hits: 0,
             misses: 0,
             max_per_bucket: 8, // Keep up to 8 slices per size.
@@ -354,6 +357,47 @@ impl GpuMemoryPool {
         })
     }
 
+    /// Get or allocate a BFloat16 `DeviceSlice`. WS-3.5 Y(1). Mirrors
+    /// `get_f16` exactly with `half::f16 → half::bf16` substitution.
+    ///
+    /// Note: this method does NOT enforce the BF16 sm_80+ hardware
+    /// gate — that's `GpuTensor::check_bf16_hardware`'s job, called from
+    /// `GpuTensor::zeros_bf16` and `from_host_bf16`. The pool itself is
+    /// dtype-storage-only; downstream pooling sites must ensure they
+    /// only request BF16 slices on hardware-capable devices.
+    pub fn get_bf16(
+        &mut self,
+        ctx: &IconnxCudaContext,
+        len: usize,
+    ) -> Result<DeviceSlice<'static, half::bf16>, CudaError> {
+        let bucket = size_class(len);
+        if let Some(slices) = self.bf16_pool.get_mut(&bucket) {
+            if let Some(idx) = slices.iter().position(|s| s.len() >= len) {
+                let mut slice = slices.swap_remove(idx);
+                self.hits += 1;
+                ctx.zero_bf16(&mut slice)?;
+                return Ok(slice);
+            }
+        }
+        self.misses += 1;
+        ctx.alloc_zeros::<half::bf16>(bucket)
+    }
+
+    /// Get or allocate a BFloat16 `GpuTensor` (convenience method).
+    /// WS-3.5 Y(1).
+    pub fn get_tensor_bf16(
+        &mut self,
+        ctx: &IconnxCudaContext,
+        shape: Vec<usize>,
+    ) -> Result<GpuTensor, CudaError> {
+        let len: usize = shape.iter().product();
+        let slice = self.get_bf16(ctx, len)?;
+        Ok(GpuTensor::BFloat16 {
+            data: Arc::new(slice),
+            shape,
+        })
+    }
+
     /// Return a Float32 slice to the pool.
     pub fn return_f32(&mut self, slice: DeviceSlice<'static, f32>) {
         let len = slice.len();
@@ -421,6 +465,16 @@ impl GpuMemoryPool {
         }
     }
 
+    /// Return a BFloat16 slice to the pool. WS-3.5 Y(1).
+    pub fn return_bf16(&mut self, slice: DeviceSlice<'static, half::bf16>) {
+        let len = slice.len();
+        let bucket_key = size_class(len);
+        let bucket = self.bf16_pool.entry(bucket_key).or_default();
+        if bucket.len() < self.max_per_bucket {
+            bucket.push(slice);
+        }
+    }
+
     /// Return a `GpuTensor` to the pool (extracts slice if possible).
     ///
     /// Returns true if the tensor was successfully returned to the pool.
@@ -449,6 +503,10 @@ impl GpuMemoryPool {
             }
             Some(TypedSlice::Float16(slice)) => {
                 self.return_f16(slice);
+                true
+            }
+            Some(TypedSlice::BFloat16(slice)) => {
+                self.return_bf16(slice);
                 true
             }
             // Bool's GPU storage is byte-per-element u8 (the same shape
@@ -487,6 +545,7 @@ impl GpuMemoryPool {
             + self.i8_pool.values().map(|v| v.len()).sum::<usize>()
             + self.u8_pool.values().map(|v| v.len()).sum::<usize>()
             + self.f16_pool.values().map(|v| v.len()).sum::<usize>()
+            + self.bf16_pool.values().map(|v| v.len()).sum::<usize>()
     }
 
     /// Clear all pooled memory (frees GPU memory).
@@ -497,6 +556,7 @@ impl GpuMemoryPool {
         self.i8_pool.clear();
         self.u8_pool.clear();
         self.f16_pool.clear();
+        self.bf16_pool.clear();
     }
 
     /// Reset statistics.

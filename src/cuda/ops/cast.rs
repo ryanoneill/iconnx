@@ -170,6 +170,7 @@ pub fn gpu_cast(
         | (DType::Int8, DType::Int8)
         | (DType::UInt8, DType::UInt8)
         | (DType::Float16, DType::Float16)
+        | (DType::BFloat16, DType::BFloat16)
         | (DType::Bool, DType::Bool) => unreachable!("Same-type cast handled above"),
 
         // WS-3 M3.5: FP16 boundary casts. Float16 ↔ Float32 is the
@@ -383,6 +384,151 @@ pub fn gpu_cast(
                 src_dtype.name(),
                 target_dtype.name()
             )))
+        }
+
+        // WS-3.5 Y(2) sub-2d: BF16 boundary casts. (BFloat16, Float32)
+        // is the primary boundary for BERT/Whisper BF16 mixed-precision;
+        // FP16↔BF16 is the manual checklist net-new pair (no existing
+        // FP16↔BF16 arm to mirror, per spec §2 dtype-pair caveat —
+        // ONNX doesn't define a direct half-half cast and iconnx avoids
+        // precision-coupling between the two half formats by routing
+        // via f32 intermediate inside the NVRTC kernel).
+        (DType::BFloat16, DType::Float32) => {
+            let mut output = GpuTensor::zeros_f32(ctx, shape)?;
+            // SAFETY: cast_bf16_to_f32_kernel: `(float* out, const __nv_bfloat16* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<f32, half::bf16>(
+                    ctx,
+                    cache,
+                    "cast_bf16_to_f32_kernel",
+                    output.data_f32_mut()?,
+                    input.data_bf16()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Float32, DType::BFloat16) => {
+            let mut output = GpuTensor::zeros_bf16(ctx, shape)?;
+            // SAFETY: cast_f32_to_bf16_kernel: `(__nv_bfloat16* out, const float* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<half::bf16, f32>(
+                    ctx,
+                    cache,
+                    "cast_f32_to_bf16_kernel",
+                    output.data_bf16_mut()?,
+                    input.data_f32()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::BFloat16, DType::Float16) => {
+            let mut output = GpuTensor::zeros_f16(ctx, shape)?;
+            // SAFETY: cast_bf16_to_f16_kernel: `(__half* out, const __nv_bfloat16* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<half::f16, half::bf16>(
+                    ctx,
+                    cache,
+                    "cast_bf16_to_f16_kernel",
+                    output.data_f16_mut()?,
+                    input.data_bf16()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Float16, DType::BFloat16) => {
+            let mut output = GpuTensor::zeros_bf16(ctx, shape)?;
+            // SAFETY: cast_f16_to_bf16_kernel: `(__nv_bfloat16* out, const __half* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<half::bf16, half::f16>(
+                    ctx,
+                    cache,
+                    "cast_f16_to_bf16_kernel",
+                    output.data_bf16_mut()?,
+                    input.data_f16()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::BFloat16, DType::Int32) => {
+            let mut output = GpuTensor::zeros_i32(ctx, shape)?;
+            // SAFETY: cast_bf16_to_i32_kernel: `(int* out, const __nv_bfloat16* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<i32, half::bf16>(
+                    ctx,
+                    cache,
+                    "cast_bf16_to_i32_kernel",
+                    output.data_i32_mut()?,
+                    input.data_bf16()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Int32, DType::BFloat16) => {
+            let mut output = GpuTensor::zeros_bf16(ctx, shape)?;
+            // SAFETY: cast_i32_to_bf16_kernel: `(__nv_bfloat16* out, const int* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<half::bf16, i32>(
+                    ctx,
+                    cache,
+                    "cast_i32_to_bf16_kernel",
+                    output.data_bf16_mut()?,
+                    input.data_i32()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::BFloat16, DType::Int64) => {
+            let mut output = GpuTensor::zeros_i64(ctx, shape)?;
+            // SAFETY: cast_bf16_to_i64_kernel: `(long long* out, const __nv_bfloat16* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<i64, half::bf16>(
+                    ctx,
+                    cache,
+                    "cast_bf16_to_i64_kernel",
+                    output.data_i64_mut()?,
+                    input.data_bf16()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+        (DType::Int64, DType::BFloat16) => {
+            let mut output = GpuTensor::zeros_bf16(ctx, shape)?;
+            // SAFETY: cast_i64_to_bf16_kernel: `(__nv_bfloat16* out, const long long* in, size_t n)`.
+            unsafe {
+                launch_cast_kernel::<half::bf16, i64>(
+                    ctx,
+                    cache,
+                    "cast_i64_to_bf16_kernel",
+                    output.data_bf16_mut()?,
+                    input.data_i64()?,
+                    n,
+                )?;
+            }
+            Ok(output)
+        }
+
+        // (BFloat16, Bool) and (Bool, BFloat16): explicitly unsupported
+        // per M3.7b discipline. No active roster graph routes Bool
+        // through BF16; round-trip would lose information (every non-
+        // zero bf16 → 1, then 1 → 1.0_bf16). Stay loud rather than
+        // silently truncating. Mirrors the FP16↔Bool arm above.
+        (DType::BFloat16, DType::Bool) | (DType::Bool, DType::BFloat16) => {
+            Err(CudaError::UnsupportedDtype {
+                op: "Cast",
+                dtype: "bfloat16",
+                reason: format!(
+                    "BF16 ↔ Bool cast is unsupported (no active model graph requires this; round-trip would lose information). {} -> {}",
+                    src_dtype.name(),
+                    target_dtype.name()
+                ),
+            })
         }
     }
 }

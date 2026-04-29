@@ -10,9 +10,10 @@ use garboard::{DeviceSlice, LaunchConfig};
 
 /// GPU im2col transformation for 2D convolution
 ///
-/// Transforms [N, C, H, W] into [C*kH*kW, N*out_H*out_W]. Float32 and
-/// Float16 supported (M3.6 light-up: gpu_conv2d → gpu_im2col → gpu_gemm
-/// only stays FP16 if both seams accept it).
+/// Transforms [N, C, H, W] into [C*kH*kW, N*out_H*out_W]. Float32,
+/// Float16, and BFloat16 supported. Multi-dtype light-up: gpu_conv2d →
+/// gpu_im2col → gpu_gemm only stays low-precision if both seams accept
+/// the requested dtype (M3.6 added FP16; WS-3.5 Y(3) added BF16).
 pub fn gpu_im2col(
     ctx: &IconnxCudaContext,
     cache: &ConvKernelCache,
@@ -103,8 +104,45 @@ pub fn gpu_im2col(
                 .map_err(|e| CudaError::Kernel(format!("im2col_f16 launch failed: {}", e)))?;
             Ok(output)
         }
+        DType::BFloat16 => {
+            // WS-3.5 Y(3): BF16 mirror of im2col_f16 — pure memcpy +
+            // zero-fill, so the kernel takes `unsigned short*` operands.
+            let mut output = pool.get_tensor_bf16(ctx, vec![col_height, col_width])?;
+            // SAFETY: im2col_bf16_kernel C signature mirrors im2col_f16_kernel
+            // exactly with `unsigned short*` data pointers — `half::bf16`
+            // is `repr(transparent) u16`, byte-identical layout.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, half::bf16>,
+                    &DeviceSlice<'_, half::bf16>,
+                    usize, usize, usize, usize,
+                    usize, usize, usize, usize,
+                    usize, usize, usize, usize,
+                )>("im2col_bf16_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("im2col_bf16_kernel lookup failed: {}", e))
+            })?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &launch_cfg,
+                    (
+                        output.data_bf16_mut()?,
+                        input.data_bf16()?,
+                        batch_size, channels, height, width,
+                        params.kernel_h, params.kernel_w,
+                        params.stride_h, params.stride_w,
+                        params.pad_h, params.pad_w,
+                        out_h, out_w,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("im2col_bf16 launch failed: {}", e)))?;
+            Ok(output)
+        }
         dt => Err(CudaError::Kernel(format!(
-            "im2col: unsupported dtype {} (Float32 + Float16 supported)",
+            "im2col: unsupported dtype {} (Float32 + Float16 + BFloat16 supported)",
             dt.name()
         ))),
     }
@@ -112,7 +150,8 @@ pub fn gpu_im2col(
 
 /// GPU im2col transformation for 1D convolution
 ///
-/// Transforms [N, C, L] into [C*K, N*out_L]. Float32 + Float16 supported.
+/// Transforms [N, C, L] into [C*K, N*out_L]. Float32, Float16, and
+/// BFloat16 supported (BF16 added in WS-3.5 Y(3)).
 pub fn gpu_im2col_1d(
     ctx: &IconnxCudaContext,
     cache: &ConvKernelCache,
@@ -194,6 +233,41 @@ pub fn gpu_im2col_1d(
                     ),
                 )
                 .map_err(|e| CudaError::Kernel(format!("im2col_1d_f16 launch failed: {}", e)))?;
+            Ok(output)
+        }
+        DType::BFloat16 => {
+            // WS-3.5 Y(3): BF16 mirror of im2col_1d_f16 (pure memcpy).
+            let mut output = pool.get_tensor_bf16(ctx, vec![col_height, col_width])?;
+            // SAFETY: im2col_1d_bf16_kernel C signature mirrors
+            // im2col_1d_f16_kernel with `unsigned short*` data pointers
+            // (BF16 byte-identical to u16).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, half::bf16>,
+                    &DeviceSlice<'_, half::bf16>,
+                    usize, usize, usize,
+                    usize, usize, usize, usize, usize,
+                )>("im2col_1d_bf16_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("im2col_1d_bf16_kernel lookup failed: {}", e))
+            })?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &launch_cfg,
+                    (
+                        output.data_bf16_mut()?,
+                        input.data_bf16()?,
+                        batch_size, channels, length,
+                        params.kernel_size, params.stride,
+                        params.padding, params.dilation, out_length,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("im2col_1d_bf16 launch failed: {}", e))
+                })?;
             Ok(output)
         }
         dt => Err(CudaError::Kernel(format!(
@@ -363,7 +437,9 @@ pub fn gpu_conv1d(
     Ok(output)
 }
 
-/// Add bias to convolution output. Float32 + Float16 supported.
+/// Add bias to convolution output. Float32, Float16, and BFloat16
+/// supported (BF16 added in WS-3.5 Y(3) — sum runs in f32 to match
+/// `gemm_bf16`'s CUBLAS_COMPUTE_32F accumulator policy).
 pub fn add_bias(
     ctx: &IconnxCudaContext,
     cache: &ConvKernelCache,
@@ -434,6 +510,36 @@ pub fn add_bias(
                     ),
                 )
                 .map_err(|e| CudaError::Kernel(format!("add_bias_f16 launch failed: {}", e)))?;
+        }
+        DType::BFloat16 => {
+            // SAFETY: add_bias_bf16_kernel signature is
+            // `(__nv_bfloat16* output, const __nv_bfloat16* bias,
+            //   size_t batch, size_t C, size_t spatial)`. Sum runs in
+            // f32 (matches gemm_bf16's CUBLAS_COMPUTE_32F policy).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut DeviceSlice<'_, half::bf16>,
+                    &DeviceSlice<'_, half::bf16>,
+                    usize, usize, usize,
+                )>("add_bias_bf16_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("add_bias_bf16_kernel lookup failed: {}", e))
+            })?;
+
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &launch_cfg,
+                    (
+                        output.data_bf16_mut()?,
+                        bias.data_bf16()?,
+                        batch_size, out_channels, spatial_size,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("add_bias_bf16 launch failed: {}", e))
+                })?;
         }
         dt => {
             return Err(CudaError::Kernel(format!(

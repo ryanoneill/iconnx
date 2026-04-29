@@ -20,7 +20,9 @@ use super::context::{CudaError, IconnxCudaContext};
 use super::memory_pool::GpuMemoryPool;
 use super::tensor::GpuTensor;
 
+mod kernels_bf16;
 mod kernels_fp16;
+use kernels_bf16::{KERNELS_BF16, KERNEL_NAMES_BF16};
 use kernels_fp16::{ELEMENTWISE_KERNELS_FP16, KERNEL_NAMES_FP16};
 
 /// Compiled elementwise kernels loaded as a garboard `Module`.
@@ -31,7 +33,10 @@ pub struct KernelCache {
 impl KernelCache {
     /// Compile all elementwise kernels and create the cache.
     pub fn new(ctx: &IconnxCudaContext) -> Result<Self, CudaError> {
-        let combined_src = format!("{}\n{}", ELEMENTWISE_KERNELS, ELEMENTWISE_KERNELS_FP16);
+        let combined_src = format!(
+            "{}\n{}\n{}",
+            ELEMENTWISE_KERNELS, ELEMENTWISE_KERNELS_FP16, KERNELS_BF16
+        );
         let program =
             Program::compile_for_device(&combined_src, ctx.garboard_device(), &[])
                 .map_err(|e| {
@@ -46,7 +51,11 @@ impl KernelCache {
         // Eagerly validate that every kernel name resolves — catches
         // typos or missing `extern "C"` at cache-construction time rather
         // than on first launch.
-        for name in KERNEL_NAMES.iter().chain(KERNEL_NAMES_FP16.iter()) {
+        for name in KERNEL_NAMES
+            .iter()
+            .chain(KERNEL_NAMES_FP16.iter())
+            .chain(KERNEL_NAMES_BF16.iter())
+        {
             module.function(name).map_err(|e| {
                 CudaError::Kernel(format!("Failed to load kernel '{}': {}", name, e))
             })?;
@@ -455,6 +464,68 @@ fn launch_binary_f16(
         .map_err(|e| CudaError::Kernel(format!("{} launch failed: {}", name, e)))
 }
 
+/// Binary elementwise BF16: `(out, a, b, n)`. Covers add_bf16 / sub_bf16
+/// / mul_bf16 / div_bf16 / pow_bf16. The C kernel parameter type is
+/// `__nv_bfloat16*`, which shares ABI layout with `half::bf16`
+/// (`#[repr(transparent)]` over `u16`).
+fn launch_binary_bf16(
+    ctx: &IconnxCudaContext,
+    kernels: &KernelCache,
+    name: &'static str,
+    out: &mut DeviceSlice<'static, half::bf16>,
+    a: &DeviceSlice<'static, half::bf16>,
+    b: &DeviceSlice<'static, half::bf16>,
+    n: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: kernel signature is
+    // `(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, size_t)`.
+    let kernel = unsafe {
+        kernels.module().typed_kernel::<(
+            &mut DeviceSlice<'_, half::bf16>,
+            &DeviceSlice<'_, half::bf16>,
+            &DeviceSlice<'_, half::bf16>,
+            usize,
+        )>(name)
+    }
+    .map_err(|e| CudaError::Kernel(format!("{} lookup failed: {}", name, e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(n as u32),
+            (out, a, b, n),
+        )
+        .map_err(|e| CudaError::Kernel(format!("{} launch failed: {}", name, e)))
+}
+
+/// Unary elementwise BF16: `(out, x, n)`. Covers sqrt_bf16 / erf_bf16.
+fn launch_unary_bf16(
+    ctx: &IconnxCudaContext,
+    kernels: &KernelCache,
+    name: &'static str,
+    out: &mut DeviceSlice<'static, half::bf16>,
+    x: &DeviceSlice<'static, half::bf16>,
+    n: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: kernel signature is `(__nv_bfloat16*, const __nv_bfloat16*, size_t)`.
+    let kernel = unsafe {
+        kernels.module().typed_kernel::<(
+            &mut DeviceSlice<'_, half::bf16>,
+            &DeviceSlice<'_, half::bf16>,
+            usize,
+        )>(name)
+    }
+    .map_err(|e| CudaError::Kernel(format!("{} lookup failed: {}", name, e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(n as u32),
+            (out, x, n),
+        )
+        .map_err(|e| CudaError::Kernel(format!("{} launch failed: {}", name, e)))
+}
+
 /// Unary elementwise FP16: `(out, x, n)`. Covers sqrt_f16 / erf_f16.
 fn launch_unary_f16(
     ctx: &IconnxCudaContext,
@@ -680,6 +751,19 @@ pub fn gpu_add(
             )?;
             Ok(out)
         }
+        (super::tensor::DType::BFloat16, super::tensor::DType::BFloat16) => {
+            let mut out = pool.get_tensor_bf16(ctx, a.shape().to_vec())?;
+            launch_binary_bf16(
+                ctx,
+                kernels,
+                "add_bf16_kernel",
+                out.data_bf16_mut()?,
+                a.data_bf16()?,
+                b.data_bf16()?,
+                n,
+            )?;
+            Ok(out)
+        }
         (a_dt, b_dt) => Err(CudaError::Kernel(format!(
             "Add: unsupported dtype combination ({} + {})",
             a_dt.name(),
@@ -736,6 +820,19 @@ fn gpu_add_broadcast_scalar(
                 out.data_f16_mut()?,
                 tensor.data_f16()?,
                 scalar.data_f16()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        (super::tensor::DType::BFloat16, super::tensor::DType::BFloat16) => {
+            let mut out = pool.get_tensor_bf16(ctx, tensor.shape().to_vec())?;
+            launch_binary_bf16(
+                ctx,
+                kernels,
+                "add_bf16_scalar_ptr_kernel",
+                out.data_bf16_mut()?,
+                tensor.data_bf16()?,
+                scalar.data_bf16()?,
                 n,
             )?;
             Ok(out)
@@ -799,6 +896,19 @@ pub fn gpu_sub(
             )?;
             Ok(out)
         }
+        (super::tensor::DType::BFloat16, super::tensor::DType::BFloat16) => {
+            let mut out = pool.get_tensor_bf16(ctx, a.shape().to_vec())?;
+            launch_binary_bf16(
+                ctx,
+                kernels,
+                "sub_bf16_kernel",
+                out.data_bf16_mut()?,
+                a.data_bf16()?,
+                b.data_bf16()?,
+                n,
+            )?;
+            Ok(out)
+        }
         (a_dt, b_dt) => Err(CudaError::Kernel(format!(
             "Sub: unsupported dtype combination ({} - {})",
             a_dt.name(),
@@ -854,6 +964,19 @@ pub fn gpu_mul(
                 out.data_f16_mut()?,
                 a.data_f16()?,
                 b.data_f16()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        (super::tensor::DType::BFloat16, super::tensor::DType::BFloat16) => {
+            let mut out = pool.get_tensor_bf16(ctx, a.shape().to_vec())?;
+            launch_binary_bf16(
+                ctx,
+                kernels,
+                "mul_bf16_kernel",
+                out.data_bf16_mut()?,
+                a.data_bf16()?,
+                b.data_bf16()?,
                 n,
             )?;
             Ok(out)
@@ -920,6 +1043,19 @@ pub fn gpu_div(
                 out.data_f16_mut()?,
                 a.data_f16()?,
                 b.data_f16()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        (super::tensor::DType::BFloat16, super::tensor::DType::BFloat16) => {
+            let mut out = pool.get_tensor_bf16(ctx, a.shape().to_vec())?;
+            launch_binary_bf16(
+                ctx,
+                kernels,
+                "div_bf16_kernel",
+                out.data_bf16_mut()?,
+                a.data_bf16()?,
+                b.data_bf16()?,
                 n,
             )?;
             Ok(out)
@@ -1076,6 +1212,18 @@ pub fn gpu_erf(
             )?;
             Ok(out)
         }
+        super::tensor::DType::BFloat16 => {
+            let mut out = pool.get_tensor_bf16(ctx, input.shape().to_vec())?;
+            launch_unary_bf16(
+                ctx,
+                kernels,
+                "erf_bf16_kernel",
+                out.data_bf16_mut()?,
+                input.data_bf16()?,
+                n,
+            )?;
+            Ok(out)
+        }
         dt => Err(CudaError::Kernel(format!("Erf: unsupported dtype {}", dt.name()))),
     }
 }
@@ -1133,6 +1281,18 @@ pub fn gpu_sqrt(
             )?;
             Ok(out)
         }
+        super::tensor::DType::BFloat16 => {
+            let mut out = pool.get_tensor_bf16(ctx, input.shape().to_vec())?;
+            launch_unary_bf16(
+                ctx,
+                kernels,
+                "sqrt_bf16_kernel",
+                out.data_bf16_mut()?,
+                input.data_bf16()?,
+                n,
+            )?;
+            Ok(out)
+        }
         dt => Err(CudaError::Kernel(format!("Sqrt: unsupported dtype {}", dt.name()))),
     }
 }
@@ -1175,6 +1335,19 @@ pub fn gpu_pow(
             )?;
             Ok(out)
         }
+        (super::tensor::DType::BFloat16, super::tensor::DType::BFloat16) => {
+            let mut out = pool.get_tensor_bf16(ctx, base.shape().to_vec())?;
+            launch_binary_bf16(
+                ctx,
+                kernels,
+                "pow_bf16_kernel",
+                out.data_bf16_mut()?,
+                base.data_bf16()?,
+                exp.data_bf16()?,
+                n,
+            )?;
+            Ok(out)
+        }
         (b_dt, e_dt) => Err(CudaError::Kernel(format!(
             "Pow: unsupported dtype combination ({} ^ {})",
             b_dt.name(),
@@ -1184,6 +1357,10 @@ pub fn gpu_pow(
 }
 
 /// GPU Sin: out = sin(x).
+///
+/// Float32 path uses `sinf` directly. BF16 path (WS-3.5 Y(2) sub-2e —
+/// Whisper-BF16 positional encoding) rounds through f32 because there
+/// is no `__nv_bfloat16`-typed sin intrinsic.
 pub fn gpu_sin(
     ctx: &IconnxCudaContext,
     kernels: &KernelCache,
@@ -1191,19 +1368,39 @@ pub fn gpu_sin(
     input: &GpuTensor,
 ) -> Result<GpuTensor, CudaError> {
     let n = input.len();
-    let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
-    launch_unary_f32(
-        ctx,
-        kernels,
-        "sin_kernel",
-        out.data_f32_mut()?,
-        input.data_f32()?,
-        n,
-    )?;
-    Ok(out)
+    match input.dtype() {
+        super::tensor::DType::Float32 => {
+            let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
+            launch_unary_f32(
+                ctx,
+                kernels,
+                "sin_kernel",
+                out.data_f32_mut()?,
+                input.data_f32()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        super::tensor::DType::BFloat16 => {
+            let mut out = pool.get_tensor_bf16(ctx, input.shape().to_vec())?;
+            launch_unary_bf16(
+                ctx,
+                kernels,
+                "sin_bf16_kernel",
+                out.data_bf16_mut()?,
+                input.data_bf16()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        dt => Err(CudaError::Kernel(format!("Sin: unsupported dtype {}", dt.name()))),
+    }
 }
 
 /// GPU Cos: out = cos(x).
+///
+/// Same dispatch shape as `gpu_sin`. Whisper-BF16 positional encoding
+/// produces sin/cos pairs over the same input.
 pub fn gpu_cos(
     ctx: &IconnxCudaContext,
     kernels: &KernelCache,
@@ -1211,16 +1408,33 @@ pub fn gpu_cos(
     input: &GpuTensor,
 ) -> Result<GpuTensor, CudaError> {
     let n = input.len();
-    let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
-    launch_unary_f32(
-        ctx,
-        kernels,
-        "cos_kernel",
-        out.data_f32_mut()?,
-        input.data_f32()?,
-        n,
-    )?;
-    Ok(out)
+    match input.dtype() {
+        super::tensor::DType::Float32 => {
+            let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
+            launch_unary_f32(
+                ctx,
+                kernels,
+                "cos_kernel",
+                out.data_f32_mut()?,
+                input.data_f32()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        super::tensor::DType::BFloat16 => {
+            let mut out = pool.get_tensor_bf16(ctx, input.shape().to_vec())?;
+            launch_unary_bf16(
+                ctx,
+                kernels,
+                "cos_bf16_kernel",
+                out.data_bf16_mut()?,
+                input.data_bf16()?,
+                n,
+            )?;
+            Ok(out)
+        }
+        dt => Err(CudaError::Kernel(format!("Cos: unsupported dtype {}", dt.name()))),
+    }
 }
 
 /// GPU Abs: out = |x|.

@@ -473,6 +473,53 @@ pub fn gpu_transpose_nd(
                 input.dtype().name()
             )))
         }
+        GpuTensor::BFloat16 { .. } => {
+            // WS-3.5 Y(2) sub-2a: BERT-base BF16 + Whisper-Tiny BF16
+            // attention paths exercise this op heavily. Memcpy-class —
+            // mirrors the FP16 arm above with `unsigned short*` data
+            // pointers backed by half::bf16's repr(transparent) u16
+            // layout.
+            let mut output = pool.get_tensor_bf16(ctx, out_shape)?;
+            // SAFETY: transpose_general_bf16_kernel signature mirrors
+            // transpose_general_kernel with `unsigned short*` data
+            // pointers in place of `float*` — half::bf16 is
+            // `#[repr(transparent)] struct(u16)`, so the byte layout
+            // is identical.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::bf16>,
+                    &garboard::DeviceSlice<'_, half::bf16>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("transpose_general_bf16_kernel")
+            }
+            .map_err(|e| {
+                CudaError::Kernel(format!("transpose_general_bf16_kernel lookup: {}", e))
+            })?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_bf16_mut()?,
+                        input.data_bf16()?,
+                        &in_shape_gpu,
+                        &in_strides_gpu,
+                        &out_strides_gpu,
+                        &perm_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| {
+                    CudaError::Kernel(format!("transpose_general_bf16 launch failed: {}", e))
+                })?;
+            Ok(output)
+        }
     }
 }
 
@@ -610,6 +657,17 @@ pub fn gpu_where(
                 "Where does not support {} for x/y (Whisper-FP16 doesn't route FP16 through Where; Bool x/y not on any active graph)",
                 dtype.name()
             )))
+        }
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5: Where rejects FP16 today (Whisper-FP16 doesn't
+            // route FP16 through Where); BF16 inherits the same scope
+            // per spec §1 R3 (FP16-touched-surfaces only).
+            Err(CudaError::UnsupportedDtype {
+                op: "Where",
+                dtype: "bfloat16",
+                reason: "Where rejects FP16 today (no active model graph routes FP16 through Where); BF16 inherits the same scope per WS-3.5 spec §1 R3"
+                    .to_string(),
+            })
         }
     }
 }
@@ -799,6 +857,41 @@ pub fn gpu_gather(
             "Gather: unsupported input dtype {} (WS-3 M3.4 sub-2+ for Bool; Int32/Int8 not on any active model graph)",
             input.dtype().name()
         ))),
+        GpuTensor::BFloat16 { .. } => {
+            // WS-3.5 Y(2) sub-2a: BERT-base BF16 token embedding Gather
+            // is roster-exercised. Memcpy-class — mirrors the FP16 arm
+            // above with `unsigned short*` data pointers.
+            let mut output = pool.get_tensor_bf16(ctx, out_shape)?;
+            // SAFETY: gather_bf16_kernel takes (unsigned short* out,
+            //   const unsigned short* inp, const long long* indices,
+            //   size_t num_indices, size_t slice_size, size_t dim0_size).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::bf16>,
+                    &garboard::DeviceSlice<'_, half::bf16>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                )>("gather_bf16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("gather_bf16_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_bf16_mut()?,
+                        input.data_bf16()?,
+                        &indices_gpu,
+                        num_indices,
+                        slice_size,
+                        dim0_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("gather_bf16 launch failed: {}", e)))?;
+            Ok(output)
+        }
     }
 }
 
@@ -971,6 +1064,41 @@ pub fn gpu_gather_from_gpu(
             "Gather: unsupported input dtype {} (WS-3 M3.4 sub-2+ for Bool; Int32/Int8 not on any active model graph)",
             input.dtype().name()
         ))),
+        GpuTensor::BFloat16 { .. } => {
+            // WS-3.5 Y(2) sub-2a: parallel of gpu_gather's BFloat16 arm —
+            // BERT-base BF16 token embedding Gather may route indices
+            // on-GPU (same lift as on-host Gather, just indices source).
+            let mut output = pool.get_tensor_bf16(ctx, out_shape)?;
+            // SAFETY: gather_bf16_kernel takes (unsigned short* out,
+            //   const unsigned short* inp, const long long* indices,
+            //   size_t num_indices, size_t slice_size, size_t dim0_size).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::bf16>,
+                    &garboard::DeviceSlice<'_, half::bf16>,
+                    &garboard::DeviceSlice<'_, i64>,
+                    usize,
+                    usize,
+                    usize,
+                )>("gather_bf16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("gather_bf16_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_bf16_mut()?,
+                        input.data_bf16()?,
+                        indices_tensor.data_i64()?,
+                        num_indices,
+                        slice_size,
+                        dim0_size,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("gather_bf16 launch failed: {}", e)))?;
+            Ok(output)
+        }
     }
 }
 
@@ -1103,6 +1231,31 @@ pub fn gpu_copy(
                 "gpu_copy does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
                 input.dtype().name()
             )))
+        }
+        GpuTensor::BFloat16 { .. } => {
+            // WS-3.5 Y(2) sub-2a: dedicated copy_bf16_kernel arm
+            // (per WS-1 M1.4 commit `01213c5`, gpu_copy is per-dtype
+            // non-polymorphic). Memcpy-class — `unsigned short*` data
+            // pointers backed by half::bf16's repr(transparent) layout.
+            let mut output = pool.get_tensor_bf16(ctx, shape)?;
+            // SAFETY: copy_bf16_kernel takes (unsigned short* out,
+            //   const unsigned short* inp, size_t n).
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::bf16>,
+                    &garboard::DeviceSlice<'_, half::bf16>,
+                    usize,
+                )>("copy_bf16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("copy_bf16_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (output.data_bf16_mut()?, input.data_bf16()?, n),
+                )
+                .map_err(|e| CudaError::Kernel(format!("copy_bf16 launch failed: {}", e)))?;
+            Ok(output)
         }
     }
 }
@@ -1404,6 +1557,64 @@ pub fn gpu_concat(
                 dtype.name()
             )))
         }
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5 Y(2) sub-2a: Whisper-Tiny BF16 encoder concatenates
+            // BF16 activations along the time axis. Memcpy-class —
+            // mirrors the FP16 arm above with `unsigned short*` data
+            // pointers backed by half::bf16's repr(transparent) u16
+            // layout.
+            let mut output = pool.get_tensor_bf16(ctx, out_shape.clone())?;
+            // SAFETY: concat_bf16_kernel mirrors concat_kernel with
+            // `unsigned short*` data pointers — half::bf16 is
+            // `#[repr(transparent)] struct(u16)`, so the byte layout
+            // is identical.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::bf16>,
+                    &garboard::DeviceSlice<'_, half::bf16>,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                    usize,
+                )>("concat_bf16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("concat_bf16_kernel lookup: {}", e)))?;
+
+            let mut inp_offset: usize = 0;
+            for inp in inputs {
+                let inp_axis_size = inp.shape()[axis];
+                let total_inp_elements = inp.len();
+
+                if total_inp_elements == 0 {
+                    inp_offset += inp_axis_size;
+                    continue;
+                }
+
+                let config = garboard::LaunchConfig::for_num_elems(total_inp_elements as u32);
+
+                kernel
+                    .launch(
+                        ctx.garboard_stream(),
+                        &config,
+                        (
+                            output.data_bf16_mut()?,
+                            inp.data_bf16()?,
+                            inp_offset,
+                            inp_axis_size,
+                            outer_size,
+                            inner_size,
+                            out_axis_size,
+                            total_inp_elements,
+                        ),
+                    )
+                    .map_err(|e| CudaError::Kernel(format!("concat_bf16 launch failed: {}", e)))?;
+
+                inp_offset += inp_axis_size;
+            }
+            Ok(output)
+        }
     }
 }
 
@@ -1665,6 +1876,44 @@ pub fn gpu_expand(
                     ),
                 )
                 .map_err(|e| CudaError::Kernel(format!("expand_bool launch failed: {}", e)))?;
+            Ok(output)
+        }
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5 Y(2) sub-2a: memcpy-class BF16 expand. Mirrors the
+            // FP16 arm above with `unsigned short*` data pointers backed
+            // by half::bf16's repr(transparent) u16 layout.
+            let mut output = pool.get_tensor_bf16(ctx, out_shape.clone())?;
+            // SAFETY: expand_bf16_kernel mirrors expand_kernel byte-for-byte
+            // with `unsigned short*` data pointers in place of `float*`.
+            let kernel = unsafe {
+                cache.module().typed_kernel::<(
+                    &mut garboard::DeviceSlice<'_, half::bf16>,
+                    &garboard::DeviceSlice<'_, half::bf16>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    &garboard::DeviceSlice<'_, u64>,
+                    usize,
+                    usize,
+                )>("expand_bf16_kernel")
+            }
+            .map_err(|e| CudaError::Kernel(format!("expand_bf16_kernel lookup: {}", e)))?;
+            kernel
+                .launch(
+                    ctx.garboard_stream(),
+                    &config,
+                    (
+                        output.data_bf16_mut()?,
+                        input.data_bf16()?,
+                        &out_shape_gpu,
+                        &out_strides_gpu,
+                        &inp_shape_gpu,
+                        &inp_strides_gpu,
+                        ndim,
+                        total_elements,
+                    ),
+                )
+                .map_err(|e| CudaError::Kernel(format!("expand_bf16 launch failed: {}", e)))?;
             Ok(output)
         }
     }
@@ -2539,6 +2788,11 @@ pub fn gpu_nonzero(ctx: &IconnxCudaContext, input: &GpuTensor) -> Result<GpuTens
             .map(|v| v != 0)
             .collect(),
         crate::cuda::tensor::DType::Bool => input.to_host_bool(ctx)?,
+        crate::cuda::tensor::DType::BFloat16 => input
+            .to_host_bf16(ctx)?
+            .into_iter()
+            .map(|v| v.to_f32() != 0.0)
+            .collect(),
     };
 
     let mut all_indices: Vec<Vec<i64>> = vec![Vec::new(); ndim];
@@ -2715,6 +2969,16 @@ pub fn gpu_slice_nd(
                     "Slice does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
                     dtype.name()
                 )))
+            }
+            crate::cuda::tensor::DType::BFloat16 => {
+                // WS-3.5: FP16 Slice has no kernel today (M3.4 left it
+                // as a gap); BF16 inherits the same scope per spec §1 R3.
+                Err(CudaError::UnsupportedDtype {
+                    op: "Slice",
+                    dtype: "bfloat16",
+                    reason: "no FP16 Slice kernel exists today (WS-3 M3.4 dispatch arm pending); BF16 inherits the same scope per WS-3.5 spec §1 R3"
+                        .to_string(),
+                })
             }
         };
     }
@@ -3041,6 +3305,16 @@ pub fn gpu_slice_nd(
                 "Slice does not support {} (WS-3 M3.4 — Float16/Bool dispatch arm pending)",
                 dtype.name()
             )))
+        }
+        (_, crate::cuda::tensor::DType::BFloat16) => {
+            // WS-3.5: FP16 ND-Slice has no kernel today (M3.4 left it
+            // as a gap); BF16 inherits the same scope per spec §1 R3.
+            Err(CudaError::UnsupportedDtype {
+                op: "Slice",
+                dtype: "bfloat16",
+                reason: "no FP16 Slice kernel exists today (WS-3 M3.4 dispatch arm pending); BF16 inherits the same scope per WS-3.5 spec §1 R3"
+                    .to_string(),
+            })
         }
     }
 }

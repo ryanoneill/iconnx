@@ -92,8 +92,10 @@ pub use ops::{
     // Type conversion (WS-3 M3.5 surfaces FP16 ↔ Float32 / Int32 / Int64
     // arms; integration tests need access to this entry point).
     gpu_cast,
+    gpu_concat,
     gpu_copy,
     gpu_cumsum,
+    gpu_expand,
     // Quantization ops (WS-4)
     gpu_dequantize_linear,
     gpu_dynamic_quantize_linear,
@@ -108,11 +110,13 @@ pub use ops::{
     gpu_not,
     gpu_not_equal,
     gpu_or,
+    gpu_nonzero,
     // Sequence ops
     gpu_range,
     gpu_slice_contiguous,
     // Shape/layout ops
     gpu_transpose_2d,
+    gpu_transpose_nd,
     // Conditional ops
     gpu_where,
     OpsKernelCache,

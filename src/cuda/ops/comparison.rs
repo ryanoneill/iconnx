@@ -299,6 +299,19 @@ fn binary_comparison(
                 dtype.name()
             )));
         }
+        crate::cuda::tensor::DType::BFloat16 => {
+            // WS-3.5: BF16 is FP16-touched-surfaces only (spec §1 R3).
+            // Comparison rejects FP16 (Whisper-FP16 doesn't compare FP16
+            // directly) so BF16 inherits the same rejection. If BERT-base
+            // BF16 / Whisper-Tiny BF16 e2e surfaces a need, that is a
+            // separate workstream (parallel BF16 comparison kernel).
+            return Err(CudaError::UnsupportedDtype {
+                op: "Comparison",
+                dtype: "bfloat16",
+                reason: "FP16 comparison itself is not supported (Whisper-FP16 doesn't compare FP16 directly); BF16 inherits the same scope per WS-3.5 spec §1 R3"
+                    .to_string(),
+            });
+        }
     }
 
     Ok(output)
