@@ -83,6 +83,38 @@ pub struct ParserOptions {
 /// ONNX model parser
 pub struct OnnxParser;
 
+/// Counts NaN + ±Inf elements in a half-precision tensor.
+///
+/// Used by the BF16/FP16 initializer parse paths to surface a warning
+/// when a model export overflowed FP32 → half-precision (e.g. ±FLT_MAX
+/// rounds to ±Inf in BF16 because BF16 max ≈ 3.39e38 < FLT_MAX). The
+/// parser does NOT reject the model — non-finite values are legal per
+/// the ONNX spec — but a non-zero count is loud-flagged so silent NaN
+/// cascades from `Mul(0, ±Inf)` are observable.
+fn count_non_finite_bf16(data: &[half::bf16]) -> usize {
+    data.iter().filter(|x| !x.is_finite()).count()
+}
+
+/// FP16 sibling of [`count_non_finite_bf16`]. Same overflow risk
+/// profile (FP16 max ≈ 65504 < FLT_MAX) so the warning applies symmetrically.
+fn count_non_finite_f16(data: &[half::f16]) -> usize {
+    data.iter().filter(|x| !x.is_finite()).count()
+}
+
+/// Emit a stderr warning when a half-precision initializer carries
+/// non-finite values. `dtype_label` is "BF16" or "FP16"; `count` is the
+/// pre-computed number of non-finite elements (caller already paid the
+/// scan cost). `total` is the tensor element count for context.
+fn warn_non_finite_half(dtype_label: &str, name: &str, count: usize, total: usize) {
+    eprintln!(
+        "warn: iconnx parser: {} initializer '{}' contains {}/{} non-finite values (NaN or ±Inf). \
+         May indicate an export tool that didn't saturate FP32 → {} conversion. \
+         Common cause: ±FLT_MAX rounds to ±Inf in {} (BF16 max ≈ 3.39e38, FP16 max ≈ 65504, both below FLT_MAX ≈ 3.40e38). \
+         Re-export with saturation if unintended.",
+        dtype_label, name, count, total, dtype_label, dtype_label
+    );
+}
+
 impl OnnxParser {
     /// Parse an ONNX model file with default (strict) options.
     ///
@@ -361,6 +393,10 @@ impl OnnxModel {
                     // are the f16 bit pattern (high 16 bits ignored), or
                     // raw_data carries 2 bytes per element little-endian.
                     let data = Self::decode_f16_payload(&name, tensor_proto)?;
+                    let nf = count_non_finite_f16(&data);
+                    if nf > 0 {
+                        warn_non_finite_half("FP16", &name, nf, data.len());
+                    }
                     let final_shape = self.correct_shape(&name, &shape, expected_len, data.len())?;
                     crate::tensor::Tensor::from_vec_f16(data, final_shape)
                 }
@@ -372,6 +408,10 @@ impl OnnxModel {
                     // little-endian. Bit-compatible with CUDA
                     // `__nv_bfloat16` for zero-copy GPU upload.
                     let data = Self::decode_bf16_payload(&name, tensor_proto)?;
+                    let nf = count_non_finite_bf16(&data);
+                    if nf > 0 {
+                        warn_non_finite_half("BF16", &name, nf, data.len());
+                    }
                     let final_shape = self.correct_shape(&name, &shape, expected_len, data.len())?;
                     crate::tensor::Tensor::from_vec_bf16(data, final_shape)
                 }
@@ -1099,6 +1139,10 @@ impl OnnxModel {
                     });
                 };
 
+                let nf = count_non_finite_f16(&data);
+                if nf > 0 {
+                    warn_non_finite_half("FP16", &name, nf, data.len());
+                }
                 if data.len() != expected_len {
                     return Err(ParseError::ShapeMismatch {
                         name,
@@ -1146,6 +1190,10 @@ impl OnnxModel {
                     });
                 };
 
+                let nf = count_non_finite_bf16(&data);
+                if nf > 0 {
+                    warn_non_finite_half("BF16", &name, nf, data.len());
+                }
                 if data.len() != expected_len {
                     return Err(ParseError::ShapeMismatch {
                         name,
@@ -1548,6 +1596,130 @@ mod tests {
             Tensor::BFloat16(arr) => {
                 let v: Vec<f32> = arr.iter().map(|x| x.to_f32()).collect();
                 assert_eq!(v, vec![0.5, -1.0]);
+            }
+            other => panic!("expected Tensor::BFloat16, got {:?}", other),
+        }
+    }
+
+    // ---- Non-finite scrubbing for half-precision dtypes -------------
+    //
+    // Surfaced by leadline-bench gate 4 (BERT-base BF16) on 2026-04-29:
+    // a naive FP32 → BF16 export of BERT encoded the attention-mask
+    // multiplier `-FLT_MAX` (≈ -3.4028e38) as bf16 -inf (bits 0xFF80)
+    // because BF16's max representable magnitude is ~3.39e38 and IEEE
+    // round-to-nearest-even rounds the overflow to ±inf. Downstream
+    // `Mul((1 - mask), -inf) = Mul(0, -inf) = NaN` cascades through
+    // the whole transformer.
+    //
+    // The principled fix lives at the model-export tool (saturate
+    // before bit-truncation). iconnx adds a parse-time warning so this
+    // class of broken export is observable, not silent. FP16 has the
+    // same risk profile (max ≈ 65504 < FLT_MAX) so the helper covers
+    // both half-precision dtypes.
+
+    #[test]
+    fn count_non_finite_bf16_finds_inf_and_nan() {
+        use half::bf16;
+        let bits_pos_inf = bf16::from_bits(0x7F80);
+        let bits_neg_inf = bf16::from_bits(0xFF80);
+        let bits_nan = bf16::from_bits(0x7FC0);
+        let data = vec![
+            bf16::from_f32(1.0),
+            bits_neg_inf,
+            bf16::from_f32(-2.0),
+            bits_pos_inf,
+            bits_nan,
+        ];
+        assert_eq!(super::count_non_finite_bf16(&data), 3);
+    }
+
+    #[test]
+    fn count_non_finite_bf16_zero_for_clean_tensor() {
+        use half::bf16;
+        let data = vec![
+            bf16::from_f32(1.5),
+            bf16::from_f32(-2.0),
+            bf16::from_f32(0.0),
+            bf16::from_f32(3.3895e38), // bf16 max-finite-positive
+            bf16::from_f32(-3.3895e38),
+        ];
+        assert_eq!(super::count_non_finite_bf16(&data), 0);
+    }
+
+    #[test]
+    fn count_non_finite_f16_finds_inf_and_nan() {
+        use half::f16;
+        // FP16 ±inf bits: 0x7C00 / 0xFC00; NaN: any exp=31 with non-zero mantissa.
+        let bits_pos_inf = f16::from_bits(0x7C00);
+        let bits_neg_inf = f16::from_bits(0xFC00);
+        let bits_nan = f16::from_bits(0x7E00);
+        let data = vec![
+            f16::from_f32(1.0),
+            bits_neg_inf,
+            f16::from_f32(-2.0),
+            bits_pos_inf,
+            bits_nan,
+        ];
+        assert_eq!(super::count_non_finite_f16(&data), 3);
+    }
+
+    #[test]
+    fn count_non_finite_f16_zero_for_clean_tensor() {
+        use half::f16;
+        let data = vec![
+            f16::from_f32(1.5),
+            f16::from_f32(-2.0),
+            f16::from_f32(0.0),
+            f16::from_f32(65504.0), // FP16 max-finite-positive
+            f16::from_f32(-65504.0),
+        ];
+        assert_eq!(super::count_non_finite_f16(&data), 0);
+    }
+
+    #[test]
+    fn parse_tensor_proto_bf16_neg_inf_scalar_counts_non_finite() {
+        // Mirrors the BERT BF16 attention-mask Constant exactly:
+        // scalar (dims=[]), data_type=16, single bf16 -inf value via
+        // raw_data.
+        use half::bf16;
+        let neg_inf_bits = bf16::from_bits(0xFF80).to_le_bytes();
+        let proto = onnx_proto::TensorProto {
+            name: Some("/bert/Constant_1_output_0".into()),
+            data_type: Some(16),
+            dims: vec![],
+            raw_data: Some(neg_inf_bits.to_vec()),
+            ..Default::default()
+        };
+        let tensor =
+            OnnxModel::parse_tensor_proto(&proto).expect("scalar bf16 -inf should parse");
+        match tensor {
+            Tensor::BFloat16(arr) => {
+                let s: Vec<bf16> = arr.iter().copied().collect();
+                assert_eq!(s.len(), 1);
+                assert_eq!(super::count_non_finite_bf16(&s), 1);
+            }
+            other => panic!("expected Tensor::BFloat16, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_weights_bf16_with_neg_inf_emits_count() {
+        // Mirrors leadline's gate 4 BERT scenario: a single-element bf16
+        // initializer with bits 0xFF80 (-inf). Verifies the parser sees
+        // the non-finite count without rejecting the parse — the warning
+        // is observability, not an error.
+        use half::bf16;
+        let mut init = init_proto("mask_constant", 16, vec![1]);
+        init.int32_data = vec![bf16::from_bits(0xFF80).to_bits() as i32];
+        let model = model_with_initializer(init);
+
+        let weights = model
+            .extract_weights()
+            .expect("bf16 with -inf must still parse");
+        match weights.get("mask_constant").unwrap() {
+            Tensor::BFloat16(arr) => {
+                let s: Vec<bf16> = arr.iter().copied().collect();
+                assert_eq!(super::count_non_finite_bf16(&s), 1);
             }
             other => panic!("expected Tensor::BFloat16, got {:?}", other),
         }
