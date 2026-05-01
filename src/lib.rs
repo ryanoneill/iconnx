@@ -64,7 +64,11 @@ pub mod graph;
 pub mod graph_executor;
 pub mod ir;
 pub mod onnx_parser;
+#[cfg(feature = "cuda")]
+pub mod op_support;
 pub mod operators;
+#[cfg(feature = "cuda")]
+pub mod opset;
 pub mod tensor;
 // `validate` depends on `crate::tensor::DType`, which is itself gated under
 // `feature = "cuda"` (see `src/tensor.rs`'s `pub use crate::cuda::DType`).
@@ -86,6 +90,12 @@ pub use validate::{
     validate_model, ModelCapabilities, ModelIncompatibility, ModelValidationFailure, ModelWarning,
     ToleranceBasis, ToleranceConfidence, ToleranceHint,
 };
+
+#[cfg(feature = "cuda")]
+pub use op_support::{DispatchContext, LookupResult};
+
+#[cfg(feature = "cuda")]
+pub use opset::{MAX_OPSET_SUPPORTED, MIN_OPSET_SUPPORTED};
 
 #[cfg(feature = "cuda")]
 pub use cuda::{GpuGraphExecutor, GpuMemoryPool, GpuTensor, IconnxCudaContext};

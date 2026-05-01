@@ -52,10 +52,12 @@ pub fn validate_model<P: AsRef<Path>>(
 ) -> Result<ModelCapabilities, ModelValidationFailure> {
     use crate::onnx_parser::OnnxParser;
 
-    // WS-5 Y(2) replacement points (this function):
-    //   1. Unsupported-op check: replaces placeholder pass-through with op_support::lookup().
-    //   2. Opset bounds: replaces placeholder (1..=22) with MIN/MAX_OPSET_SUPPORTED.
-    // Inline `// PLACEHOLDER (Y(2)):` markers below identify each site.
+    // WS-5 Y(2) wired up:
+    //   1. Unsupported-op check uses op_support::supported_ops() against
+    //      OP_SUPPORT_TABLE (drift-tested by
+    //      tests/op_support_table_consistency_test.rs).
+    //   2. Opset bounds use MIN/MAX_OPSET_SUPPORTED from src/opset.rs
+    //      (drift-tested by tests/opset_bounds_test.rs).
 
     // Step 1: Parse. ParseError short-circuits with partial: None.
     let model = match OnnxParser::parse_file(&path) {
@@ -87,13 +89,10 @@ pub fn validate_model<P: AsRef<Path>>(
         }
     };
 
-    // The op_support module isn't landed yet (Y(2)); for now use a
-    // placeholder that returns "all ops supported." Y(2) replaces this
-    // with the real lookup table.
     let mut incompatibilities: Vec<ModelIncompatibility> = Vec::new();
     let mut warnings: Vec<ModelWarning> = Vec::new();
 
-    // Step 2: Walk ops.
+    // Step 2: Walk ops, accumulating counts + sample node names per op_type.
     let mut op_counts: std::collections::HashMap<String, (usize, Vec<String>)> =
         std::collections::HashMap::new();
     for (idx, node) in graph.nodes().iter().enumerate() {
@@ -112,27 +111,35 @@ pub fn validate_model<P: AsRef<Path>>(
         }
     }
 
-    // PLACEHOLDER (Y(2)): replaces with real op_support::supported_ops() check.
-    // For now, no UnsupportedOp incompatibilities are surfaced — Y(2) will
-    // wire this in.
-    // (Tests in Task 1.5 use synthetic models with op_types that this
-    // placeholder accepts; they don't exercise the unsupported-op path.
-    // Y(2) re-runs the synthetic UnsupportedOp test against the real lookup.)
+    // Surface UnsupportedOp for any used op not in OP_SUPPORT_TABLE
+    // (drift-tested by tests/op_support_table_consistency_test.rs).
+    let supported = crate::op_support::supported_ops();
+    for (op_type, (count, samples)) in &op_counts {
+        if !supported.contains(op_type.as_str()) {
+            incompatibilities.push(ModelIncompatibility::UnsupportedOp {
+                op_type: op_type.clone(),
+                count: *count,
+                sample_node_names: samples.clone(),
+            });
+        }
+    }
 
-    // Step 3: Walk opset imports.
+    // Step 3: Walk opset imports against MIN/MAX_OPSET_SUPPORTED bounds
+    // (drift-tested by tests/opset_bounds_test.rs).
     let opset_imports = model.opset_imports();
-    // PLACEHOLDER (Y(2)): lands MIN_OPSET_SUPPORTED / MAX_OPSET_SUPPORTED;
-    // for now use 1..=22 as a maximally permissive stub. Y(2) replaces.
-    const PLACEHOLDER_MIN: i64 = 1;
-    const PLACEHOLDER_MAX: i64 = 22;
     for (domain, version) in &opset_imports {
         match domain.as_str() {
             "" | "ai.onnx" => {
-                if *version < PLACEHOLDER_MIN || *version > PLACEHOLDER_MAX {
+                if *version < crate::opset::MIN_OPSET_SUPPORTED
+                    || *version > crate::opset::MAX_OPSET_SUPPORTED
+                {
                     incompatibilities.push(ModelIncompatibility::OpsetOutOfRange {
                         domain: domain.clone(),
                         version: *version,
-                        supported: (PLACEHOLDER_MIN, PLACEHOLDER_MAX),
+                        supported: (
+                            crate::opset::MIN_OPSET_SUPPORTED,
+                            crate::opset::MAX_OPSET_SUPPORTED,
+                        ),
                     });
                 }
             }
@@ -145,10 +152,14 @@ pub fn validate_model<P: AsRef<Path>>(
         }
     }
 
-    // Pre-compute supported_ops (used ops ∩ placeholder supported set) so
-    // we can include it in `partial_capabilities` even if `extract_weights`
-    // bails below. Y(2) replaces with the real op_support intersection.
-    let mut supported_ops: Vec<String> = op_counts.keys().cloned().collect();
+    // Pre-compute supported_ops (used ops ∩ OP_SUPPORT_TABLE) so we can
+    // include it in `partial_capabilities` even if `extract_weights` bails
+    // below.
+    let mut supported_ops: Vec<String> = op_counts
+        .keys()
+        .filter(|op| supported.contains(op.as_str()))
+        .cloned()
+        .collect();
     supported_ops.sort();
 
     // Pre-compute the layer count up here too — it's a pure graph walk.

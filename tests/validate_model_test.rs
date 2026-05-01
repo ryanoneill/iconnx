@@ -13,22 +13,31 @@ use iconnx::tensor::DType;
 use iconnx::{validate_model, ModelIncompatibility};
 
 #[test]
-fn validate_model_unsupported_op_y2_placeholder_passthrough() {
-    // Y(1) PLACEHOLDER ONLY — this test is intentionally a passthrough today.
-    // The Y(1) `validate_model` orchestration does NOT reject custom ops
-    // (see `src/validate/mod.rs` "PLACEHOLDER: Y(2) replaces with real
-    // op_support::supported_ops()"); the synthetic CustomOpFoo fixture
-    // therefore validates "successfully" today. Y(2) lands the real
-    // OP_SUPPORT_TABLE drift-tested lookup, at which point this test
-    // MUST be tightened to assert on `Err(ModelIncompatibility::UnsupportedOp { .. })`.
+fn validate_model_unsupported_op_collected() {
+    // Y(2) tightened: validate_model now consults OP_SUPPORT_TABLE and
+    // surfaces UnsupportedOp for any op_type with no dispatch arm. The
+    // synthetic CustomOpFoo fixture (a single-node graph with op_type
+    // "CustomOpFoo", absent from OP_SUPPORT_TABLE) must fail validation
+    // with a matching incompatibility.
     let path = PathBuf::from("tests/fixtures/ws5_synthetic/unsupported_op.onnx");
     if !path.exists() {
         eprintln!("skipping: fixture not yet generated");
         return;
     }
     let result = validate_model(&path);
-    // Y(2) makes this assert-on-Err; today the placeholder accepts everything.
-    let _ = result;
+    match result {
+        Err(failure) => {
+            assert!(
+                failure.incompatibilities.iter().any(|i| matches!(
+                    i,
+                    ModelIncompatibility::UnsupportedOp { op_type, .. } if op_type == "CustomOpFoo"
+                )),
+                "expected UnsupportedOp {{ op_type: \"CustomOpFoo\", .. }}, got: {:?}",
+                failure.incompatibilities
+            );
+        }
+        Ok(_) => panic!("expected unsupported op incompat"),
+    }
 }
 
 #[test]
