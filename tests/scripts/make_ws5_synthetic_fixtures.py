@@ -139,6 +139,27 @@ def make_fp64_initializer():
     save(model, "fp64_initializer")
 
 
+# 7. int64_input_fp32_init: INT64 input + FP32 weight initializer.
+# Proves IO-walk contributes a dtype not present in initializers.
+def make_int64_input_fp32_init():
+    a = helper.make_tensor_value_info("A", TensorProto.INT64, [3])
+    c = helper.make_tensor_value_info("C", TensorProto.FLOAT, [3])
+    weight = helper.make_tensor(
+        name="weight", data_type=TensorProto.FLOAT, dims=[3],
+        vals=[1.0, 2.0, 3.0],
+    )
+    # Identity on INT64 input (we only care about dtypes for capability discovery).
+    # Use Cast to convert INT64 to FP32 so the FP32 output validates.
+    cast_node = helper.make_node("Cast", ["A"], ["A_f32"], to=TensorProto.FLOAT)
+    add_node = helper.make_node("Add", ["A_f32", "weight"], ["C"])
+    graph = helper.make_graph(
+        [cast_node, add_node], "int64_in_fp32_init",
+        [a], [c], initializer=[weight]
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    save(model, "int64_input_fp32_init")
+
+
 if __name__ == "__main__":
     make_minimal_add()
     make_unsupported_op()
@@ -147,3 +168,4 @@ if __name__ == "__main__":
     make_bf16_with_neg_inf()
     make_garbage()
     make_fp64_initializer()
+    make_int64_input_fp32_init()

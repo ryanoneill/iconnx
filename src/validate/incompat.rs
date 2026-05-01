@@ -33,9 +33,9 @@ pub struct ModelValidationFailure {
     /// dtypes [list], opset [N], EXCEPT for these incompatibilities [list]"
     /// rather than just the failure list.
     ///
-    /// `None` only on the parse short-circuit case (`vec![Parse(_)]` shape) —
-    /// when the file failed to parse, no capability fields can be honestly
-    /// reported.
+    /// `None` only on the file-level parse short-circuit case (model proto
+    /// decode); always `Some(_)` otherwise, even when the incompatibility
+    /// list contains a `Parse(_)` from later-stage initializer decode.
     pub partial_capabilities: Option<ModelCapabilities>,
 }
 
@@ -82,7 +82,17 @@ pub enum ModelIncompatibility {
         found: String,
     },
 
-    /// Underlying parse error. Short-circuits validation —
-    /// `partial_capabilities` is `None` when this variant is present.
+    /// Underlying parse error.
+    ///
+    /// Appears in two cases:
+    /// - **File-level parse failure** (model proto decode failed): the entire
+    ///   validation short-circuits; `partial_capabilities` is `None`.
+    /// - **Initializer decode failure** after a successful file-level parse:
+    ///   composes with any prior incompatibilities; `partial_capabilities` is
+    ///   `Some(_)` populated with fields computable from the parseable model
+    ///   (opset_imports, supported_ops list, layer count, declared
+    ///   input/output dtypes — initializer-derived fields zeroed).
+    ///
+    /// Inspect `partial_capabilities` to disambiguate.
     Parse(ParseError),
 }

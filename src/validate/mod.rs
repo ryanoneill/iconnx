@@ -52,6 +52,11 @@ pub fn validate_model<P: AsRef<Path>>(
 ) -> Result<ModelCapabilities, ModelValidationFailure> {
     use crate::onnx_parser::OnnxParser;
 
+    // WS-5 Y(2) replacement points (this function):
+    //   1. Unsupported-op check: replaces placeholder pass-through with op_support::lookup().
+    //   2. Opset bounds: replaces placeholder (1..=22) with MIN/MAX_OPSET_SUPPORTED.
+    // Inline `// PLACEHOLDER (Y(2)):` markers below identify each site.
+
     // Step 1: Parse. ParseError short-circuits with partial: None.
     let model = match OnnxParser::parse_file(&path) {
         Ok(m) => m,
@@ -107,7 +112,7 @@ pub fn validate_model<P: AsRef<Path>>(
         }
     }
 
-    // PLACEHOLDER: Y(2) replaces with real op_support::supported_ops() check.
+    // PLACEHOLDER (Y(2)): replaces with real op_support::supported_ops() check.
     // For now, no UnsupportedOp incompatibilities are surfaced — Y(2) will
     // wire this in.
     // (Tests in Task 1.5 use synthetic models with op_types that this
@@ -116,7 +121,7 @@ pub fn validate_model<P: AsRef<Path>>(
 
     // Step 3: Walk opset imports.
     let opset_imports = model.opset_imports();
-    // PLACEHOLDER: Y(2) lands MIN_OPSET_SUPPORTED / MAX_OPSET_SUPPORTED;
+    // PLACEHOLDER (Y(2)): lands MIN_OPSET_SUPPORTED / MAX_OPSET_SUPPORTED;
     // for now use 1..=22 as a maximally permissive stub. Y(2) replaces.
     const PLACEHOLDER_MIN: i64 = 1;
     const PLACEHOLDER_MAX: i64 = 22;
@@ -159,7 +164,13 @@ pub fn validate_model<P: AsRef<Path>>(
     let weights = match model.extract_weights() {
         Ok(w) => w,
         Err(e) => {
-            let used_dtypes_vec: Vec<crate::tensor::DType> = Vec::new();
+            // Even though initializer decode failed, the IO-walk over declared
+            // input/output value-info dtypes is still computable from the
+            // already-parsed model proto. Surface those dtypes in the failure
+            // caps so callers see e.g. INT64 inputs for NLP models.
+            let io_dtype_set = collect_io_dtypes(&model);
+            let used_dtypes_vec: Vec<crate::tensor::DType> =
+                io_dtype_set.into_iter().collect();
             let expected_tolerance = tolerance_hint::expected_tolerance(&used_dtypes_vec, 0);
             let caps = ModelCapabilities {
                 opset_imports,
@@ -293,6 +304,37 @@ pub fn validate_model<P: AsRef<Path>>(
             partial_capabilities: Some(caps),
         })
     }
+}
+
+/// Walk declared input + output value-info dtypes into a sorted set.
+///
+/// Used by both the `extract_weights` failure path (where it's the only
+/// available dtype source) and conceptually mirrors the IO-walk in the
+/// success path. The success path inlines the walk because it also emits
+/// a `DTypeDowncast` warning for FLOAT64 declared on a graph IO; that
+/// warning side-effect doesn't apply on the failure path (caps.warnings is
+/// empty), so the helper only handles the dtype extraction.
+fn collect_io_dtypes(
+    model: &crate::onnx_parser::OnnxModel,
+) -> std::collections::BTreeSet<crate::tensor::DType> {
+    let mut set = std::collections::BTreeSet::new();
+    for id in model
+        .input_dtypes()
+        .into_iter()
+        .chain(model.output_dtypes())
+        .flatten()
+    {
+        if let Some(dt) = onnx_dtype_id_to_dtype(id) {
+            set.insert(dt);
+        } else if id == 11 {
+            // FLOAT64 on a graph IO maps to FP32 in the GPU dtype taxonomy
+            // (validate_model has no f64 GPU path); same downcast surface
+            // as the success path, minus the warning emission.
+            set.insert(crate::tensor::DType::Float32);
+        }
+        // Other unknown ids (sequence/map/sparse) silently skipped.
+    }
+    set
 }
 
 /// Map an ONNX `TensorProto.DataType` raw enum value to iconnx's GPU

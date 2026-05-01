@@ -167,6 +167,30 @@ fn validate_model_fp64_initializer_emits_dtype_downcast_warning() {
 }
 
 #[test]
+fn validate_model_int64_input_surfaced_via_io_walk() {
+    let path = PathBuf::from("tests/fixtures/ws5_synthetic/int64_input_fp32_init.onnx");
+    if !path.exists() {
+        eprintln!("skipping: fixture not yet generated");
+        return;
+    }
+    let result = validate_model(&path);
+    let caps = match result {
+        Ok(c) => c,
+        Err(failure) => failure.partial_capabilities.expect("partial caps populated"),
+    };
+    assert!(
+        caps.used_dtypes.contains(&iconnx::tensor::DType::Int64),
+        "INT64 input should be surfaced via IO-walk; used_dtypes = {:?}",
+        caps.used_dtypes
+    );
+    assert!(
+        caps.used_dtypes.contains(&iconnx::tensor::DType::Float32),
+        "FP32 initializer should also surface; used_dtypes = {:?}",
+        caps.used_dtypes
+    );
+}
+
+#[test]
 #[ignore = "requires CUDA GPU"]
 fn validate_model_for_hardware_bf16_full_path_compose() {
     // Issue #1 review feedback: exercise the full
