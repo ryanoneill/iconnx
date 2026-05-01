@@ -5,6 +5,15 @@
 use half::{bf16, f16};
 use ndarray::{ArrayD, IxDyn};
 
+/// Re-export of the GPU-side [`DType`](crate::cuda::DType) tag enum so that
+/// CPU-only consumers (e.g. the WS-5 `validate` module) can refer to a
+/// canonical `crate::tensor::DType` without depending on the `cuda::tensor`
+/// module path. Only available with the `cuda` feature, which is enabled by
+/// default; if iconnx ever ships a non-cuda build target the validate module
+/// will need a dedicated CPU-side dtype tag.
+#[cfg(feature = "cuda")]
+pub use crate::cuda::DType;
+
 /// N-dimensional tensor with multiple data types
 ///
 /// ONNX models use various data types for different purposes:
@@ -854,6 +863,61 @@ impl Tensor {
             let arrays: Vec<&ArrayD<f32>> = as_f32.iter().map(|t| t.to_array()).collect();
             Tensor::Float32(f32_op(&arrays))
         }
+    }
+}
+
+// ===== WS-5 helpers =====
+//
+// `dtype_for_tensor` and `tensor_byte_size` give the WS-5 `validate` module
+// a uniform way to walk a `HashMap<String, Tensor>` from
+// `OnnxModel::extract_weights()` without re-implementing the variant match
+// at every call site. Defined here (next to the `Tensor` enum) so any
+// future variant added to `Tensor` is a compile error if the helpers
+// aren't updated.
+
+/// Return the [`DType`] tag corresponding to a `Tensor` variant.
+#[cfg(feature = "cuda")]
+pub fn dtype_for_tensor(t: &Tensor) -> DType {
+    match t {
+        Tensor::Float32(_) => DType::Float32,
+        Tensor::Float16(_) => DType::Float16,
+        Tensor::BFloat16(_) => DType::BFloat16,
+        Tensor::Int32(_) => DType::Int32,
+        Tensor::Int64(_) => DType::Int64,
+        Tensor::Int8(_) => DType::Int8,
+        Tensor::UInt8(_) => DType::UInt8,
+        Tensor::Bool(_) => DType::Bool,
+        // FLOAT64 has no `DType` tag in the GPU-side enum (the GPU path
+        // doesn't accept f64 today). For capability discovery purposes,
+        // treat f64 as Float32 — `validate_model` reports it via
+        // `used_dtypes` only and never dispatches kernels.
+        Tensor::Float64(_) => DType::Float32,
+    }
+}
+
+/// Total byte size of the `Tensor`'s underlying storage (element count ×
+/// element-byte-size).
+pub fn tensor_byte_size(t: &Tensor) -> usize {
+    let element_size = match t {
+        Tensor::Float32(_) | Tensor::Int32(_) => 4,
+        Tensor::Float16(_) | Tensor::BFloat16(_) => 2,
+        Tensor::Int64(_) | Tensor::Float64(_) => 8,
+        Tensor::Int8(_) | Tensor::UInt8(_) | Tensor::Bool(_) => 1,
+    };
+    element_size * tensor_element_count(t)
+}
+
+fn tensor_element_count(t: &Tensor) -> usize {
+    match t {
+        Tensor::Float32(a) => a.len(),
+        Tensor::Float16(a) => a.len(),
+        Tensor::BFloat16(a) => a.len(),
+        Tensor::Int32(a) => a.len(),
+        Tensor::Int64(a) => a.len(),
+        Tensor::Int8(a) => a.len(),
+        Tensor::UInt8(a) => a.len(),
+        Tensor::Bool(a) => a.len(),
+        Tensor::Float64(a) => a.len(),
     }
 }
 

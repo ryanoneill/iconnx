@@ -59,18 +59,54 @@ pub mod attributes;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod engine;
+pub mod errors;
 pub mod graph;
 pub mod graph_executor;
 pub mod ir;
 pub mod onnx_parser;
+// `op_support` and `opset` are gated under `cuda` to mirror `validate`
+// (the only consumer); neither has an intrinsic cuda dependency, but
+// ungating them while `validate` remains gated would leave dead code
+// paths visible on no-default-features builds (e.g. `OP_SUPPORT_TABLE`
+// would compile against a `validate` module that doesn't exist).
+// Ungate together if/when validate's cuda coupling is removed.
+#[cfg(feature = "cuda")]
+pub mod op_support;
 pub mod operators;
+#[cfg(feature = "cuda")]
+pub mod opset;
 pub mod tensor;
+pub mod tolerance;
+// `validate` depends on `crate::tensor::DType`, which is itself gated under
+// `feature = "cuda"` (see `src/tensor.rs`'s `pub use crate::cuda::DType`).
+// Mirror that gating here so a future no-default-features build doesn't
+// surface link errors from a partially-defined module surface. Public
+// re-exports below match the gating exactly.
+#[cfg(feature = "cuda")]
+pub mod validate;
 
 // Re-export commonly used types at crate root
 pub use attributes::NodeAttributes;
+pub use errors::{IconnxError, Result};
 pub use graph_executor::GraphExecutor;
 pub use onnx_parser::{OnnxModel, OnnxParser, ParseError};
 pub use tensor::Tensor;
+pub use tolerance::DifferentialTolerance;
+
+#[cfg(feature = "cuda")]
+pub use validate::{
+    validate_model, ModelCapabilities, ModelIncompatibility, ModelValidationFailure, ModelWarning,
+    ToleranceBasis, ToleranceConfidence, ToleranceHint,
+};
+
+#[cfg(feature = "cuda")]
+pub use op_support::{DispatchContext, LookupResult};
+
+#[cfg(feature = "cuda")]
+pub use opset::{MAX_OPSET_SUPPORTED, MIN_OPSET_SUPPORTED};
 
 #[cfg(feature = "cuda")]
 pub use cuda::{GpuGraphExecutor, GpuMemoryPool, GpuTensor, IconnxCudaContext};
+
+#[cfg(feature = "cuda")]
+pub use validate::validate_model_for_hardware;

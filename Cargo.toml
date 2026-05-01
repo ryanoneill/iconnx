@@ -94,6 +94,13 @@ npyz = "0.8"
 # Serialization for test fixtures
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Regex — used by `tests/op_support_table_consistency_test.rs` to source-parse
+# dispatch arms from `src/cuda/executor/*.rs` at compile time. Drift fence
+# closes the WS-3.5 cross-tier dispatch hole (BERT BF16 Cast hotfix lesson).
+regex = "1"
+# TOML — used by `tests/onnx_conformance.rs` to parse the known-failures
+# allowlist (WS-5 M5.3 conformance harness).
+toml = "0.8"
 
 [package.metadata.docs.rs]
 # Build docs.rs without CUDA (since their build server likely doesn't have it)

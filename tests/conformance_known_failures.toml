@@ -1,0 +1,67 @@
+# WS-5 M5.3 — Conformance harness allowlist.
+#
+# Each entry documents a known-failing conformance test for an op iconnx
+# claims to support. The harness uses this list to distinguish:
+#   - listed + fails  -> KnownFailure (expected)
+#   - listed + passes -> UnexpectedPass (allowlist stale; remove the entry)
+#   - !listed + fails -> UnexpectedFailure (regression)
+#   - !listed + passes -> Pass
+#
+# `dispatch` is one of "cpu" | "gpu" | "both":
+#   - "gpu":  entry applies only when running with cuda feature + GPU
+#   - "cpu":  entry applies only in ParserOnlyCi (forward-compat; iconnx
+#             has no CPU executor today, so cpu entries are inert)
+#   - "both": entry applies in both contexts
+#
+# Add `tracked_issue` (string) when the failure has a known root cause
+# tracked elsewhere.
+
+# Example entry shape (commented out):
+#
+# [[failures]]
+# test = "test_resize_upsample_scales_linear"
+# op = "Resize"
+# dispatch = "gpu"
+# reason = """
+# iconnx Resize doesn't support linear-coordinates mode at half-pixel
+# alignment; only nearest is implemented.
+# """
+# tracked_issue = "iconnx#N"
+
+# ---- Populated empirically from the first conformance run ----
+
+# ai.onnx.ml domain operators are out of scope for iconnx (which targets the
+# standard ai.onnx neural-network opset). Their conformance models contain
+# tensor attributes with dtypes iconnx does not decode (e.g., INT16=5),
+# causing ParseError::UnsupportedDType at parse time. Tracked here so the
+# harness records them as KnownFailure rather than UnexpectedFailure.
+
+[[failures]]
+test = "test_ai_onnx_ml_label_encoder_tensor_value_only_mapping"
+op = "LabelEncoder"
+dispatch = "both"
+reason = """
+ai.onnx.ml domain (out of iconnx scope). Model contains a tensor attribute
+with dtype 5 (INT16) which iconnx does not decode; parse fails with
+ParseError::UnsupportedDType.
+"""
+
+[[failures]]
+test = "test_ai_onnx_ml_label_encoder_tensor_mapping"
+op = "LabelEncoder"
+dispatch = "both"
+reason = """
+ai.onnx.ml domain (out of iconnx scope). Model contains a tensor attribute
+with dtype 5 (INT16) which iconnx does not decode; parse fails with
+ParseError::UnsupportedDType.
+"""
+
+[[failures]]
+test = "test_ai_onnx_ml_tree_ensemble_single_tree"
+op = "TreeEnsemble"
+dispatch = "both"
+reason = """
+ai.onnx.ml domain (out of iconnx scope). Parse fails because the model
+contains attributes/dtypes specific to traditional-ML tree ensembles that
+iconnx does not decode.
+"""

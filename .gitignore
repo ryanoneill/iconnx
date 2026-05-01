@@ -20,6 +20,16 @@ Thumbs.db
 # ONNX models (too large for git)
 *.onnx
 
+# WS-5 synthetic fixtures are tiny (≤200 bytes each, ≤1KB total) and must
+# be checked in so `cargo test --test validate_model_test` runs offline.
+!tests/fixtures/ws5_synthetic/*.onnx
+
+# WS-5 M5.3 vendored ONNX conformance test data (~43 MB across ~1450
+# test_*/ directories). Must be checked in so the conformance harness
+# runs offline. See tests/conformance_data/regenerate.sh for re-vendoring.
+!tests/conformance_data/**/*.onnx
+!tests/conformance_data_self_test/**/*.onnx
+
 # Build artifacts
 *.so
 *.dylib
