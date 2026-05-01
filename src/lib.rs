@@ -59,18 +59,28 @@ pub mod attributes;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod engine;
+pub mod errors;
 pub mod graph;
 pub mod graph_executor;
 pub mod ir;
 pub mod onnx_parser;
 pub mod operators;
 pub mod tensor;
+pub mod validate;
 
 // Re-export commonly used types at crate root
 pub use attributes::NodeAttributes;
+pub use errors::{IconnxError, Result};
 pub use graph_executor::GraphExecutor;
 pub use onnx_parser::{OnnxModel, OnnxParser, ParseError};
 pub use tensor::Tensor;
+pub use validate::{
+    validate_model, ModelCapabilities, ModelIncompatibility, ModelValidationFailure, ModelWarning,
+    ToleranceBasis, ToleranceConfidence, ToleranceHint,
+};
 
 #[cfg(feature = "cuda")]
 pub use cuda::{GpuGraphExecutor, GpuMemoryPool, GpuTensor, IconnxCudaContext};
+
+#[cfg(feature = "cuda")]
+pub use validate::validate_model_for_hardware;

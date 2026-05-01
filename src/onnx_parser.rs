@@ -265,6 +265,21 @@ impl OnnxModel {
             .unwrap_or_default()
     }
 
+    /// Returns the model's opset imports as `(domain, version)` pairs.
+    ///
+    /// The default ONNX domain is represented as the empty string `""` per
+    /// the ONNX spec convention; some exporters use `"ai.onnx"` instead —
+    /// callers should treat both as equivalent.
+    ///
+    /// Added in WS-5 M5.1 to support `validate_model`'s opset-bounds walk.
+    pub fn opset_imports(&self) -> Vec<(String, i64)> {
+        self.proto
+            .opset_import
+            .iter()
+            .map(|op| (op.domain.clone().unwrap_or_default(), op.version.unwrap_or(0)))
+            .collect()
+    }
+
     /// Extract weight tensors from initializers.
     ///
     /// Returns a map of tensor name → Tensor. Supports ONNX dtypes
@@ -2152,5 +2167,37 @@ mod tests {
             }
             other => panic!("expected InvalidTensorData, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn opset_imports_extracts_domain_and_version() {
+        let proto = onnx_proto::ModelProto {
+            opset_import: vec![
+                onnx_proto::OperatorSetIdProto {
+                    domain: Some("".to_string()),
+                    version: Some(17),
+                },
+                onnx_proto::OperatorSetIdProto {
+                    domain: Some("com.microsoft".to_string()),
+                    version: Some(1),
+                },
+            ],
+            graph: Some(onnx_proto::GraphProto {
+                node: vec![],
+                initializer: vec![],
+                input: vec![],
+                output: vec![],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let model = OnnxModel {
+            proto,
+            options: Default::default(),
+        };
+        let imports = model.opset_imports();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0], ("".to_string(), 17));
+        assert_eq!(imports[1], ("com.microsoft".to_string(), 1));
     }
 }

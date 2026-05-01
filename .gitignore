@@ -20,6 +20,10 @@ Thumbs.db
 # ONNX models (too large for git)
 *.onnx
 
+# WS-5 synthetic fixtures are tiny (≤200 bytes each, ≤1KB total) and must
+# be checked in so `cargo test --test validate_model_test` runs offline.
+!tests/fixtures/ws5_synthetic/*.onnx
+
 # Build artifacts
 *.so
 *.dylib

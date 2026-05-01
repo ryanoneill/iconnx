@@ -15,7 +15,7 @@ use garboard::DeviceSlice;
 use super::context::{CudaError, IconnxCudaContext};
 
 /// Data type enum matching ONNX types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DType {
     Float32,
     Float16,
