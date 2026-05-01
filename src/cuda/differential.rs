@@ -40,6 +40,10 @@ use std::path::{Path, PathBuf};
 /// the canonical type has moved to `crate::tolerance::DifferentialTolerance`
 /// (just `abs` + `rel` optionals). The alias preserves the import path
 /// during the migration window.
+#[deprecated(
+    since = "0.1.0",
+    note = "WS-5 Y(4): renamed to `DifferentialTolerance` (lifted to `crate::tolerance`); the legacy correlation_threshold/max_abs_diff/allow_shape_mismatch shape is gone"
+)]
 pub type DiffTolerance = DifferentialTolerance;
 
 /// Where iconnx finds reference outputs to compare against.
@@ -62,6 +66,7 @@ pub enum ReferenceSource {
 
 /// Variant indicating which tolerance bound was exceeded.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ExceededTolerance {
     /// Absolute difference exceeded the configured ceiling. Carries the
     /// observed max-abs-diff value.
@@ -77,6 +82,7 @@ pub enum ExceededTolerance {
 
 /// Truncated preview of a tensor for inclusion in divergence reports.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TensorPreview {
     pub name: String,
     pub shape: Vec<usize>,
@@ -87,6 +93,7 @@ pub struct TensorPreview {
 
 /// Report of a divergence found during differential testing.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DivergenceReport {
     /// Name of the first divergent node (or graph output, in InMemory mode).
     pub node_name: String,
@@ -284,6 +291,13 @@ impl DifferentialRunner {
     /// Override the op-chain context depth (default: 5). When a
     /// divergence is detected, the report includes up to this many
     /// preceding op names walked backward through the producer chain.
+    ///
+    /// **Walk semantics:** at each step, the walk follows only the
+    /// *first input's* producer. For branchy graphs (e.g., an `Add`
+    /// node whose two operands have distinct ancestor histories), only
+    /// one ancestor branch is reported. This gives a single linear
+    /// context trail suitable for `--bisect`-style consumers; consumers
+    /// needing full DAG ancestry should walk the model graph directly.
     pub fn with_op_chain_context_depth(mut self, depth: usize) -> Self {
         self.op_chain_context_depth = depth;
         self
@@ -645,6 +659,7 @@ fn extract_op_type_from_error(err: &str) -> Option<&str> {
 
 /// Differential testing errors.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum DifferentialError {
     /// Model loading error.
     ModelLoad(String),
