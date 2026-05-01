@@ -64,6 +64,12 @@ pub mod graph;
 pub mod graph_executor;
 pub mod ir;
 pub mod onnx_parser;
+// `op_support` and `opset` are gated under `cuda` to mirror `validate`
+// (the only consumer); neither has an intrinsic cuda dependency, but
+// ungating them while `validate` remains gated would leave dead code
+// paths visible on no-default-features builds (e.g. `OP_SUPPORT_TABLE`
+// would compile against a `validate` module that doesn't exist).
+// Ungate together if/when validate's cuda coupling is removed.
 #[cfg(feature = "cuda")]
 pub mod op_support;
 pub mod operators;

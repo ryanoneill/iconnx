@@ -27,12 +27,26 @@ fn validate_model_unsupported_op_collected() {
     let result = validate_model(&path);
     match result {
         Err(failure) => {
+            // Y(2) review fix: tighten beyond op_type-only — also assert
+            // `count >= 1` and `sample_node_names` non-empty so the test
+            // exercises the full UnsupportedOp variant payload, not just
+            // the discriminant. A regression that drops sample_node_names
+            // collection (e.g. via an off-by-one in the validate walk)
+            // would slip past the looser `op_type == ..` check.
+            let found = failure.incompatibilities.iter().any(|i| matches!(
+                i,
+                ModelIncompatibility::UnsupportedOp {
+                    op_type,
+                    count,
+                    sample_node_names,
+                } if op_type == "CustomOpFoo"
+                    && *count >= 1
+                    && !sample_node_names.is_empty()
+            ));
             assert!(
-                failure.incompatibilities.iter().any(|i| matches!(
-                    i,
-                    ModelIncompatibility::UnsupportedOp { op_type, .. } if op_type == "CustomOpFoo"
-                )),
-                "expected UnsupportedOp {{ op_type: \"CustomOpFoo\", .. }}, got: {:?}",
+                found,
+                "expected UnsupportedOp {{ op_type: \"CustomOpFoo\", count >= 1, \
+                 sample_node_names non-empty }}; got: {:?}",
                 failure.incompatibilities
             );
         }
