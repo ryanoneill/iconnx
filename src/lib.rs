@@ -76,6 +76,7 @@ pub mod operators;
 #[cfg(feature = "cuda")]
 pub mod opset;
 pub mod tensor;
+pub mod tolerance;
 // `validate` depends on `crate::tensor::DType`, which is itself gated under
 // `feature = "cuda"` (see `src/tensor.rs`'s `pub use crate::cuda::DType`).
 // Mirror that gating here so a future no-default-features build doesn't
@@ -90,6 +91,7 @@ pub use errors::{IconnxError, Result};
 pub use graph_executor::GraphExecutor;
 pub use onnx_parser::{OnnxModel, OnnxParser, ParseError};
 pub use tensor::Tensor;
+pub use tolerance::DifferentialTolerance;
 
 #[cfg(feature = "cuda")]
 pub use validate::{

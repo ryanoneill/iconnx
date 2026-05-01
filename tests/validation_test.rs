@@ -289,24 +289,29 @@ fn test_checkpoint_find_divergence() {
 // ==================== Differential Testing Framework Tests ====================
 
 #[cfg(feature = "debug-inference")]
-use iconnx::cuda::differential::{DifferentialRunner, DiffTolerance};
+use iconnx::cuda::differential::{DifferentialRunner, ReferenceSource};
+#[cfg(feature = "debug-inference")]
+use iconnx::DifferentialTolerance;
 
 /// Test tolerance configurations
 #[test]
 #[cfg(feature = "debug-inference")]
 fn test_tolerance_presets() {
-    let default = DiffTolerance::default();
-    assert!((default.correlation_threshold - 0.9999).abs() < 1e-6);
-    assert!((default.max_abs_diff - 1e-4).abs() < 1e-8);
-    assert!(!default.allow_shape_mismatch);
+    // Post-Y(4): DifferentialTolerance has the implicit-mode shape
+    // (abs/rel optionals). Default is "disabled"; strict is abs-only;
+    // loose is dual-gate.
+    let default = DifferentialTolerance::default();
+    assert!(default.abs.is_none());
+    assert!(default.rel.is_none());
+    assert!(!default.is_active());
 
-    let strict = DiffTolerance::strict();
-    assert!(strict.correlation_threshold > default.correlation_threshold);
-    assert!(strict.max_abs_diff < default.max_abs_diff);
+    let strict = DifferentialTolerance::strict();
+    assert!(strict.abs.is_some());
+    assert!(strict.rel.is_none());
 
-    let loose = DiffTolerance::loose();
-    assert!(loose.correlation_threshold < default.correlation_threshold);
-    assert!(loose.max_abs_diff > default.max_abs_diff);
+    let loose = DifferentialTolerance::loose();
+    assert!(loose.abs.is_some());
+    assert!(loose.rel.is_some());
 }
 
 /// Test differential runner with encoder nodes
@@ -322,8 +327,13 @@ fn test_differential_encoder_nodes() {
         return;
     }
 
-    let runner = match DifferentialRunner::new(&model_path, fixture_path, DiffTolerance::default()) {
-        Ok(r) => r,
+    let runner = match DifferentialRunner::new(&model_path) {
+        Ok(r) => r
+            .with_reference(ReferenceSource::FixtureDir {
+                path: fixture_path.to_path_buf(),
+            })
+            .with_tolerance(DifferentialTolerance::strict())
+            .with_outputs(&["/encoder/Squeeze_1_output_0"]),
         Err(e) => {
             println!("Failed to create runner: {}", e);
             return;
@@ -333,7 +343,7 @@ fn test_differential_encoder_nodes() {
     let inputs = test_inputs();
 
     // Run to encoder output - should have no divergence
-    match runner.run_until_divergence(inputs, "/encoder/Squeeze_1_output_0") {
+    match runner.run_until_divergence(inputs) {
         Ok(Some(report)) => {
             println!("\n{}", report.to_string_detailed());
             // Early divergence is unexpected for encoder
@@ -361,14 +371,18 @@ fn test_differential_find_divergence() {
         return;
     }
 
-    let tolerance = DiffTolerance {
-        correlation_threshold: 0.999,  // Slightly loose
-        max_abs_diff: 1e-3,
-        allow_shape_mismatch: false,
+    let tolerance = DifferentialTolerance {
+        abs: Some(1e-3),
+        rel: None,
     };
 
-    let runner = match DifferentialRunner::new(&model_path, fixture_path, tolerance) {
-        Ok(r) => r,
+    let runner = match DifferentialRunner::new(&model_path) {
+        Ok(r) => r
+            .with_reference(ReferenceSource::FixtureDir {
+                path: fixture_path.to_path_buf(),
+            })
+            .with_tolerance(tolerance)
+            .with_outputs(&["audio"]),
         Err(e) => {
             println!("Failed to create runner: {}", e);
             return;
@@ -379,13 +393,16 @@ fn test_differential_find_divergence() {
     let inputs = load_fixture_inputs();
 
     // Run full model - expect divergence if GPU doesn't match ORT
-    match runner.run_until_divergence(inputs, "audio") {
+    match runner.run_until_divergence(inputs) {
         Ok(Some(report)) => {
             println!("\n=== DIVERGENCE FOUND ===");
             println!("{}", report.to_string_detailed());
 
-            // We expect divergence at Add_2 due to known shape mismatch
-            if report.is_shape_mismatch {
+            // Post-Y(4): shape mismatch surfaces as ExceededTolerance::Abs(INFINITY).
+            if matches!(
+                report.exceeded,
+                iconnx::cuda::differential::ExceededTolerance::Abs(v) if !v.is_finite()
+            ) {
                 println!("Shape mismatch confirmed at: {}", report.node_name);
             }
         }
