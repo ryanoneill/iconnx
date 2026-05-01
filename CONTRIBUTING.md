@@ -29,3 +29,12 @@ The vendored ONNX conformance test data lives at
 Then update `CONFORMANCE_DATA_DIR` in `tests/onnx_conformance.rs` to point at
 the new directory, run the harness to populate any new entries in
 `tests/conformance_known_failures.toml`, and commit.
+
+## Vendored Data Attribution
+
+`tests/conformance_data/onnx-1.18/node/` is vendored from
+[`onnx/onnx`](https://github.com/onnx/onnx) at tag v1.18.0, subdirectory
+`onnx/backend/test/data/node/`. ONNX is licensed under Apache-2.0;
+see `tests/conformance_data/onnx-1.18/UPSTREAM_LICENSE` for the upstream
+license text. Re-vendoring uses `tests/conformance_data/regenerate.sh`,
+which re-copies the LICENSE alongside the data.

@@ -25,5 +25,9 @@ DEST="$(dirname "$0")/onnx-$SHORT"
 mkdir -p "$DEST"
 cp -r "$TMPDIR/onnx/onnx/backend/test/data/node" "$DEST/"
 
+# Attribution: ONNX is Apache-2.0; copy upstream LICENSE/NOTICE.
+cp "$TMPDIR/onnx/LICENSE" "$DEST/UPSTREAM_LICENSE"
+cp "$TMPDIR/onnx/NOTICE" "$DEST/UPSTREAM_NOTICE" 2>/dev/null || true
+
 echo "Vendored ONNX $TAG conformance node tests at $DEST"
 echo "Next: update tests/onnx_conformance.rs CONFORMANCE_DATA_DIR to point at the new directory."

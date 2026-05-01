@@ -85,8 +85,10 @@ fn load_allowlist() -> Allowlist {
     if !path.exists() {
         return Allowlist { failures: vec![] };
     }
-    let s = fs::read_to_string(&path).expect("read allowlist");
-    toml::from_str(&s).expect("parse allowlist TOML")
+    let s = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read allowlist {}: {}", ALLOWLIST_PATH, e));
+    toml::from_str(&s)
+        .unwrap_or_else(|e| panic!("parse allowlist {}: {}", ALLOWLIST_PATH, e))
 }
 
 fn allowlist_matches(
