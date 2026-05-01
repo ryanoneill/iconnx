@@ -66,6 +66,12 @@ pub mod ir;
 pub mod onnx_parser;
 pub mod operators;
 pub mod tensor;
+// `validate` depends on `crate::tensor::DType`, which is itself gated under
+// `feature = "cuda"` (see `src/tensor.rs`'s `pub use crate::cuda::DType`).
+// Mirror that gating here so a future no-default-features build doesn't
+// surface link errors from a partially-defined module surface. Public
+// re-exports below match the gating exactly.
+#[cfg(feature = "cuda")]
 pub mod validate;
 
 // Re-export commonly used types at crate root
@@ -74,6 +80,8 @@ pub use errors::{IconnxError, Result};
 pub use graph_executor::GraphExecutor;
 pub use onnx_parser::{OnnxModel, OnnxParser, ParseError};
 pub use tensor::Tensor;
+
+#[cfg(feature = "cuda")]
 pub use validate::{
     validate_model, ModelCapabilities, ModelIncompatibility, ModelValidationFailure, ModelWarning,
     ToleranceBasis, ToleranceConfidence, ToleranceHint,

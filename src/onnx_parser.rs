@@ -19,6 +19,7 @@ use thiserror::Error;
 /// failure surfaces through this enum so callers can decide whether
 /// to fail fast, log, or (for legacy flows) request opt-in recovery.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParseError {
     /// TensorProto or attribute used an ONNX dtype that the parser
     /// does not yet decode. The dtype_id is the raw ONNX enum value
@@ -53,6 +54,20 @@ pub enum ParseError {
         declared_len: usize,
         actual_len: usize,
     },
+
+    /// Catchall for parse-adjacent errors that don't map cleanly to a
+    /// dedicated variant — file I/O at parse time, protobuf-level decode
+    /// failures (the `prost` decode adapter), and similar `anyhow` errors
+    /// that propagate up from the parse machinery without an associated
+    /// tensor name.
+    ///
+    /// Used by `crate::validate::validate_model` to wrap the residual
+    /// `anyhow::Error` left over after downcasting a `ParseError` fails;
+    /// before WS-5 Y(1) review feedback this path used a synthetic
+    /// `InvalidTensorData { name: String::new(), … }` which misled
+    /// consumers into thinking a specific tensor was at fault.
+    #[error("parse error: {reason}")]
+    Other { reason: String },
 }
 
 /// Generated ONNX protobuf types
@@ -277,6 +292,42 @@ impl OnnxModel {
             .opset_import
             .iter()
             .map(|op| (op.domain.clone().unwrap_or_default(), op.version.unwrap_or(0)))
+            .collect()
+    }
+
+    /// Declared ONNX dtype id (`TensorProto.DataType` enum) for each graph
+    /// input, in graph order. Returns `None` for an input whose value-info
+    /// has no `tensor_type` (e.g. sequence/map types) or no element type.
+    ///
+    /// The id is the raw ONNX enum value (1=FLOAT, 7=INT64, 6=INT32, 11=FLOAT64,
+    /// 9=BOOL, 3=INT8, 2=UINT8, 10=FLOAT16, 16=BFLOAT16, …). Added in WS-5 Y(1)
+    /// fixup to satisfy `ModelCapabilities::used_dtypes`'s rustdoc claim that
+    /// the dtype walk covers initializers + declared input/output types.
+    pub fn input_dtypes(&self) -> Vec<Option<i32>> {
+        Self::value_info_dtypes(self.proto.graph.as_ref().map(|g| &g.input[..]))
+    }
+
+    /// Declared ONNX dtype id for each graph output. See [`Self::input_dtypes`]
+    /// for the encoding.
+    pub fn output_dtypes(&self) -> Vec<Option<i32>> {
+        Self::value_info_dtypes(self.proto.graph.as_ref().map(|g| &g.output[..]))
+    }
+
+    fn value_info_dtypes(infos: Option<&[onnx_proto::ValueInfoProto]>) -> Vec<Option<i32>> {
+        let Some(infos) = infos else {
+            return Vec::new();
+        };
+        infos
+            .iter()
+            .map(|info| {
+                info.r#type
+                    .as_ref()
+                    .and_then(|t| t.value.as_ref())
+                    .and_then(|v| match v {
+                        onnx_proto::type_proto::Value::TensorType(t) => t.elem_type,
+                        _ => None,
+                    })
+            })
             .collect()
     }
 

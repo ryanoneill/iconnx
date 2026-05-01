@@ -15,6 +15,14 @@ use garboard::DeviceSlice;
 use super::context::{CudaError, IconnxCudaContext};
 
 /// Data type enum matching ONNX types.
+//
+// IMPORTANT: variant declaration order is API-load-bearing as of WS-5 Y(1).
+// `crate::validate::validate_model` collects dtypes into a `BTreeSet<DType>`
+// and surfaces them to consumers via `ModelCapabilities::used_dtypes` whose
+// iteration order is the `Ord`-derived order of this enum. Reordering or
+// inserting variants in the middle therefore reorders a public API field
+// (`#[non_exhaustive]` doesn't shield iteration order). New variants should
+// be appended; reorderings need a CHANGELOG note + downstream coordination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DType {
     Float32,

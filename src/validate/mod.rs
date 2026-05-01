@@ -3,6 +3,19 @@
 //!
 //! See `docs/superpowers/specs/2026-04-29-ws5-observability-design.md`
 //! Section 4 Flow A for the orchestration walk.
+//!
+//! ## Relationship to the parser's `eprintln!` warnings
+//!
+//! `OnnxParser::extract_weights` emits an unconditional stderr warning when
+//! it encounters non-finite half-precision (BF16/FP16) initializer values
+//! (see `warn_non_finite_half` in `src/onnx_parser.rs`). The structured
+//! [`ModelWarning::NonFiniteHalfConstants`] surfaced by `validate_model`
+//! **subsumes** that stderr emission for callers using the validate API:
+//! every initializer that triggered the parser eprintln also produces a
+//! structured warning here. The parser's eprintln is retained because it
+//! affects unrelated callers (anything that calls `extract_weights`
+//! directly), but consumers of `validate_model` should rely on the
+//! structured `warnings` vec rather than capturing stderr.
 
 pub mod capabilities;
 pub mod incompat;
@@ -44,11 +57,12 @@ pub fn validate_model<P: AsRef<Path>>(
         Ok(m) => m,
         Err(e) => {
             // OnnxParser::parse_file returns anyhow::Result; map to ParseError
-            // when possible, otherwise wrap as InvalidTensorData.
+            // when possible, otherwise wrap in `ParseError::Other` (a generic
+            // catchall — the previous `InvalidTensorData { name: "" }` shape
+            // misled consumers into thinking a named tensor was at fault).
             let pe = e
                 .downcast::<crate::onnx_parser::ParseError>()
-                .unwrap_or_else(|other| crate::onnx_parser::ParseError::InvalidTensorData {
-                    name: String::new(),
+                .unwrap_or_else(|other| crate::onnx_parser::ParseError::Other {
                     reason: other.to_string(),
                 });
             return Err(ModelValidationFailure {
@@ -126,13 +140,44 @@ pub fn validate_model<P: AsRef<Path>>(
         }
     }
 
+    // Pre-compute supported_ops (used ops ∩ placeholder supported set) so
+    // we can include it in `partial_capabilities` even if `extract_weights`
+    // bails below. Y(2) replaces with the real op_support intersection.
+    let mut supported_ops: Vec<String> = op_counts.keys().cloned().collect();
+    supported_ops.sort();
+
+    // Pre-compute the layer count up here too — it's a pure graph walk.
+    let layer_count = tolerance_hint::count_layer_norm_nodes(&graph);
+
     // Step 4: Walk initializers for non-finite half-precision constants.
+    // If `extract_weights` fails we still surface a partial capability
+    // payload — the contract on `ModelValidationFailure::partial_capabilities`
+    // says `None` is reserved for the parse-short-circuit (file failed to
+    // open / decode); a downstream initializer-decoding failure is not the
+    // same case. Caller can still see opset_imports / supported_ops /
+    // layer_count / fp32-fallback tolerance hint.
     let weights = match model.extract_weights() {
         Ok(w) => w,
         Err(e) => {
+            let used_dtypes_vec: Vec<crate::tensor::DType> = Vec::new();
+            let expected_tolerance = tolerance_hint::expected_tolerance(&used_dtypes_vec, 0);
+            let caps = ModelCapabilities {
+                opset_imports,
+                supported_ops,
+                used_dtypes: used_dtypes_vec,
+                initializer_count: 0,
+                initializer_bytes: 0,
+                estimated_peak_bytes: 0,
+                expected_tolerance,
+                warnings: Vec::new(),
+            };
+            // Compose with any incompatibilities collected so far (opset
+            // checks ran before `extract_weights`); add the new Parse one.
+            let mut all_incompat = incompatibilities;
+            all_incompat.push(ModelIncompatibility::Parse(e));
             return Err(ModelValidationFailure {
-                incompatibilities: vec![ModelIncompatibility::Parse(e)],
-                partial_capabilities: None,
+                incompatibilities: all_incompat,
+                partial_capabilities: Some(caps),
             });
         }
     };
@@ -142,9 +187,26 @@ pub fn validate_model<P: AsRef<Path>>(
     let mut total_init_bytes: usize = 0;
     let initializer_count = weights.len();
 
+    // Per #2 review: surface ONE `DTypeDowncast` warning per model when at
+    // least one initializer's source dtype was compressed (today only
+    // `Tensor::Float64 → DType::Float32`). Flag-gated rather than
+    // per-tensor; consumers should read it as a single global signal that
+    // the dtype taxonomy lost information.
+    let mut already_warned_fp64 = false;
+
     for (name, tensor) in &weights {
         used_dtypes.insert(crate::tensor::dtype_for_tensor(tensor));
         total_init_bytes += crate::tensor::tensor_byte_size(tensor);
+
+        if let crate::tensor::Tensor::Float64(_) = tensor {
+            if !already_warned_fp64 {
+                warnings.push(ModelWarning::DTypeDowncast {
+                    from: "float64",
+                    to: crate::tensor::DType::Float32,
+                });
+                already_warned_fp64 = true;
+            }
+        }
 
         // Non-finite half scan (re-uses helpers from WS-3.5 hotfix).
         if let crate::tensor::Tensor::BFloat16(arr) = tensor {
@@ -170,22 +232,47 @@ pub fn validate_model<P: AsRef<Path>>(
         }
     }
 
-    // Step 5: Compute layer count + tolerance hint.
-    let layer_count = tolerance_hint::count_layer_norm_nodes(&graph);
+    // Step 4b: Walk declared input/output value-info dtypes per the
+    // `used_dtypes` rustdoc claim ("initializers + declared input/output
+    // types"). NLP models in particular have INT64 input ids that don't
+    // appear in any initializer.
+    for id in model
+        .input_dtypes()
+        .into_iter()
+        .chain(model.output_dtypes())
+        .flatten()
+    {
+        if let Some(dt) = onnx_dtype_id_to_dtype(id) {
+            used_dtypes.insert(dt);
+        } else if id == 11 {
+            // FLOAT64 declared on a graph IO; same downcast surface
+            // applies (validate_model has no f64 GPU path).
+            used_dtypes.insert(crate::tensor::DType::Float32);
+            if !already_warned_fp64 {
+                warnings.push(ModelWarning::DTypeDowncast {
+                    from: "float64",
+                    to: crate::tensor::DType::Float32,
+                });
+                already_warned_fp64 = true;
+            }
+        }
+        // Other unknown ids (sequence/map/sparse) silently skipped —
+        // they don't belong in `used_dtypes` and aren't validate-fatal.
+    }
+
+    // Step 5: Compute tolerance hint from the complete dtype set.
     let used_dtypes_vec: Vec<_> = used_dtypes.iter().copied().collect();
     let expected_tolerance = tolerance_hint::expected_tolerance(&used_dtypes_vec, layer_count);
 
     // Step 6: Estimate peak bytes (rough heuristic per rustdoc).
-    // Activation heuristic: 2 * largest-shape-product * 4 bytes (f32 default).
-    // Replaced with proper graph-walk in Y(2)+ if needed; for now the
-    // initializer_bytes dominates for transformer models.
-    let max_intermediate_bytes = total_init_bytes / initializer_count.max(1);
-    let estimated_peak_bytes = total_init_bytes + 2 * max_intermediate_bytes;
-
-    // Step 7: supported_ops = used ops ∩ (placeholder supported set).
-    // Y(2) replaces with real op_support::supported_ops() intersection.
-    let mut supported_ops: Vec<String> = op_counts.keys().cloned().collect();
-    supported_ops.sort();
+    // Y(1) implementation: total initializer footprint + 2 * mean
+    // initializer size as a stand-in for activation/intermediate memory.
+    // The proper non-initializer graph walk (originally-intended
+    // `max_intermediate_tensor_bytes`) is deferred to a future workstream;
+    // the runtime arena planner is the source of truth for precise memory
+    // plans (out of scope for capability discovery).
+    let mean_initializer_bytes = total_init_bytes / initializer_count.max(1);
+    let estimated_peak_bytes = total_init_bytes + 2 * mean_initializer_bytes;
 
     let caps = ModelCapabilities {
         opset_imports,
@@ -206,6 +293,61 @@ pub fn validate_model<P: AsRef<Path>>(
             partial_capabilities: Some(caps),
         })
     }
+}
+
+/// Map an ONNX `TensorProto.DataType` raw enum value to iconnx's GPU
+/// [`crate::tensor::DType`] tag, or `None` if the id has no GPU representation.
+///
+/// FLOAT64(11) returns `None` — callers handle the downcast-and-warn path
+/// explicitly so the surface is honest about the lossy mapping.
+fn onnx_dtype_id_to_dtype(id: i32) -> Option<crate::tensor::DType> {
+    use crate::tensor::DType;
+    match id {
+        1 => Some(DType::Float32),    // FLOAT
+        7 => Some(DType::Int64),      // INT64
+        6 => Some(DType::Int32),      // INT32
+        9 => Some(DType::Bool),       // BOOL
+        3 => Some(DType::Int8),       // INT8
+        2 => Some(DType::UInt8),      // UINT8
+        10 => Some(DType::Float16),   // FLOAT16
+        16 => Some(DType::BFloat16),  // BFLOAT16
+        // 11 = FLOAT64 — no DType tag, downcast surface (handled by caller).
+        _ => None,
+    }
+}
+
+/// Pure helper: produce `HardwareFloorUnmet` incompatibilities for any
+/// dtype in `caps.used_dtypes` whose hardware floor is unmet by `cc`.
+///
+/// Today only BF16 has a hardware floor (sm_80+). FP16 works on sm_70+
+/// without explicit gating; new dtype hardware floors get added as `match`
+/// arms here.
+///
+/// Pure (no `IconnxCudaContext` parameter) so it's unit-testable without a
+/// GPU. `validate_model_for_hardware` calls this with `ctx.compute_capability()`.
+#[cfg(feature = "cuda")]
+fn check_hardware_floor(
+    caps: &ModelCapabilities,
+    cc: (i32, i32),
+) -> Vec<ModelIncompatibility> {
+    let (cc_major, cc_minor) = cc;
+    let device_str = format!("sm_{cc_major}{cc_minor}");
+    let mut out = Vec::new();
+    for dtype in &caps.used_dtypes {
+        match dtype {
+            crate::tensor::DType::BFloat16 if cc_major < 8 => {
+                out.push(ModelIncompatibility::HardwareFloorUnmet {
+                    dtype: *dtype,
+                    required: "sm_80+",
+                    found: device_str.clone(),
+                });
+            }
+            // FP16 has no hardware floor in iconnx today (works on sm_70+);
+            // add explicit check if/when that changes.
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Static model validation + hardware floor check.
@@ -244,25 +386,9 @@ pub fn validate_model_for_hardware<P: AsRef<Path>>(
         }
     }
 
-    // Hardware floor check: if any half-precision dtype is used but the
-    // context is below sm_80, surface HardwareFloorUnmet.
-    let (cc_major, cc_minor) = ctx.compute_capability();
-    let device_str = format!("sm_{cc_major}{cc_minor}");
-
-    for dtype in &caps_for_hw_check.used_dtypes {
-        match dtype {
-            crate::tensor::DType::BFloat16 if cc_major < 8 => {
-                existing_incompat.push(ModelIncompatibility::HardwareFloorUnmet {
-                    dtype: *dtype,
-                    required: "sm_80+",
-                    found: device_str.clone(),
-                });
-            }
-            // FP16 has no hardware floor in iconnx today (works on sm_70+);
-            // add explicit check if/when that changes.
-            _ => {}
-        }
-    }
+    // Hardware floor check delegated to a pure helper for unit-testability.
+    let cc = ctx.compute_capability();
+    existing_incompat.extend(check_hardware_floor(&caps_for_hw_check, cc));
 
     if existing_incompat.is_empty() {
         Ok(caps_for_hw_check)
@@ -271,5 +397,105 @@ pub fn validate_model_for_hardware<P: AsRef<Path>>(
             incompatibilities: existing_incompat,
             partial_capabilities: Some(caps_for_hw_check),
         })
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use crate::tensor::DType;
+
+    fn caps_with_dtypes(dtypes: Vec<DType>) -> ModelCapabilities {
+        ModelCapabilities {
+            opset_imports: vec![("".to_string(), 17)],
+            supported_ops: Vec::new(),
+            used_dtypes: dtypes,
+            initializer_count: 0,
+            initializer_bytes: 0,
+            estimated_peak_bytes: 0,
+            expected_tolerance: tolerance_hint::expected_tolerance(&[], 0),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn check_hardware_floor_bf16_on_sm75_yields_unmet() {
+        let caps = caps_with_dtypes(vec![DType::BFloat16]);
+        let result = check_hardware_floor(&caps, (7, 5));
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            ModelIncompatibility::HardwareFloorUnmet {
+                dtype,
+                required,
+                found,
+            } => {
+                assert_eq!(*dtype, DType::BFloat16);
+                assert_eq!(*required, "sm_80+");
+                assert_eq!(found, "sm_75");
+            }
+            other => panic!("unexpected incompatibility: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_hardware_floor_bf16_on_sm80_no_incompat() {
+        let caps = caps_with_dtypes(vec![DType::BFloat16]);
+        let result = check_hardware_floor(&caps, (8, 0));
+        assert!(result.is_empty(), "BF16 on sm_80 should be supported");
+    }
+
+    #[test]
+    fn check_hardware_floor_bf16_on_sm90_no_incompat() {
+        let caps = caps_with_dtypes(vec![DType::BFloat16]);
+        let result = check_hardware_floor(&caps, (9, 0));
+        assert!(result.is_empty(), "BF16 on sm_90 (Hopper) should be supported");
+    }
+
+    #[test]
+    fn check_hardware_floor_fp32_only_on_sm75_no_incompat() {
+        let caps = caps_with_dtypes(vec![DType::Float32]);
+        let result = check_hardware_floor(&caps, (7, 5));
+        assert!(result.is_empty(), "FP32-only has no hardware floor");
+    }
+
+    #[test]
+    fn check_hardware_floor_empty_used_dtypes_no_incompat() {
+        let caps = caps_with_dtypes(Vec::new());
+        let result = check_hardware_floor(&caps, (7, 5));
+        assert!(
+            result.is_empty(),
+            "empty used_dtypes should produce no incompat"
+        );
+    }
+
+    #[test]
+    fn check_hardware_floor_mixed_bf16_fp32_on_sm75_only_bf16_unmet() {
+        // BF16 + FP32 on sm_75: only BF16 surfaces an unmet floor.
+        let caps = caps_with_dtypes(vec![DType::Float32, DType::BFloat16]);
+        let result = check_hardware_floor(&caps, (7, 5));
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            result[0],
+            ModelIncompatibility::HardwareFloorUnmet {
+                dtype: DType::BFloat16,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn onnx_dtype_id_to_dtype_round_trip_supported_ids() {
+        assert_eq!(onnx_dtype_id_to_dtype(1), Some(DType::Float32));
+        assert_eq!(onnx_dtype_id_to_dtype(7), Some(DType::Int64));
+        assert_eq!(onnx_dtype_id_to_dtype(6), Some(DType::Int32));
+        assert_eq!(onnx_dtype_id_to_dtype(9), Some(DType::Bool));
+        assert_eq!(onnx_dtype_id_to_dtype(3), Some(DType::Int8));
+        assert_eq!(onnx_dtype_id_to_dtype(2), Some(DType::UInt8));
+        assert_eq!(onnx_dtype_id_to_dtype(10), Some(DType::Float16));
+        assert_eq!(onnx_dtype_id_to_dtype(16), Some(DType::BFloat16));
+        // FLOAT64 (11) intentionally returns None; caller handles downcast.
+        assert_eq!(onnx_dtype_id_to_dtype(11), None);
+        // Unknown id (5 = INT16, not in iconnx) returns None.
+        assert_eq!(onnx_dtype_id_to_dtype(5), None);
     }
 }

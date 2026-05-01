@@ -118,6 +118,27 @@ def make_garbage():
     print(f"wrote {path}")
 
 
+# 7. fp64_initializer: a FLOAT64 initializer to exercise the
+# `ModelWarning::DTypeDowncast` path in `validate_model`. iconnx maps
+# `Tensor::Float64 → DType::Float32` for capability-discovery purposes; the
+# warning surfaces the lossy mapping so consumers can detect it.
+def make_fp64_initializer():
+    a = helper.make_tensor_value_info("A", TensorProto.DOUBLE, [3])
+    c = helper.make_tensor_value_info("C", TensorProto.DOUBLE, [3])
+    init = helper.make_tensor(
+        name="bias_f64",
+        data_type=TensorProto.DOUBLE,
+        dims=[3],
+        vals=[0.0, 0.0, 0.0],
+    )
+    node = helper.make_node("Add", ["A", "bias_f64"], ["C"])
+    graph = helper.make_graph(
+        [node], "fp64_init", [a], [c], initializer=[init]
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    save(model, "fp64_initializer")
+
+
 if __name__ == "__main__":
     make_minimal_add()
     make_unsupported_op()
@@ -125,3 +146,4 @@ if __name__ == "__main__":
     make_unknown_opset_domain()
     make_bf16_with_neg_inf()
     make_garbage()
+    make_fp64_initializer()

@@ -13,10 +13,14 @@ use iconnx::tensor::DType;
 use iconnx::{validate_model, ModelIncompatibility};
 
 #[test]
-fn validate_model_unsupported_op_collected() {
-    // PLACEHOLDER: Y(2) replaces this test once OP_SUPPORT_TABLE lands and
-    // the synthetic CustomOp path actually fails. For now, this test
-    // documents the expected behavior; assert is loose.
+fn validate_model_unsupported_op_y2_placeholder_passthrough() {
+    // Y(1) PLACEHOLDER ONLY — this test is intentionally a passthrough today.
+    // The Y(1) `validate_model` orchestration does NOT reject custom ops
+    // (see `src/validate/mod.rs` "PLACEHOLDER: Y(2) replaces with real
+    // op_support::supported_ops()"); the synthetic CustomOpFoo fixture
+    // therefore validates "successfully" today. Y(2) lands the real
+    // OP_SUPPORT_TABLE drift-tested lookup, at which point this test
+    // MUST be tightened to assert on `Err(ModelIncompatibility::UnsupportedOp { .. })`.
     let path = PathBuf::from("tests/fixtures/ws5_synthetic/unsupported_op.onnx");
     if !path.exists() {
         eprintln!("skipping: fixture not yet generated");
@@ -122,5 +126,93 @@ fn validate_model_happy_path_returns_capabilities() {
         Err(failure) => {
             panic!("unexpected validation failure: {:?}", failure);
         }
+    }
+}
+
+#[test]
+fn validate_model_fp64_initializer_emits_dtype_downcast_warning() {
+    // Issue #2 review feedback: confirm `Tensor::Float64 → DType::Float32`
+    // surfaces a structured `ModelWarning::DTypeDowncast` (one per model,
+    // de-duplicated via `already_warned_fp64` flag in validate_model).
+    let path = PathBuf::from("tests/fixtures/ws5_synthetic/fp64_initializer.onnx");
+    if !path.exists() {
+        eprintln!("skipping: fixture not yet generated");
+        return;
+    }
+    let result = validate_model(&path);
+    let caps = match result {
+        Ok(c) => c,
+        Err(failure) => panic!("unexpected validation failure: {:?}", failure),
+    };
+    let downcast_warnings: Vec<_> = caps
+        .warnings
+        .iter()
+        .filter(|w| matches!(w, iconnx::ModelWarning::DTypeDowncast { .. }))
+        .collect();
+    assert_eq!(
+        downcast_warnings.len(),
+        1,
+        "expected exactly one DTypeDowncast warning (de-duplicated per model), got {}",
+        downcast_warnings.len()
+    );
+    match downcast_warnings[0] {
+        iconnx::ModelWarning::DTypeDowncast { from, to } => {
+            assert_eq!(*from, "float64");
+            assert_eq!(*to, DType::Float32);
+        }
+        _ => unreachable!("filtered above"),
+    }
+    // FP64 initializer gets reported under Float32 in `used_dtypes`.
+    assert!(caps.used_dtypes.contains(&DType::Float32));
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn validate_model_for_hardware_bf16_full_path_compose() {
+    // Issue #1 review feedback: exercise the full
+    // `validate_model_for_hardware` orchestration with a real
+    // `IconnxCudaContext`. Uses the BF16 fixture (which has a BF16
+    // initializer) so the dtype walk hits the hardware-floor branch.
+    //
+    // On sm_80+ the call should compose cleanly; the BF16 hardware floor
+    // is met, and the only surfaced observation is the
+    // `NonFiniteHalfConstants` warning (the fixture has a -inf bit pattern).
+    // On sm_75 the same call would surface a `HardwareFloorUnmet`
+    // incompatibility — we don't cc-gate this test (the harness only runs
+    // it on a GPU box at all), but we document the expectation here so the
+    // sub-sm_80 path is preserved by Y(2)+ refactors.
+    use iconnx::{validate_model_for_hardware, IconnxCudaContext, ModelWarning};
+
+    let path = PathBuf::from("tests/fixtures/ws5_synthetic/bf16_with_neg_inf.onnx");
+    if !path.exists() {
+        eprintln!("skipping: fixture not yet generated");
+        return;
+    }
+    let ctx = IconnxCudaContext::new().expect("CUDA context required for this test");
+    let (cc_major, _) = ctx.compute_capability();
+
+    let result = validate_model_for_hardware(&path, &ctx);
+
+    if cc_major >= 8 {
+        // Expected sm_80+ path: BF16 floor met, only the non-finite warning.
+        let caps = result.expect("BF16 fixture should validate on sm_80+");
+        assert!(
+            caps.warnings
+                .iter()
+                .any(|w| matches!(w, ModelWarning::NonFiniteHalfConstants { .. })),
+            "expected NonFiniteHalfConstants warning on bf16_with_neg_inf fixture",
+        );
+    } else {
+        // Sub-sm_80 path: BF16 floor unmet, validation fails with
+        // partial_capabilities populated (collect-all preserves caps).
+        let failure = result.expect_err("BF16 fixture must fail on sm_75");
+        assert!(failure.incompatibilities.iter().any(|i| matches!(
+            i,
+            iconnx::ModelIncompatibility::HardwareFloorUnmet {
+                dtype: DType::BFloat16,
+                ..
+            }
+        )));
+        assert!(failure.partial_capabilities.is_some());
     }
 }

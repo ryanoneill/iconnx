@@ -36,19 +36,20 @@ pub struct ModelCapabilities {
 
     /// Rough estimate of peak GPU memory consumption during inference.
     ///
-    /// **Heuristic, NOT arena-precise.** Computed as:
+    /// **Rough Y(1) heuristic** computed as:
     ///
     /// ```text
     /// estimated_peak_bytes = sum(initializer_bytes) +
-    ///                        2 * max_intermediate_tensor_bytes
+    ///                        2 * mean(initializer_bytes)
     /// ```
     ///
-    /// where `max_intermediate_tensor_bytes` is the largest
-    /// shape-product × dtype-byte-size across non-initializer graph values
-    /// (the ×2 covers double-buffering; conservative upper bound). The
-    /// actual runtime arena planner may use less. Consumers wanting precise
-    /// memory plans should run the planner (out of scope for capability
-    /// discovery).
+    /// — i.e. the total weight footprint plus a small slack term derived from
+    /// the average initializer size as a stand-in for activation/intermediate
+    /// memory. The proper graph-walk computing
+    /// `max_intermediate_tensor_bytes` over non-initializer graph values
+    /// (the originally-intended formula) is deferred to a future workstream.
+    /// Consumers wanting precise memory plans should run the runtime arena
+    /// planner (out of scope for capability discovery).
     pub estimated_peak_bytes: usize,
 
     /// Tolerance estimate consumers can use as a starting point for gating
@@ -93,5 +94,24 @@ pub enum ModelWarning {
     DepthExceedsTolerancePrior {
         layers: usize,
         dtype: DType,
+    },
+
+    /// iconnx had to compress a source dtype that lacks a dedicated GPU
+    /// [`DType`] tag, surfacing the source dtype under a different `DType`
+    /// in [`ModelCapabilities::used_dtypes`]. Today this is FLOAT64(11) →
+    /// `DType::Float32` (the GPU path doesn't accept f64 today, so for
+    /// capability-discovery purposes f64 weights are reported under the
+    /// Float32 bucket).
+    ///
+    /// Surfaced once per model regardless of how many initializers triggered
+    /// the downcast — consumers should read it as "the model has at least
+    /// one tensor whose source dtype was not preserved in the GPU dtype
+    /// taxonomy," not as a per-tensor count.
+    ///
+    /// `from` is the source dtype label as returned by [`crate::tensor::Tensor::dtype`]
+    /// (e.g. `"float64"`); `to` is the GPU [`DType`] iconnx reported in its place.
+    DTypeDowncast {
+        from: &'static str,
+        to: DType,
     },
 }

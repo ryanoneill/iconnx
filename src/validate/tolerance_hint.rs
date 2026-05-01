@@ -153,6 +153,13 @@ fn bf16_hint(layer_count: usize) -> ToleranceHint {
 
 /// Count distinct `LayerNormalization` nodes in a computation graph.
 /// Used as the "transformer depth" heuristic for [`expected_tolerance`].
+///
+/// Returns 0 for graphs that decompose `LayerNormalization` into primitives
+/// (the typical pre-opset-17 export path: ReduceMean → Sub → Mul → ReduceMean
+/// → Add → Sqrt → Div → Mul → Add) or use a non-canonical op_type. The hint
+/// will fall back to the dtype-only baseline (`bf16_hint(0)` / `fp16_hint(0)` /
+/// `fp32_hint()`) in that case, which over-estimates tightness for deep
+/// transformers; consumers can supply their own depth heuristic if needed.
 pub fn count_layer_norm_nodes(graph: &crate::onnx_parser::ComputationGraph) -> usize {
     graph
         .nodes()
