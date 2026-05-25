@@ -29,6 +29,7 @@ use crate::cuda::ops::{
     gpu_slice_nd, gpu_transpose_2d, gpu_transpose_nd, gpu_where, ResizeCoordMode, ResizeMode,
     ResizeNearestMode,
 };
+use crate::cuda::kernels::gpu_batchnorm_affine;
 use crate::cuda::tensor::DType;
 use crate::cuda::{CudaError, GpuTensor};
 use crate::ir::{ExecutionPlan, PlannedOp};
@@ -1075,6 +1076,49 @@ impl Executor {
                         a_ndim, b_ndim
                     ))),
                 }
+            }
+
+            // --- BatchNormalization (inference, NCHW) --------------------
+            //
+            // Inference BN ignores momentum and training-mode attrs.
+            // Per-channel affine coefficients are precomputed on the host
+            // from the 5 model inputs (x, scale, B, mean, var) + epsilon,
+            // uploaded as 1-D GPU tensors, and applied via a fresh standalone
+            // NVRTC kernel (NOT the [1,C,T]-gated fused path in
+            // gpu_fused_add_mul_add, which is a different shape contract).
+            //
+            //   a[c] = scale[c] / sqrt(var[c] + eps)
+            //   b[c] = B[c] - mean[c] * a[c]
+            //   y[i] = a[ch] * x[i] + b[ch],  ch = (i / spatial) % C
+            "BatchNormalization" => {
+                let eps = attributes.get_float("epsilon").unwrap_or(1e-5);
+                let x = inputs[0];
+                let xs = x.shape();
+                if xs.len() != 4 {
+                    return Err(CudaError::Kernel(format!(
+                        "BatchNormalization expects 4D NCHW, got {:?}",
+                        xs
+                    )));
+                }
+                let c = xs[1];
+                let scale = inputs[1].to_host_f32(&self.ctx)?;
+                let beta = inputs[2].to_host_f32(&self.ctx)?;
+                let mean = inputs[3].to_host_f32(&self.ctx)?;
+                let var = inputs[4].to_host_f32(&self.ctx)?;
+                let a_host: Vec<f32> =
+                    (0..c).map(|k| scale[k] / (var[k] + eps).sqrt()).collect();
+                let b_host: Vec<f32> =
+                    (0..c).map(|k| beta[k] - mean[k] * a_host[k]).collect();
+                let a_dev = GpuTensor::from_host_f32(&self.ctx, &a_host, vec![c])?;
+                let b_dev = GpuTensor::from_host_f32(&self.ctx, &b_host, vec![c])?;
+                gpu_batchnorm_affine(
+                    &self.ctx,
+                    &self.elementwise_kernels,
+                    &mut pool,
+                    x,
+                    &a_dev,
+                    &b_dev,
+                )
             }
 
             other => Err(CudaError::Kernel(format!(

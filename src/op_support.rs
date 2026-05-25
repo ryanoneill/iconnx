@@ -109,6 +109,8 @@ pub const OP_SUPPORT_TABLE: &[OpSupport] = &[
     OpSupport { op_type: "Range" },
     OpSupport { op_type: "CumSum" },
     OpSupport { op_type: "DequantizeLinear" },
+    // BatchNormalization inference — per-channel NCHW affine (WS-6 M6.4 Task 13):
+    OpSupport { op_type: "BatchNormalization" },
 ];
 
 /// Returns the cached set of op_types iconnx supports. Build-once via
