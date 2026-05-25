@@ -224,6 +224,48 @@ impl GpuGraphExecutor {
         Self::new_with_profiling(false)
     }
 
+    /// Build a `GpuGraphExecutor` directly from a parsed `OnnxModel`.
+    ///
+    /// Seeds inputs from `model.input_shapes()`, uploads every initializer via
+    /// `add_initializer`, and adds each `computation_graph()` node via `add_node`.
+    /// `GraphNode` carries no `name` field, so node names are synthesized as
+    /// `n{i}` over the graph's node order (names are internal — only input/output
+    /// tensor names participate in dataflow).
+    ///
+    /// Does NOT call `validate_*`; callers wanting a fail-fast op-name pre-flight
+    /// should call `validate::validate_parsed_model(&model)` first (op-NAME only,
+    /// not a runnability guarantee).
+    ///
+    /// # Note on `clippy::result_large_err`
+    ///
+    /// `crate::Result<T>` = `Result<T, IconnxError>`. `IconnxError` is intentionally
+    /// large: it stores every leaf error inline (by value, not boxed), which is what
+    /// trips the lint. The allow attribute is the established pattern across this
+    /// crate; see `validate::validate_parsed_model`.
+    #[allow(clippy::result_large_err)]
+    pub fn from_model(model: &crate::onnx_parser::OnnxModel) -> crate::Result<Self> {
+        let mut exec = Self::new()?;
+        for (name, shape) in model.input_shapes() {
+            exec.add_input(name, shape);
+        }
+        let weights = model.extract_weights()?;
+        for (name, tensor) in weights {
+            exec.add_initializer(name, &tensor)?;
+        }
+        let graph = model.computation_graph()?;
+        for (i, node) in graph.nodes().iter().enumerate() {
+            let synth = format!("n{i}");
+            exec.add_node(
+                &synth,
+                &node.op_type,
+                node.inputs.iter().map(|s| s.as_str()).collect(),
+                node.outputs.iter().map(|s| s.as_str()).collect(),
+                node.attributes.clone(),
+            );
+        }
+        Ok(exec)
+    }
+
     /// Create a new GPU graph executor with optional profiling output
     /// during initialization.
     pub fn new_with_profiling(profile: bool) -> Result<Self, CudaError> {
