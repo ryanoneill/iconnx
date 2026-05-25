@@ -290,9 +290,9 @@ impl Executor {
         match op.node.op_type.as_str() {
             // Elementwise arith / unary math / comparisons / activations.
             "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Exp" | "Erf" | "Sqrt" | "Sin" | "Cos"
-            | "Tanh" | "Sigmoid" | "Relu" | "LeakyRelu" | "Atan" | "Round" | "Floor" | "Clip"
-            | "Softmax" | "Equal" | "Less" | "Greater" | "GreaterOrEqual" | "LessOrEqual"
-            | "NotEqual" => {
+            | "Tanh" | "Sigmoid" | "Relu" | "LeakyRelu" | "HardSigmoid" | "HardSwish"
+            | "Atan" | "Round" | "Floor" | "Clip" | "Softmax" | "Equal" | "Less" | "Greater"
+            | "GreaterOrEqual" | "LessOrEqual" | "NotEqual" => {
                 self.dispatch_elementwise(op, values, &plan.weights)
             }
 

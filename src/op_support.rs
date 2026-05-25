@@ -47,6 +47,8 @@ pub const OP_SUPPORT_TABLE: &[OpSupport] = &[
     OpSupport { op_type: "Sigmoid" },
     OpSupport { op_type: "Relu" },
     OpSupport { op_type: "LeakyRelu" },
+    OpSupport { op_type: "HardSigmoid" },
+    OpSupport { op_type: "HardSwish" },
     OpSupport { op_type: "Atan" },
     OpSupport { op_type: "Round" },
     OpSupport { op_type: "Floor" },

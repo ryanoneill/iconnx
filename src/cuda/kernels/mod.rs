@@ -86,6 +86,8 @@ const KERNEL_NAMES: &[&str] = &[
     "tanh_kernel",
     "relu_kernel",
     "leaky_relu_kernel",
+    "hardsigmoid_kernel",
+    "hardswish_kernel",
     // Math ops
     "exp_kernel",
     "erf_kernel",
@@ -218,6 +220,16 @@ extern "C" __global__ void leaky_relu_kernel(float* out, const float* x, float a
         float v = x[i];
         out[i] = v >= 0.0f ? v : alpha * v;
     }
+}
+
+extern "C" __global__ void hardsigmoid_kernel(float* out, const float* x, float alpha, float beta, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i] = fminf(fmaxf(alpha * x[i] + beta, 0.0f), 1.0f); }
+}
+
+extern "C" __global__ void hardswish_kernel(float* out, const float* x, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { float v = x[i]; out[i] = v * fminf(fmaxf((v + 3.0f) / 6.0f, 0.0f), 1.0f); }
 }
 
 // Math operations
@@ -1149,6 +1161,83 @@ pub fn gpu_leaky_relu(
         out.data_f32_mut()?,
         input.data_f32()?,
         alpha,
+        n,
+    )?;
+    Ok(out)
+}
+
+/// Launch helper for hardsigmoid: `(out, x, alpha, beta, n)`.
+fn launch_hardsigmoid(
+    ctx: &IconnxCudaContext,
+    kernels: &KernelCache,
+    out: &mut DeviceSlice<'static, f32>,
+    x: &DeviceSlice<'static, f32>,
+    alpha: f32,
+    beta: f32,
+    n: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: hardsigmoid_kernel signature is
+    // `(float* out, const float* x, float alpha, float beta, size_t n)`.
+    let kernel = unsafe {
+        kernels.module().typed_kernel::<(
+            &mut DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            f32,
+            f32,
+            usize,
+        )>("hardsigmoid_kernel")
+    }
+    .map_err(|e| CudaError::Kernel(format!("hardsigmoid_kernel lookup failed: {}", e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(n as u32),
+            (out, x, alpha, beta, n),
+        )
+        .map_err(|e| CudaError::Kernel(format!("hardsigmoid_kernel launch failed: {}", e)))
+}
+
+/// GPU HardSigmoid: out = clamp(alpha * x + beta, 0, 1).
+///
+/// Alpha and beta are read from node attributes (ONNX defaults: alpha=0.2, beta=0.5).
+pub fn gpu_hardsigmoid(
+    ctx: &IconnxCudaContext,
+    kernels: &KernelCache,
+    pool: &mut GpuMemoryPool,
+    input: &GpuTensor,
+    alpha: f32,
+    beta: f32,
+) -> Result<GpuTensor, CudaError> {
+    let n = input.len();
+    let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
+    launch_hardsigmoid(
+        ctx,
+        kernels,
+        out.data_f32_mut()?,
+        input.data_f32()?,
+        alpha,
+        beta,
+        n,
+    )?;
+    Ok(out)
+}
+
+/// GPU HardSwish: out = x * clamp((x + 3) / 6, 0, 1).
+pub fn gpu_hardswish(
+    ctx: &IconnxCudaContext,
+    kernels: &KernelCache,
+    pool: &mut GpuMemoryPool,
+    input: &GpuTensor,
+) -> Result<GpuTensor, CudaError> {
+    let n = input.len();
+    let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
+    launch_unary_f32(
+        ctx,
+        kernels,
+        "hardswish_kernel",
+        out.data_f32_mut()?,
+        input.data_f32()?,
         n,
     )?;
     Ok(out)
