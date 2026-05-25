@@ -131,3 +131,40 @@ fn rank_mismatch_triggers_guard() {
         "expected InputShapeMismatch on rank mismatch, got {err:?}",
     );
 }
+
+/// WS-6 M6.2 Task 6 — dynamic-load Conv correct across two shapes vs ORT.
+///
+/// pdfocr's path: one plan loaded from `conv_dyn.onnx` (dynamic-dim model)
+/// is executed at two different (H,W) without any re-plan in between.
+/// The fixture is a single Conv, input `x` with dim_param on N, H, W (so
+/// `input_shapes()` yields `[None, Some(1), None, None]`), kernel 1/9
+/// box-blur, pads 1, so output spatial == input spatial.
+///
+/// Verifies the R2 dynamic-load MUST: the Task 5 guard must NOT fire (None
+/// dims accept any runtime value), and the numerical result must match ORT
+/// at atol=rtol=1e-3 for both shapes.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn dynamic_load_correct_across_two_shapes_vs_ort() {
+    #[path = "common/ort_parity.rs"]
+    mod ort_parity;
+    use std::collections::HashMap;
+    use iconnx::{GpuGraphExecutor, OnnxParser, Tensor};
+
+    let p = std::path::Path::new("tests/fixtures/ws6_op/conv_dyn.onnx");
+    let model = OnnxParser::parse_file(p).expect("parse");
+    let exec = GpuGraphExecutor::from_model(&model).expect("from_model");
+    let mut ort = ort_parity::OrtSession::open(p).expect("ort");
+
+    // ONE plan, executed at two different (H,W) — no re-plan in between.
+    for (h, w) in [(8usize, 8usize), (12usize, 12usize)] {
+        let n = h * w;
+        let data: Vec<f32> = (0..n).map(|i| (i % 7) as f32 - 3.0).collect();
+        let mut iin = HashMap::new();
+        iin.insert("x".to_string(), Tensor::from_vec_f32(data.clone(), vec![1, 1, h, w]));
+        let got = exec.run(iin, vec!["y"]).expect("iconnx run");
+        let (oref, oref_shape) = ort.run_f32(&[("x", &data, vec![1, 1, h, w])], "y").expect("ort run");
+        assert_eq!(oref_shape, vec![1, 1, h, w], "ORT output spatial should match input (pad=1,k=3)");
+        ort_parity::assert_close(&got["y"].as_slice(), &oref, 1e-3, 1e-3);
+    }
+}
