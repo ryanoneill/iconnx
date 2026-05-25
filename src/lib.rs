@@ -95,8 +95,8 @@ pub use tolerance::DifferentialTolerance;
 
 #[cfg(feature = "cuda")]
 pub use validate::{
-    validate_model, ModelCapabilities, ModelIncompatibility, ModelValidationFailure, ModelWarning,
-    ToleranceBasis, ToleranceConfidence, ToleranceHint,
+    validate_model, validate_parsed_model, ModelCapabilities, ModelIncompatibility,
+    ModelValidationFailure, ModelWarning, ToleranceBasis, ToleranceConfidence, ToleranceHint,
 };
 
 #[cfg(feature = "cuda")]

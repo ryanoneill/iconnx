@@ -30,55 +30,29 @@ use std::path::Path;
 #[cfg(feature = "cuda")]
 use crate::cuda::IconnxCudaContext;
 
-/// Static model validation — pure analysis with no CUDA dependency.
+/// Op-name presence check for an already-parsed model — does NOT guarantee
+/// runnability.
+///
+/// Validates op-support, opset bounds, and initializer dtype signals for a
+/// model that the caller has already parsed. This is a **fail-fast pre-flight
+/// only**: it consults [`crate::op_support::OP_SUPPORT_TABLE`] by op name.
+/// It would have reported `Conv` "supported" before WS-6's grouped-conv fix;
+/// `DispatchContext::Gpu` lives in `op_support::lookup()`, which this does
+/// NOT call. Use it as a fail-fast pre-flight, not a runnability guarantee.
+///
+/// Callers that hold a parsed model (e.g. `from_model`) can call this instead
+/// of [`validate_model`] to avoid re-parsing the file.
 ///
 /// Cannot produce `ModelIncompatibility::HardwareFloorUnmet` (no hardware
-/// context to compare against). Library consumers writing GPU-less tooling
-/// (TUI inspectors, capability discovery for filtered roster sweeps, etc.)
-/// call this entry point.
+/// context to compare against).
 ///
 /// # Note on `clippy::result_large_err`
 ///
-/// The error type is intentionally not boxed. `ModelValidationFailure`
-/// carries a `Vec<ModelIncompatibility>` plus an `Option<ModelCapabilities>`,
-/// which clippy flags as a large `Err` variant; however, the public API
-/// contract (locked at the WS-5 Y(1) signed commit) returns the failure
-/// by-value so that downstream consumers (leadline-bench `--validate`)
-/// can iterate `failure.incompatibilities` without an extra deref. Boxing
-/// would change the surface and break that contract.
+/// See [`validate_model`] for the rationale.
 #[allow(clippy::result_large_err)]
-pub fn validate_model<P: AsRef<Path>>(
-    path: P,
+pub fn validate_parsed_model(
+    model: &crate::onnx_parser::OnnxModel,
 ) -> Result<ModelCapabilities, ModelValidationFailure> {
-    use crate::onnx_parser::OnnxParser;
-
-    // WS-5 Y(2) wired up:
-    //   1. Unsupported-op check uses op_support::supported_ops() against
-    //      OP_SUPPORT_TABLE (drift-tested by
-    //      tests/op_support_table_consistency_test.rs).
-    //   2. Opset bounds use MIN/MAX_OPSET_SUPPORTED from src/opset.rs
-    //      (drift-tested by tests/opset_bounds_test.rs).
-
-    // Step 1: Parse. ParseError short-circuits with partial: None.
-    let model = match OnnxParser::parse_file(&path) {
-        Ok(m) => m,
-        Err(e) => {
-            // OnnxParser::parse_file returns anyhow::Result; map to ParseError
-            // when possible, otherwise wrap in `ParseError::Other` (a generic
-            // catchall — the previous `InvalidTensorData { name: "" }` shape
-            // misled consumers into thinking a named tensor was at fault).
-            let pe = e
-                .downcast::<crate::onnx_parser::ParseError>()
-                .unwrap_or_else(|other| crate::onnx_parser::ParseError::Other {
-                    reason: other.to_string(),
-                });
-            return Err(ModelValidationFailure {
-                incompatibilities: vec![ModelIncompatibility::Parse(pe)],
-                partial_capabilities: None,
-            });
-        }
-    };
-
     let graph = match model.computation_graph() {
         Ok(g) => g,
         Err(e) => {
@@ -179,9 +153,8 @@ pub fn validate_model<P: AsRef<Path>>(
             // input/output value-info dtypes is still computable from the
             // already-parsed model proto. Surface those dtypes in the failure
             // caps so callers see e.g. INT64 inputs for NLP models.
-            let io_dtype_set = collect_io_dtypes(&model);
-            let used_dtypes_vec: Vec<crate::tensor::DType> =
-                io_dtype_set.into_iter().collect();
+            let io_dtype_set = collect_io_dtypes(model);
+            let used_dtypes_vec: Vec<crate::tensor::DType> = io_dtype_set.into_iter().collect();
             let expected_tolerance = tolerance_hint::expected_tolerance(&used_dtypes_vec, 0);
             let caps = ModelCapabilities {
                 opset_imports,
@@ -315,6 +288,60 @@ pub fn validate_model<P: AsRef<Path>>(
             partial_capabilities: Some(caps),
         })
     }
+}
+
+/// Static model validation — pure analysis with no CUDA dependency.
+///
+/// Cannot produce `ModelIncompatibility::HardwareFloorUnmet` (no hardware
+/// context to compare against). Library consumers writing GPU-less tooling
+/// (TUI inspectors, capability discovery for filtered roster sweeps, etc.)
+/// call this entry point.
+///
+/// # Note on `clippy::result_large_err`
+///
+/// The error type is intentionally not boxed. `ModelValidationFailure`
+/// carries a `Vec<ModelIncompatibility>` plus an `Option<ModelCapabilities>`,
+/// which clippy flags as a large `Err` variant; however, the public API
+/// contract (locked at the WS-5 Y(1) signed commit) returns the failure
+/// by-value so that downstream consumers (leadline-bench `--validate`)
+/// can iterate `failure.incompatibilities` without an extra deref. Boxing
+/// would change the surface and break that contract.
+#[allow(clippy::result_large_err)]
+pub fn validate_model<P: AsRef<Path>>(
+    path: P,
+) -> Result<ModelCapabilities, ModelValidationFailure> {
+    use crate::onnx_parser::OnnxParser;
+
+    // WS-5 Y(2) wired up:
+    //   1. Unsupported-op check uses op_support::supported_ops() against
+    //      OP_SUPPORT_TABLE (drift-tested by
+    //      tests/op_support_table_consistency_test.rs).
+    //   2. Opset bounds use MIN/MAX_OPSET_SUPPORTED from src/opset.rs
+    //      (drift-tested by tests/opset_bounds_test.rs).
+
+    // Step 1: Parse. ParseError short-circuits with partial: None.
+    let model = match OnnxParser::parse_file(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            // OnnxParser::parse_file returns anyhow::Result; map to ParseError
+            // when possible, otherwise wrap in `ParseError::Other` (a generic
+            // catchall — the previous `InvalidTensorData { name: "" }` shape
+            // misled consumers into thinking a named tensor was at fault).
+            let pe = e
+                .downcast::<crate::onnx_parser::ParseError>()
+                .unwrap_or_else(|other| crate::onnx_parser::ParseError::Other {
+                    reason: other.to_string(),
+                });
+            return Err(ModelValidationFailure {
+                incompatibilities: vec![ModelIncompatibility::Parse(pe)],
+                partial_capabilities: None,
+            });
+        }
+    };
+
+    // Delegate all post-parse logic to the `&OnnxModel`-taking entry so
+    // callers that already hold a parsed model avoid re-parsing.
+    validate_parsed_model(&model)
 }
 
 /// Walk declared input + output value-info dtypes into a sorted set.
