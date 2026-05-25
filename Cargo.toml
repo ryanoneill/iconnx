@@ -101,6 +101,9 @@ regex = "1"
 # TOML — used by `tests/onnx_conformance.rs` to parse the known-failures
 # allowlist (WS-5 M5.3 conformance harness).
 toml = "0.8"
+# SHA-256 — used by `tests/common/npy.rs` to verify fixture integrity
+# (O-6: do NOT hand-roll crypto).
+sha2 = "0.10"
 
 [package.metadata.docs.rs]
 # Build docs.rs without CUDA (since their build server likely doesn't have it)
