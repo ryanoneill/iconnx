@@ -5,36 +5,28 @@
 //!
 //! ## Features
 //!
-//! - **ONNX Opset 17+ support** - Modern operators for transformer models
+//! - **ONNX opset 11–20 support** - Modern operators for transformer models
 //! - **CUDA GPU acceleration** - Native cuBLAS/cuDNN integration via garboard
-//! - **Concurrent inference** - Multiple streams share weights for optimal GPU utilization
-//! - **CPU fallback** - Full CPU implementation for testing and portability
+//! - **!Sync executor** — one GpuGraphExecutor per thread (interior RefCells).
 //! - **Pure Rust** - No C++ dependencies, just Rust + CUDA
 //!
 //! ## Architecture
 //!
-//! - **Shared weights:** Model parameters loaded once, shared via Arc
+//! - **Shared weights:** Model parameters loaded once via `from_model`
 //! - **Per-inference contexts:** Each inference has own buffers + CUDA stream
-//! - **No Mutex serialization:** Multiple threads call run(&self) concurrently
 //!
 //! ## Quick Start
 //!
 //! ```text
+//! use std::collections::HashMap;
 //! use iconnx::{OnnxParser, GpuGraphExecutor, Tensor};
 //!
-//! // Load ONNX model
 //! let model = OnnxParser::parse_file("model.onnx")?;
+//! let executor = GpuGraphExecutor::from_model(&model)?; // !Sync: one executor per thread
 //!
-//! // Create GPU executor
-//! let mut executor = GpuGraphExecutor::new()?;
-//!
-//! // Add model weights
-//! for (name, tensor) in model.extract_weights()? {
-//!     executor.add_initializer(name, &tensor)?;
-//! }
-//!
-//! // Run inference
-//! let outputs = executor.run(inputs, &["output"])?;
+//! let mut inputs = HashMap::new();
+//! inputs.insert("input".to_string(), Tensor::from_vec_f32(vec![1.0, 2.0, 3.0], vec![1, 3]));
+//! let outputs = executor.run(inputs, vec!["output"])?;
 //! ```
 //!
 //! ## Feature Flags
