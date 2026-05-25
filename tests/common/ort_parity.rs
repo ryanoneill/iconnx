@@ -1,3 +1,11 @@
+// Shared test-helper module: `#[path]`-included into multiple test binaries,
+// each of which uses only a SUBSET of these helpers (e.g. the dynamic-shape
+// guard test uses `OrtSession` + `assert_close` but not `seeded`, while the
+// smoke test uses all three). Per-binary `dead_code` is therefore a false
+// positive — this module-scoped allow is the canonical idiom for `tests/common`
+// shared fixtures, NOT a silenced real warning.
+#![allow(dead_code)]
+
 //! Live-ORT parity test harness.
 //!
 //! This is the FIRST live `ort::` use in the codebase. All prior parity
