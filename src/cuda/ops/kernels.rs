@@ -87,6 +87,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     "fill_kernel",
     "fill_i64_kernel",
     "max_pool_2d_kernel",
+    // WS-6 M6.4 Task 14: general N-D Tile (np.tile semantics).
+    "tile_kernel",
     // WS-4 quantization kernels live in `quantize_kernels.rs`
     // (split out per the project's 1000-line file guideline).
 ];
@@ -1728,6 +1730,33 @@ extern "C" __global__ void max_pool_2d_kernel(
     }
 
     out[((n * C + c) * oH + oh) * oW + ow] = any ? maxv : -CUDART_INF_F;
+}
+
+// WS-6 M6.4 Task 14: General N-D Tile (np.tile semantics).
+//
+// out_shape[d] = in_shape[d] * repeats[d].
+// For each output linear index `o`:
+//   - decompose into per-axis coords via out_strides
+//   - map each coord to input coord via `coord % in_shape[d]`
+//   - recompose input linear index via in_strides
+//   - copy x[in_idx] → out[o]
+//
+// Parameters are host-computed and uploaded as device int buffers (size_t =
+// u64). ndim <= 8 is the practical limit for ONNX models.
+extern "C" __global__ void tile_kernel(
+    float* out, const float* x, size_t n_out, size_t ndim,
+    const size_t* in_shape, const size_t* out_strides, const size_t* in_strides
+) {
+    size_t o = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (o >= n_out) return;
+    size_t rem = o;
+    size_t in_idx = 0;
+    for (size_t d = 0; d < ndim; ++d) {
+        size_t coord = (out_strides[d] > 0) ? rem / out_strides[d] : 0;
+        rem = (out_strides[d] > 0) ? rem % out_strides[d] : rem;
+        in_idx += (coord % in_shape[d]) * in_strides[d];
+    }
+    out[o] = x[in_idx];
 }
 
 "#;

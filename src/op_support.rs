@@ -102,6 +102,8 @@ pub const OP_SUPPORT_TABLE: &[OpSupport] = &[
     OpSupport { op_type: "Identity" },
     OpSupport { op_type: "Concat" },
     OpSupport { op_type: "Expand" },
+    // Tile: np.tile semantics — execute-time repeats (WS-6 M6.4 Task 14):
+    OpSupport { op_type: "Tile" },
     OpSupport { op_type: "Pad" },
     OpSupport { op_type: "Resize" },
     OpSupport { op_type: "NonZero" },

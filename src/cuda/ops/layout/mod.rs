@@ -3473,6 +3473,105 @@ pub fn gpu_max_pool_2d(
     Ok(output)
 }
 
+/// GPU Tile: repeat input tensor along each axis by the corresponding repeats factor.
+///
+/// ONNX Tile semantics: `out_shape[d] = in_shape[d] * repeats[d]`.
+/// For each output element at linear index `o`, per-axis coordinates are
+/// recovered via out_strides, mapped to input coordinates via modulo, and
+/// recomposed into an input linear index via in_strides.
+///
+/// Shape/stride arrays are computed on the host and uploaded as `size_t`
+/// (u64) device buffers — the same approach as `gpu_expand`. `ndim` is
+/// capped at 8 for practical ONNX models; larger ranks return an error.
+///
+/// Only Float32 inputs are supported (the rec model Tile nodes produce f32).
+pub fn gpu_tile(
+    ctx: &IconnxCudaContext,
+    cache: &OpsKernelCache,
+    pool: &mut GpuMemoryPool,
+    input: &GpuTensor,
+    repeats: &[i64],
+) -> Result<GpuTensor, CudaError> {
+    let in_shape = input.shape();
+    let ndim = in_shape.len();
+
+    if ndim == 0 {
+        return Err(CudaError::Kernel("Tile: scalar (0-D) input is not supported".into()));
+    }
+    if repeats.len() != ndim {
+        return Err(CudaError::Kernel(format!(
+            "Tile: repeats length {} does not match input ndim {}",
+            repeats.len(),
+            ndim
+        )));
+    }
+    if ndim > 8 {
+        return Err(CudaError::Kernel(format!(
+            "Tile: ndim {} exceeds the 8-axis limit of tile_kernel",
+            ndim
+        )));
+    }
+
+    // Compute output shape.
+    let out_shape: Vec<usize> = in_shape
+        .iter()
+        .zip(repeats.iter())
+        .map(|(&d, &r)| d * (r as usize))
+        .collect();
+
+    let n_out: usize = out_shape.iter().product();
+    if n_out == 0 {
+        // Zero-element output — allocate an empty tensor, skip kernel launch.
+        return pool.get_tensor_f32(ctx, out_shape);
+    }
+
+    // Compute row-major strides for out_shape and in_shape.
+    let out_strides = compute_strides(&out_shape);
+    let in_strides = compute_strides(in_shape);
+
+    // Upload shape/stride arrays to device as size_t (u64) slices.
+    let in_shape_gpu = ctx.htod_usize(in_shape)?;
+    let out_strides_gpu = ctx.htod_usize(&out_strides)?;
+    let in_strides_gpu = ctx.htod_usize(&in_strides)?;
+
+    let mut output = pool.get_tensor_f32(ctx, out_shape)?;
+    let config = garboard::LaunchConfig::for_num_elems(n_out as u32);
+
+    // SAFETY: tile_kernel C signature is
+    //   (float* out, const float* x, size_t n_out, size_t ndim,
+    //    const size_t* in_shape, const size_t* out_strides, const size_t* in_strides)
+    let kernel = unsafe {
+        cache.module().typed_kernel::<(
+            &mut garboard::DeviceSlice<'_, f32>,
+            &garboard::DeviceSlice<'_, f32>,
+            usize,
+            usize,
+            &garboard::DeviceSlice<'_, u64>,
+            &garboard::DeviceSlice<'_, u64>,
+            &garboard::DeviceSlice<'_, u64>,
+        )>("tile_kernel")
+    }
+    .map_err(|e| CudaError::Kernel(format!("tile_kernel lookup: {}", e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &config,
+            (
+                output.data_f32_mut()?,
+                input.data_f32()?,
+                n_out,
+                ndim,
+                &in_shape_gpu,
+                &out_strides_gpu,
+                &in_strides_gpu,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("tile_kernel launch: {}", e)))?;
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests;
 

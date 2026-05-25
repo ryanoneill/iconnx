@@ -26,8 +26,8 @@ use crate::cuda::ops::{
     gpu_cumsum, gpu_dequantize_linear, gpu_expand, gpu_gather_from_gpu, gpu_matmul_integer,
     gpu_max_pool_2d,
     gpu_nonzero, gpu_pad, gpu_range, gpu_range_i64, gpu_resize, gpu_scatter_nd, gpu_shape,
-    gpu_slice_nd, gpu_transpose_2d, gpu_transpose_nd, gpu_where, ResizeCoordMode, ResizeMode,
-    ResizeNearestMode,
+    gpu_slice_nd, gpu_tile, gpu_transpose_2d, gpu_transpose_nd, gpu_where, ResizeCoordMode,
+    ResizeMode, ResizeNearestMode,
 };
 use crate::cuda::kernels::gpu_batchnorm_affine;
 use crate::cuda::tensor::DType;
@@ -680,6 +680,24 @@ impl Executor {
                     ));
                 };
                 gpu_expand(&self.ctx, &self.ops_kernels, &mut pool, inputs[0], out_shape)
+            }
+
+            // --- Tile: repeat tensor along each axis by repeats[d] -------
+            //
+            // ONNX Tile semantics: out_shape[d] = in_shape[d] * repeats[d].
+            // `repeats` is an INT64 input tensor read at execute time using
+            // the same get_or_fetch_i64 accessor as Expand/Pad/Slice.
+            // The kernel maps each output linear index back to an input
+            // index via modulo addressing (np.tile semantics).
+            "Tile" => {
+                if inputs.len() < 2 {
+                    return Err(CudaError::Kernel(
+                        "Tile requires 2 inputs: data and repeats".into(),
+                    ));
+                }
+                let repeats_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
+                let repeats = self.get_or_fetch_i64(repeats_name, inputs[1], plan)?;
+                gpu_tile(&self.ctx, &self.ops_kernels, &mut pool, inputs[0], &repeats)
             }
 
             // --- Pad with constant/reflect/edge modes --------------------
