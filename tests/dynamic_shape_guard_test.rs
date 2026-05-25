@@ -12,6 +12,14 @@ use std::collections::HashMap;
 use iconnx::{GpuGraphExecutor, NodeAttributes, Tensor};
 use iconnx::cuda::CudaError;
 
+// Live-ORT parity helpers, shared by the parity tests in this file. Declared
+// ONCE at file scope (not per-test) so `clippy::duplicate_mod` is satisfied —
+// declaring the same `#[path]` module inside multiple test fns loads the file
+// as a module multiple times. Each parity test brings it into scope with
+// `use crate::ort_parity` (the module is a sibling at the test-binary root).
+#[path = "common/ort_parity.rs"]
+mod ort_parity;
+
 /// A concrete-shape plan ([1, 4]) must reject a runtime input shaped [1, 8].
 ///
 /// This is the always-on floor: even without dynamic-shape support, a wrong
@@ -146,8 +154,7 @@ fn rank_mismatch_triggers_guard() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn dynamic_load_correct_across_two_shapes_vs_ort() {
-    #[path = "common/ort_parity.rs"]
-    mod ort_parity;
+    use crate::ort_parity;
     use std::collections::HashMap;
     use iconnx::{GpuGraphExecutor, OnnxParser, Tensor};
 
@@ -166,5 +173,82 @@ fn dynamic_load_correct_across_two_shapes_vs_ort() {
         let (oref, oref_shape) = ort.run_f32(&[("x", &data, vec![1, 1, h, w])], "y").expect("ort run");
         assert_eq!(oref_shape, vec![1, 1, h, w], "ORT output spatial should match input (pad=1,k=3)");
         ort_parity::assert_close(&got["y"].as_slice(), &oref, 1e-3, 1e-3);
+    }
+}
+
+/// WS-6 M6.2 Task 7 — R2 acceptance (b): concrete-load differing-shape path.
+///
+/// A model loaded with CONCRETE input dims (`x: [1,1,8,8]` from the committed
+/// `conv_concrete_1x1x8x8.onnx`, kernel 1/9 box-blur, pad 1) is run first at
+/// its declared shape (must match ORT), then at a DIFFERING shape `[1,1,12,12]`.
+///
+/// The acceptance is satisfied EITHER way — this is the SHOULD's spec-defined
+/// floor:
+///   * if concrete-load re-plan is implemented, the second run re-lowers and
+///     the result matches ORT; OR
+///   * the always-on Task 5 guard fires with `InputShapeMismatch`.
+///
+/// What is NOT acceptable is a silent miscompute (`Ok` with wrong numbers) or
+/// any other error variant.
+///
+/// ## Re-plan status: DEFERRED (guard is the floor)
+///
+/// Concrete-load re-plan is a SHOULD, deferred here per the M6.2 decision
+/// rule because it is not a clean, contained change:
+///   * `OptimizableGraphBuilder::add_input` (`src/ir/graph.rs`) APPENDS to its
+///     `inputs: Vec<GraphInput>` (open question O-4 — confirmed: it `push`es,
+///     it does NOT overwrite an existing input by name). Re-planning a
+///     concrete-load shape change would therefore require a new
+///     `set_input_shape` builder method, not just a re-call of `add_input`
+///     (which would duplicate the input).
+///   * The cache-reuse decision in `ensure_compiled_with_outputs` currently
+///     keys only on output-name coverage; threading runtime input shapes into
+///     that decision (to detect a concrete-dim change and drop the cached
+///     plan) intertwines with — and risks regressing — the working dynamic-
+///     load cache-reuse path (Task 6).
+///
+/// pdfocr loads its models with DYNAMIC dims (`None`), which already runs
+/// correctly across multiple shapes with one plan (Task 6, verified vs ORT),
+/// so the concrete-load re-plan is not on pdfocr's path. The guard guarantees
+/// no silent miscompute in the meantime. Re-plan is documented for the M6.6
+/// batching/perf follow-up. This test passes today via the `InputShapeMismatch`
+/// branch, and will continue to pass unchanged if re-plan is later added.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn concrete_load_differing_shape_replans_or_errors() {
+    use crate::ort_parity;
+    use std::collections::HashMap;
+    use iconnx::{GpuGraphExecutor, OnnxParser, Tensor};
+
+    let p = std::path::Path::new("tests/fixtures/ws6_op/conv_concrete_1x1x8x8.onnx");
+    let model = OnnxParser::parse_file(p).expect("parse");
+    let exec = GpuGraphExecutor::from_model(&model).expect("from_model");
+    let mut ort = ort_parity::OrtSession::open(p).expect("ort");
+
+    // First at the DECLARED shape [1,1,8,8] — must be correct vs ORT.
+    let d0: Vec<f32> = (0..64).map(|i| (i % 5) as f32 - 2.0).collect();
+    let mut i0 = HashMap::new();
+    i0.insert("x".to_string(), Tensor::from_vec_f32(d0.clone(), vec![1, 1, 8, 8]));
+    let g0 = exec.run(i0, vec!["y"]).expect("run at declared shape");
+    let (r0, _) = ort
+        .run_f32(&[("x", &d0, vec![1, 1, 8, 8])], "y")
+        .expect("ort");
+    ort_parity::assert_close(&g0["y"].as_slice(), &r0, 1e-3, 1e-3);
+
+    // Then at a DIFFERING shape [1,1,12,12]: either re-plans correctly OR
+    // errors loudly — never silent-wrong.
+    let d1: Vec<f32> = (0..144).map(|i| (i % 5) as f32 - 2.0).collect();
+    let mut i1 = HashMap::new();
+    i1.insert("x".to_string(), Tensor::from_vec_f32(d1.clone(), vec![1, 1, 12, 12]));
+    match exec.run(i1, vec!["y"]) {
+        Ok(g1) => {
+            // Re-planned correctly — verify against ORT.
+            let (r1, _) = ort
+                .run_f32(&[("x", &d1, vec![1, 1, 12, 12])], "y")
+                .expect("ort");
+            ort_parity::assert_close(&g1["y"].as_slice(), &r1, 1e-3, 1e-3);
+        }
+        Err(CudaError::InputShapeMismatch { .. }) => { /* guard floor — acceptable per spec */ }
+        Err(e) => panic!("unexpected error variant (must be re-plan-correct or InputShapeMismatch): {e:?}"),
     }
 }
