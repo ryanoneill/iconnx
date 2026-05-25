@@ -381,8 +381,10 @@ fn rec_whole_model_matches_ort() {
 /// (c) Non-empty-mask guard: the ORT binary mask must contain at least one
 ///     foreground pixel; if the input fixture has no text the test fails loudly.
 ///
-/// This also exercises R6 Resize parity end-to-end, since PP-OCRv3 det uses
-/// bilinear Resize in its DBNet head.
+/// This also exercises R6 Resize parity end-to-end: PP-OCRv3 det's DBNet head
+/// uses nearest/asymmetric/floor Resize (verified in the model graph), which is
+/// exactly the GPU `ResizeCoordMode` support — a mode mismatch would shift the
+/// probability map and fail this parity check.
 #[test]
 #[ignore = "requires CUDA GPU + pdfocr model/fixture files"]
 fn det_whole_model_matches_ort() {
