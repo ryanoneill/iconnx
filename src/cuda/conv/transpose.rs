@@ -601,6 +601,7 @@ mod tests {
             stride_w: 1,
             pad_h: 0,
             pad_w: 0,
+            ..Default::default()
         };
 
         // `gpu_conv_transpose_2d` signature is (input, kernel, ...). Input

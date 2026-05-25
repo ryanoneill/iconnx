@@ -16,6 +16,7 @@ pub mod rnn;
 pub use rnn::*;
 
 use super::context::{CudaError, IconnxCudaContext};
+use super::conv::Conv2dParams;
 use super::tensor::GpuTensor;
 
 // =============================================================================
@@ -76,6 +77,86 @@ pub fn garboard_conv_1d(
     };
 
     let mut output = GpuTensor::zeros_f32(ctx, vec![batch, out_channels, out_length])?;
+
+    ctx.dnn()
+        .conv_forward(
+            ctx.garboard_stream(),
+            &config,
+            input.data_f32()?,
+            kernel.data_f32()?,
+            output.data_f32_mut()?,
+        )
+        .map_err(|e| CudaError::Cudnn(e.to_string()))?;
+
+    Ok(output)
+}
+
+/// 2D Convolution via garboard's DnnContext (NCHW + groups + dilation).
+///
+/// Mirrors [`garboard_conv_1d`] but for rank-4 `[N, C, H, W]` input. This is
+/// the path for grouped/depthwise (`group > 1`) and dilated 2D convs, which
+/// the in-tree im2col `gpu_conv2d` does not support — cuDNN handles groups and
+/// dilation natively. The `group == 1` non-dilated case stays on `gpu_conv2d`.
+///
+/// cuDNN's `conv_forward` does NOT fold bias; the caller applies `add_bias`.
+pub fn garboard_conv_2d(
+    ctx: &IconnxCudaContext,
+    input: &GpuTensor,
+    kernel: &GpuTensor,
+    params: &Conv2dParams,
+) -> Result<GpuTensor, CudaError> {
+    let input_shape = input.shape();
+    let kernel_shape = kernel.shape();
+
+    if input_shape.len() != 4 {
+        return Err(CudaError::Cudnn(format!(
+            "Expected 4D input [N,C,H,W], got {:?}",
+            input_shape
+        )));
+    }
+    if kernel_shape.len() != 4 {
+        return Err(CudaError::Cudnn(format!(
+            "Expected 4D kernel [C_out,C_in/g,kH,kW], got {:?}",
+            kernel_shape
+        )));
+    }
+
+    let batch = input_shape[0];
+    let in_channels = input_shape[1];
+    let in_h = input_shape[2];
+    let in_w = input_shape[3];
+
+    let out_channels = kernel_shape[0];
+    let in_channels_per_group = kernel_shape[1];
+    let kernel_h = kernel_shape[2];
+    let kernel_w = kernel_shape[3];
+
+    let out_h =
+        (in_h + 2 * params.pad_h - params.dilation_h * (kernel_h - 1) - 1) / params.stride_h + 1;
+    let out_w =
+        (in_w + 2 * params.pad_w - params.dilation_w * (kernel_w - 1) - 1) / params.stride_w + 1;
+
+    let config = garboard::ConvForwardConfig {
+        input_dims: [
+            batch as i32,
+            in_channels as i32,
+            in_h as i32,
+            in_w as i32,
+        ],
+        filter_dims: [
+            out_channels as i32,
+            in_channels_per_group as i32,
+            kernel_h as i32,
+            kernel_w as i32,
+        ],
+        padding: [params.pad_h as i32, params.pad_w as i32],
+        stride: [params.stride_h as i32, params.stride_w as i32],
+        dilation: [params.dilation_h as i32, params.dilation_w as i32],
+        groups: params.group as i32,
+        algorithm: None, // cuDNN heuristic picks per-call.
+    };
+
+    let mut output = GpuTensor::zeros_f32(ctx, vec![batch, out_channels, out_h, out_w])?;
 
     ctx.dnn()
         .conv_forward(
