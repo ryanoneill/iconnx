@@ -356,6 +356,18 @@ pub enum CudaError {
         /// kernel exists; BF16 follows the same scope").
         reason: String,
     },
+    /// Runtime input shape disagrees with the dims the cached plan was lowered
+    /// against. WS-6 M6.2: prevents silent miscompute when a concrete-loaded
+    /// model is run at a shape other than the one its plan baked. Distinct from
+    /// `ShapeMismatch` (data-len vs element-count at upload).
+    InputShapeMismatch {
+        /// Name of the input tensor whose shape disagrees.
+        input: String,
+        /// The shape the compiled plan was lowered with (`None` = dynamic dim).
+        expected: Vec<Option<usize>>,
+        /// The actual runtime shape supplied by the caller.
+        actual: Vec<usize>,
+    },
 }
 
 impl std::fmt::Display for CudaError {
@@ -394,6 +406,12 @@ impl std::fmt::Display for CudaError {
                 f,
                 "{} does not support {}: {}",
                 op, dtype, reason
+            ),
+            CudaError::InputShapeMismatch { input, expected, actual } => write!(
+                f,
+                "input '{}' shape {:?} does not match the compiled plan's input dims {:?}; \
+                 recompile or load with dynamic dims",
+                input, actual, expected
             ),
         }
     }

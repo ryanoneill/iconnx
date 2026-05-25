@@ -431,6 +431,33 @@ impl GpuGraphExecutor {
         output_names: Vec<&str>,
     ) -> Result<HashMap<String, Tensor>, CudaError> {
         self.ensure_compiled_with_outputs(&output_names)?;
+        // WS-6 M6.2 Task 5: always-on guard — compare each runtime input
+        // shape to the dims the compiled plan was lowered against.
+        //
+        // Must run BEFORE any GPU work so no partial execution occurs on
+        // a mismatched shape. We scope the borrow explicitly and drop it
+        // before calling `executor.run`, which needs its own borrow-free
+        // access to the plan.
+        {
+            let plan = self.compiled_plan.borrow();
+            let plan = plan.as_ref().expect("plan ensured above");
+            for gi in &plan.graph_inputs {
+                if let Some(rt) = inputs.get(&gi.name) {
+                    let actual = rt.shape();
+                    let mismatch = gi.shape.len() != actual.len()
+                        || gi.shape.iter().zip(actual.iter()).any(|(p, &a)| {
+                            matches!(p, Some(d) if *d != a)
+                        });
+                    if mismatch {
+                        return Err(CudaError::InputShapeMismatch {
+                            input: gi.name.clone(),
+                            expected: gi.shape.clone(),
+                            actual: actual.to_vec(),
+                        });
+                    }
+                }
+            }
+        } // borrow dropped here — safe to re-borrow below
         let plan = self.compiled_plan.borrow();
         self.executor
             .run(plan.as_ref().unwrap(), inputs, &output_names)
