@@ -270,9 +270,34 @@ impl Executor {
             }
 
             // --- Clip + Softmax -----------------------------------------
+            //
+            // ONNX opset 11+ moved min/max from attributes to optional inputs
+            // (inputs[1] and inputs[2]). A 0-element tensor means "absent" —
+            // placeholder kept by some exporters — so we fall back to the
+            // attribute value (or f32::MIN/MAX) in that case.
             "Clip" => {
-                let min = attrs.get_float("min").unwrap_or(f32::MIN);
-                let max = attrs.get_float("max").unwrap_or(f32::MAX);
+                let min = if inputs.len() > 1
+                    && inputs[1].shape().iter().product::<usize>() > 0
+                {
+                    inputs[1]
+                        .to_host_f32(&self.ctx)?
+                        .first()
+                        .copied()
+                        .unwrap_or(f32::MIN)
+                } else {
+                    attrs.get_float("min").unwrap_or(f32::MIN)
+                };
+                let max = if inputs.len() > 2
+                    && inputs[2].shape().iter().product::<usize>() > 0
+                {
+                    inputs[2]
+                        .to_host_f32(&self.ctx)?
+                        .first()
+                        .copied()
+                        .unwrap_or(f32::MAX)
+                } else {
+                    attrs.get_float("max").unwrap_or(f32::MAX)
+                };
                 gpu_clip(
                     &self.ctx,
                     &self.elementwise_kernels,

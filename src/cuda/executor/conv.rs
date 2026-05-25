@@ -330,14 +330,32 @@ impl Executor {
                     Ok(output)
                 } else {
                     // 2D ConvTranspose.
-                    let kernel_shape = attributes.get_ints("kernel_shape").unwrap_or(&[3, 3]);
+                    //
+                    // ONNX's `kernel_shape` attribute is optional for ConvTranspose
+                    // (the kernel tensor is always present as inputs[1], so the
+                    // shape can be inferred from it). When the attribute is absent
+                    // we read kH/kW from the weight tensor's spatial dims [2] and
+                    // [3] directly — falling back to [3,3] would be wrong for any
+                    // kernel that isn't 3×3.
+                    let kernel_weight = inputs[1];
+                    let kw_shape = kernel_weight.shape();
+                    let (default_kh, default_kw) = if kw_shape.len() == 4 {
+                        (kw_shape[2] as i64, kw_shape[3] as i64)
+                    } else {
+                        (3, 3)
+                    };
+                    let kernel_shape = attributes.get_ints("kernel_shape");
                     let strides = attributes.get_ints("strides").unwrap_or(&[1, 1]);
                     let pads = attributes.get_ints("pads").unwrap_or(&[0, 0, 0, 0]);
                     let output_padding =
                         attributes.get_ints("output_padding").unwrap_or(&[0, 0]);
                     let params = Conv2dParams {
-                        kernel_h: kernel_shape.first().copied().unwrap_or(3) as usize,
-                        kernel_w: kernel_shape.get(1).copied().unwrap_or(3) as usize,
+                        kernel_h: kernel_shape
+                            .and_then(|s| s.first().copied())
+                            .unwrap_or(default_kh) as usize,
+                        kernel_w: kernel_shape
+                            .and_then(|s| s.get(1).copied())
+                            .unwrap_or(default_kw) as usize,
                         stride_h: strides.first().copied().unwrap_or(1) as usize,
                         stride_w: strides.get(1).copied().unwrap_or(1) as usize,
                         pad_h: pads.first().copied().unwrap_or(0) as usize,
