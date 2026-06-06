@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use crate::cuda::conv::{
     add_bias, gpu_conv1d, gpu_conv2d, gpu_conv_transpose_2d, Conv1dParams, Conv2dParams,
 };
-use crate::cuda::cudnn::{garboard_conv_1d, garboard_conv_transpose_1d};
+use crate::cuda::cudnn::{garboard_conv_1d, garboard_conv_2d, garboard_conv_transpose_1d};
 use crate::cuda::tensor::DType;
 use crate::cuda::{CudaError, GpuTensor};
 use crate::ir::PlannedOp;
@@ -191,6 +191,8 @@ impl Executor {
                         let kernel_shape = attributes.get_ints("kernel_shape").unwrap_or(&[3, 3]);
                         let strides = attributes.get_ints("strides").unwrap_or(&[1, 1]);
                         let pads = attributes.get_ints("pads").unwrap_or(&[0, 0, 0, 0]);
+                        let dilations = attributes.get_ints("dilations").unwrap_or(&[1, 1]);
+                        let group = attributes.get_int("group").unwrap_or(1) as usize;
                         let params = Conv2dParams {
                             kernel_h: kernel_shape.first().copied().unwrap_or(3) as usize,
                             kernel_w: kernel_shape.get(1).copied().unwrap_or(3) as usize,
@@ -198,17 +200,47 @@ impl Executor {
                             stride_w: strides.get(1).copied().unwrap_or(1) as usize,
                             pad_h: pads.first().copied().unwrap_or(0) as usize,
                             pad_w: pads.get(1).copied().unwrap_or(0) as usize,
+                            group,
+                            dilation_h: dilations.first().copied().unwrap_or(1) as usize,
+                            dilation_w: dilations.get(1).copied().unwrap_or(1) as usize,
                         };
                         let bias = if inputs.len() > 2 { Some(inputs[2]) } else { None };
-                        gpu_conv2d(
-                            &self.ctx,
-                            &self.conv_kernels,
-                            &mut pool,
-                            inputs[0],
-                            inputs[1],
-                            bias,
-                            &params,
-                        )
+                        let dilated = params.dilation_h != 1 || params.dilation_w != 1;
+
+                        // Grouped/depthwise (`group > 1`) or dilated 2D convs
+                        // route through garboard's cuDNN binding, which
+                        // supports both natively. The in-tree im2col
+                        // `gpu_conv2d` asserts `in_channels == kernel_in` and
+                        // has no dilation, so it stays the `group == 1`
+                        // non-dilated path. cuDNN omits bias from conv, so we
+                        // follow up with `add_bias` when a bias is present.
+                        if params.group > 1 || dilated {
+                            let mut output =
+                                garboard_conv_2d(&self.ctx, inputs[0], inputs[1], &params)?;
+                            if let Some(b) = bias {
+                                let os = output.shape().to_vec();
+                                add_bias(
+                                    &self.ctx,
+                                    &self.conv_kernels,
+                                    &mut output,
+                                    b,
+                                    os[0],
+                                    os[1],
+                                    os[2] * os[3],
+                                )?;
+                            }
+                            Ok(output)
+                        } else {
+                            gpu_conv2d(
+                                &self.ctx,
+                                &self.conv_kernels,
+                                &mut pool,
+                                inputs[0],
+                                inputs[1],
+                                bias,
+                                &params,
+                            )
+                        }
                     }
                     ndim => Err(CudaError::Kernel(format!(
                         "Conv expects 3D (1D conv) or 4D (2D conv) input, got {}D with shape {:?}",
@@ -298,18 +330,37 @@ impl Executor {
                     Ok(output)
                 } else {
                     // 2D ConvTranspose.
-                    let kernel_shape = attributes.get_ints("kernel_shape").unwrap_or(&[3, 3]);
+                    //
+                    // ONNX's `kernel_shape` attribute is optional for ConvTranspose
+                    // (the kernel tensor is always present as inputs[1], so the
+                    // shape can be inferred from it). When the attribute is absent
+                    // we read kH/kW from the weight tensor's spatial dims [2] and
+                    // [3] directly — falling back to [3,3] would be wrong for any
+                    // kernel that isn't 3×3.
+                    let kernel_weight = inputs[1];
+                    let kw_shape = kernel_weight.shape();
+                    let (default_kh, default_kw) = if kw_shape.len() == 4 {
+                        (kw_shape[2] as i64, kw_shape[3] as i64)
+                    } else {
+                        (3, 3)
+                    };
+                    let kernel_shape = attributes.get_ints("kernel_shape");
                     let strides = attributes.get_ints("strides").unwrap_or(&[1, 1]);
                     let pads = attributes.get_ints("pads").unwrap_or(&[0, 0, 0, 0]);
                     let output_padding =
                         attributes.get_ints("output_padding").unwrap_or(&[0, 0]);
                     let params = Conv2dParams {
-                        kernel_h: kernel_shape.first().copied().unwrap_or(3) as usize,
-                        kernel_w: kernel_shape.get(1).copied().unwrap_or(3) as usize,
+                        kernel_h: kernel_shape
+                            .and_then(|s| s.first().copied())
+                            .unwrap_or(default_kh) as usize,
+                        kernel_w: kernel_shape
+                            .and_then(|s| s.get(1).copied())
+                            .unwrap_or(default_kw) as usize,
                         stride_h: strides.first().copied().unwrap_or(1) as usize,
                         stride_w: strides.get(1).copied().unwrap_or(1) as usize,
                         pad_h: pads.first().copied().unwrap_or(0) as usize,
                         pad_w: pads.get(1).copied().unwrap_or(0) as usize,
+                        ..Default::default()
                     };
                     let bias = if inputs.len() > 2 { Some(inputs[2]) } else { None };
                     let output_pad_h = output_padding.first().copied().unwrap_or(0) as usize;

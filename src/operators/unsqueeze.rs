@@ -12,23 +12,46 @@ impl Unsqueeze {
     /// Forward pass: insert dimensions
     ///
     /// # Arguments
-    /// * `inputs` - [data_tensor, axes_tensor]
+    /// * `inputs` - `[data_tensor]` (opset ≤ 12, axes lives on the
+    ///   `axes` attribute) **or** `[data_tensor, axes_tensor]`
+    ///   (opset ≥ 13, axes is an input).
     ///   - data_tensor: Input tensor
-    ///   - axes_tensor: 1D tensor with axes to insert (f32 values)
+    ///   - axes_tensor (opset ≥ 13): 1D Int64 tensor with axes to
+    ///     insert.
+    /// * `attributes` - For opset ≤ 12, carries the `axes` attribute
+    ///   (Vec<i64>). Ignored when a second input is present.
     ///
     /// # Returns
     /// Tensor with additional dimensions of size 1
+    ///
+    /// # Opset compatibility
+    ///
+    /// Mirrors the GPU executor's dual handling
+    /// (`src/cuda/executor/layout.rs::Unsqueeze`): opset 13 moved
+    /// `axes` from attribute to input, but older exports (e.g.
+    /// paddle2onnx opset-12 `_rapidai` rec model) still carry the
+    /// attribute form. Folding any Unsqueeze in such a graph requires
+    /// reading the attribute path here.
     pub fn forward(
         inputs: &[Tensor],
-        _attributes: &crate::attributes::NodeAttributes,
+        attributes: &crate::attributes::NodeAttributes,
     ) -> Tensor {
-        assert_eq!(inputs.len(), 2, "Unsqueeze requires exactly 2 inputs");
-
-        // Get axes as i64 values first (to handle negative axes)
-        let axes_i64: Vec<i64> = if inputs[1].is_int64() {
-            inputs[1].as_slice_i64().to_vec()
+        // Opset 13+: axes is an input. Opset ≤ 12: axes is an attribute.
+        let axes_i64: Vec<i64> = if inputs.len() >= 2 {
+            if inputs[1].is_int64() {
+                inputs[1].as_slice_i64().to_vec()
+            } else {
+                inputs[1].as_slice().iter().map(|&v| v as i64).collect()
+            }
+        } else if let Some(axes_attr) = attributes.get_ints("axes") {
+            axes_attr.to_vec()
         } else {
-            inputs[1].as_slice().iter().map(|&v| v as i64).collect()
+            panic!(
+                "Unsqueeze requires either an axes input (opset ≥ 13) or \
+                 an 'axes' attribute (opset ≤ 12); got {} input(s) and no \
+                 attribute",
+                inputs.len()
+            );
         };
 
         // Output rank = input rank + number of axes to insert

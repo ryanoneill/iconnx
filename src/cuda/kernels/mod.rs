@@ -86,6 +86,8 @@ const KERNEL_NAMES: &[&str] = &[
     "tanh_kernel",
     "relu_kernel",
     "leaky_relu_kernel",
+    "hardsigmoid_kernel",
+    "hardswish_kernel",
     // Math ops
     "exp_kernel",
     "erf_kernel",
@@ -108,6 +110,8 @@ const KERNEL_NAMES: &[&str] = &[
     // Scalar-from-pointer ops (avoids D2H transfer)
     "add_scalar_ptr_kernel",
     "add_i64_scalar_ptr_kernel",
+    // BatchNormalization inference: per-channel affine over NCHW
+    "batchnorm_affine_nchw_kernel",
 ];
 
 /// All elementwise CUDA kernel source code.
@@ -218,6 +222,16 @@ extern "C" __global__ void leaky_relu_kernel(float* out, const float* x, float a
         float v = x[i];
         out[i] = v >= 0.0f ? v : alpha * v;
     }
+}
+
+extern "C" __global__ void hardsigmoid_kernel(float* out, const float* x, float alpha, float beta, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i] = fminf(fmaxf(alpha * x[i] + beta, 0.0f), 1.0f); }
+}
+
+extern "C" __global__ void hardswish_kernel(float* out, const float* x, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { float v = x[i]; out[i] = v * fminf(fmaxf((v + 3.0f) / 6.0f, 0.0f), 1.0f); }
 }
 
 // Math operations
@@ -355,6 +369,20 @@ extern "C" __global__ void add_i64_scalar_ptr_kernel(long long* out, const long 
     if (i < n) {
         out[i] = a[i] + scalar_ptr[0];
     }
+}
+
+// BatchNormalization inference: per-channel affine over NCHW layout.
+//
+// Precomputed per-channel coefficients:
+//   a[c] = scale[c] / sqrt(var[c] + eps)
+//   b[c] = B[c] - mean[c] * a[c]
+// Applied as: out[i] = a[ch]*x[i] + b[ch], ch = (i / spatial) % c
+extern "C" __global__ void batchnorm_affine_nchw_kernel(
+    float* out, const float* x, const float* a, const float* b,
+    size_t n, size_t c, size_t spatial
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { size_t ch = (i / spatial) % c; out[i] = a[ch] * x[i] + b[ch]; }
 }
 "#;
 
@@ -1154,6 +1182,83 @@ pub fn gpu_leaky_relu(
     Ok(out)
 }
 
+/// Launch helper for hardsigmoid: `(out, x, alpha, beta, n)`.
+fn launch_hardsigmoid(
+    ctx: &IconnxCudaContext,
+    kernels: &KernelCache,
+    out: &mut DeviceSlice<'static, f32>,
+    x: &DeviceSlice<'static, f32>,
+    alpha: f32,
+    beta: f32,
+    n: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: hardsigmoid_kernel signature is
+    // `(float* out, const float* x, float alpha, float beta, size_t n)`.
+    let kernel = unsafe {
+        kernels.module().typed_kernel::<(
+            &mut DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            f32,
+            f32,
+            usize,
+        )>("hardsigmoid_kernel")
+    }
+    .map_err(|e| CudaError::Kernel(format!("hardsigmoid_kernel lookup failed: {}", e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(n as u32),
+            (out, x, alpha, beta, n),
+        )
+        .map_err(|e| CudaError::Kernel(format!("hardsigmoid_kernel launch failed: {}", e)))
+}
+
+/// GPU HardSigmoid: out = clamp(alpha * x + beta, 0, 1).
+///
+/// Alpha and beta are read from node attributes (ONNX defaults: alpha=0.2, beta=0.5).
+pub fn gpu_hardsigmoid(
+    ctx: &IconnxCudaContext,
+    kernels: &KernelCache,
+    pool: &mut GpuMemoryPool,
+    input: &GpuTensor,
+    alpha: f32,
+    beta: f32,
+) -> Result<GpuTensor, CudaError> {
+    let n = input.len();
+    let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
+    launch_hardsigmoid(
+        ctx,
+        kernels,
+        out.data_f32_mut()?,
+        input.data_f32()?,
+        alpha,
+        beta,
+        n,
+    )?;
+    Ok(out)
+}
+
+/// GPU HardSwish: out = x * clamp((x + 3) / 6, 0, 1).
+pub fn gpu_hardswish(
+    ctx: &IconnxCudaContext,
+    kernels: &KernelCache,
+    pool: &mut GpuMemoryPool,
+    input: &GpuTensor,
+) -> Result<GpuTensor, CudaError> {
+    let n = input.len();
+    let mut out = pool.get_tensor_f32(ctx, input.shape().to_vec())?;
+    launch_unary_f32(
+        ctx,
+        kernels,
+        "hardswish_kernel",
+        out.data_f32_mut()?,
+        input.data_f32()?,
+        n,
+    )?;
+    Ok(out)
+}
+
 // =============================================================================
 // Math Operations
 // =============================================================================
@@ -1609,6 +1714,74 @@ pub fn gpu_mul_scalar(
         scalar,
         n,
     )?;
+    Ok(out)
+}
+
+// =============================================================================
+// BatchNormalization
+// =============================================================================
+
+/// GPU BatchNormalization (inference, NCHW): out[i] = a[ch]*x[i] + b[ch].
+///
+/// The caller precomputes per-channel coefficients:
+///   `a[c] = scale[c] / sqrt(var[c] + eps)`
+///   `b[c] = B[c] - mean[c] * a[c]`
+/// and passes them as 1-D `GpuTensor`s. The channel index is derived as
+/// `ch = (i / spatial) % C` where `spatial = H * W` and is taken from
+/// `x.shape() = [N, C, H, W]`.
+pub fn gpu_batchnorm_affine(
+    ctx: &IconnxCudaContext,
+    kernels: &KernelCache,
+    pool: &mut GpuMemoryPool,
+    x: &GpuTensor,
+    a_dev: &GpuTensor,
+    b_dev: &GpuTensor,
+) -> Result<GpuTensor, CudaError> {
+    let xs = x.shape();
+    if xs.len() != 4 {
+        return Err(CudaError::Kernel(format!(
+            "gpu_batchnorm_affine: expected 4-D NCHW input, got shape {:?}",
+            xs
+        )));
+    }
+    let n_total = x.len(); // N * C * H * W
+    let c = xs[1];
+    let spatial = xs[2] * xs[3]; // H * W
+
+    let mut out = pool.get_tensor_f32(ctx, xs.to_vec())?;
+
+    // SAFETY: batchnorm_affine_nchw_kernel signature is
+    // `(float* out, const float* x, const float* a, const float* b,
+    //   size_t n, size_t c, size_t spatial)`.
+    let kernel = unsafe {
+        kernels.module().typed_kernel::<(
+            &mut DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            &DeviceSlice<'_, f32>,
+            usize,
+            usize,
+            usize,
+        )>("batchnorm_affine_nchw_kernel")
+    }
+    .map_err(|e| CudaError::Kernel(format!("batchnorm_affine_nchw_kernel lookup failed: {}", e)))?;
+
+    kernel
+        .launch(
+            ctx.garboard_stream(),
+            &LaunchConfig::for_num_elems(n_total as u32),
+            (
+                out.data_f32_mut()?,
+                x.data_f32()?,
+                a_dev.data_f32()?,
+                b_dev.data_f32()?,
+                n_total,
+                c,
+                spatial,
+            ),
+        )
+        .map_err(|e| CudaError::Kernel(format!("batchnorm_affine_nchw_kernel launch failed: {}", e)))?;
+
     Ok(out)
 }
 

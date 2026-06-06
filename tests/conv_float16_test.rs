@@ -56,6 +56,7 @@ fn conv_float16_stays_float16_through_im2col_gemm() {
         stride_w: 1,
         pad_h: 0,
         pad_w: 0,
+        ..Default::default()
     };
 
     let out = gpu_conv2d(&ctx, &cache, &mut pool, &input, &weight, None, &params).unwrap();
@@ -177,6 +178,7 @@ fn conv2d_float16_with_bias_stays_float16() {
         stride_w: 1,
         pad_h: 0,
         pad_w: 0,
+        ..Default::default()
     };
 
     let out = gpu_conv2d(&ctx, &cache, &mut pool, &input, &weight, Some(&bias), &params).unwrap();
@@ -229,6 +231,7 @@ fn conv2d_float16_matches_float32_within_tolerance() {
         stride_w: 1,
         pad_h: 1,
         pad_w: 1,
+        ..Default::default()
     };
 
     let input_32 = GpuTensor::from_host_f32(&ctx, &input_f32, vec![n, c_in, h, w]).unwrap();

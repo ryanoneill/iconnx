@@ -47,6 +47,8 @@ pub const OP_SUPPORT_TABLE: &[OpSupport] = &[
     OpSupport { op_type: "Sigmoid" },
     OpSupport { op_type: "Relu" },
     OpSupport { op_type: "LeakyRelu" },
+    OpSupport { op_type: "HardSigmoid" },
+    OpSupport { op_type: "HardSwish" },
     OpSupport { op_type: "Atan" },
     OpSupport { op_type: "Round" },
     OpSupport { op_type: "Floor" },
@@ -100,6 +102,8 @@ pub const OP_SUPPORT_TABLE: &[OpSupport] = &[
     OpSupport { op_type: "Identity" },
     OpSupport { op_type: "Concat" },
     OpSupport { op_type: "Expand" },
+    // Tile: np.tile semantics — execute-time repeats (WS-6 M6.4 Task 14):
+    OpSupport { op_type: "Tile" },
     OpSupport { op_type: "Pad" },
     OpSupport { op_type: "Resize" },
     OpSupport { op_type: "NonZero" },
@@ -107,6 +111,8 @@ pub const OP_SUPPORT_TABLE: &[OpSupport] = &[
     OpSupport { op_type: "Range" },
     OpSupport { op_type: "CumSum" },
     OpSupport { op_type: "DequantizeLinear" },
+    // BatchNormalization inference — per-channel NCHW affine (WS-6 M6.4 Task 13):
+    OpSupport { op_type: "BatchNormalization" },
 ];
 
 /// Returns the cached set of op_types iconnx supports. Build-once via

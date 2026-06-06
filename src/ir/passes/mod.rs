@@ -1,6 +1,7 @@
 //! Graph passes — pure functions over `OptimizableGraph`.
 
 pub mod constant_folding;
+pub mod constant_promotion;
 pub mod dce;
 pub mod elementwise_fusion;
 pub mod elementwise_fusion_codegen;
@@ -13,6 +14,7 @@ pub mod shape_inference;
 pub mod topo_sort;
 
 pub use constant_folding::constant_folding as constant_folding_pass;
+pub use constant_promotion::constant_promotion as constant_promotion_pass;
 pub use dce::dead_code_elimination;
 pub use elementwise_fusion::{
     elementwise_fusion as elementwise_fusion_pass, fusion_annotations_from_graph,

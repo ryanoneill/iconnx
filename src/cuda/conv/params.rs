@@ -9,6 +9,14 @@ pub struct Conv2dParams {
     pub stride_w: usize,
     pub pad_h: usize,
     pub pad_w: usize,
+    /// Number of convolution groups (1 = standard conv). `group == in_channels`
+    /// is depthwise. The im2col `gpu_conv2d` path handles only `group == 1`;
+    /// `group > 1` routes through `garboard_conv_2d` (cuDNN).
+    pub group: usize,
+    /// Dilation along H (1 = no dilation).
+    pub dilation_h: usize,
+    /// Dilation along W (1 = no dilation).
+    pub dilation_w: usize,
 }
 
 impl Default for Conv2dParams {
@@ -20,6 +28,9 @@ impl Default for Conv2dParams {
             stride_w: 1,
             pad_h: 0,
             pad_w: 0,
+            group: 1,
+            dilation_h: 1,
+            dilation_w: 1,
         }
     }
 }

@@ -17,7 +17,7 @@ impl Squeeze {
     /// Tensor with singleton dimensions removed
     pub fn forward(
         inputs: &[Tensor],
-        _attributes: &crate::attributes::NodeAttributes,
+        attributes: &crate::attributes::NodeAttributes,
     ) -> Tensor {
         assert!(
             !inputs.is_empty() && inputs.len() <= 2,
@@ -26,7 +26,17 @@ impl Squeeze {
 
         let data_shape = inputs[0].shape();
 
-        // Get axes to squeeze
+        // Get axes to squeeze. Three cases per ONNX opset history:
+        // - opset ≥ 13: axes is an input tensor (Int64).
+        // - opset ≤ 12: axes is an attribute (`ints`).
+        // - axes absent entirely: spec falls back to "squeeze every
+        //   size-1 dim".
+        //
+        // Mirrors the GPU executor's dual handling
+        // (`src/cuda/executor/layout.rs::Squeeze`). The attribute path
+        // is required for paddle2onnx opset-12 exports (the `_rapidai`
+        // rec model among them); without it the constant-folding pass
+        // can't fold any opset-12 Squeeze chain.
         let axes_to_squeeze: Vec<usize> = if inputs.len() == 2 {
             // Axes provided as second input
             let axes_tensor = &inputs[1];
@@ -49,6 +59,18 @@ impl Squeeze {
                     .filter(|&i| data_shape[i] == 1)
                     .collect()
             }
+        } else if let Some(axes_attr) = attributes.get_ints("axes") {
+            // opset ≤ 12: axes lives on the attribute.
+            axes_attr
+                .iter()
+                .map(|&axis| {
+                    if axis < 0 {
+                        (data_shape.len() as i64 + axis) as usize
+                    } else {
+                        axis as usize
+                    }
+                })
+                .collect()
         } else {
             // No axes specified - squeeze all dimensions of size 1
             (0..data_shape.len())
@@ -117,7 +139,7 @@ impl Squeeze {
             _ => {
                 // For other dtypes, convert to Float32
                 let data_f32 = inputs[0].to_float32();
-                Self::forward(&[data_f32], _attributes)
+                Self::forward(&[data_f32], attributes)
             }
         }
     }

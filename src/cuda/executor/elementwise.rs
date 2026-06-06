@@ -1,8 +1,8 @@
 //! Elementwise op dispatch (arith, unary math, comparisons, activations).
 //!
 //! Covers: Add, Sub, Mul, Div, Pow, Exp, Sqrt, Sin, Cos, Tanh, Sigmoid,
-//! LeakyRelu, Atan, Round, Floor, Clip, Softmax, Equal, Less, Greater,
-//! GreaterOrEqual, LessOrEqual, NotEqual.
+//! LeakyRelu, HardSigmoid, HardSwish, Atan, Round, Floor, Clip, Softmax,
+//! Equal, Less, Greater, GreaterOrEqual, LessOrEqual, NotEqual.
 //!
 //! Dispatch target parity with today's `execute_gpu_operator_with_precomputed`
 //! in `src/cuda/inference/mod.rs`: same per-op `gpu_*` wrappers, same
@@ -18,8 +18,9 @@ use std::collections::HashMap;
 
 use crate::cuda::inference::{compute_broadcast_shape, maybe_expand};
 use crate::cuda::kernels::{
-    gpu_add, gpu_clip, gpu_cos, gpu_div, gpu_erf, gpu_exp, gpu_floor, gpu_leaky_relu, gpu_mul,
-    gpu_pow, gpu_relu, gpu_round, gpu_sigmoid, gpu_sin, gpu_sqrt, gpu_sub, gpu_tanh,
+    gpu_add, gpu_clip, gpu_cos, gpu_div, gpu_erf, gpu_exp, gpu_floor, gpu_hardsigmoid,
+    gpu_hardswish, gpu_leaky_relu, gpu_mul, gpu_pow, gpu_relu, gpu_round, gpu_sigmoid, gpu_sin,
+    gpu_sqrt, gpu_sub, gpu_tanh,
 };
 use crate::cuda::ops::{
     gpu_atan, gpu_equal, gpu_greater, gpu_greater_or_equal, gpu_less, gpu_less_or_equal,
@@ -268,11 +269,51 @@ impl Executor {
                     alpha,
                 )
             }
+            "HardSigmoid" => {
+                let alpha = attrs.get_float("alpha").unwrap_or(0.2);
+                let beta = attrs.get_float("beta").unwrap_or(0.5);
+                gpu_hardsigmoid(
+                    &self.ctx,
+                    &self.elementwise_kernels,
+                    &mut pool,
+                    inputs[0],
+                    alpha,
+                    beta,
+                )
+            }
+            "HardSwish" => {
+                gpu_hardswish(&self.ctx, &self.elementwise_kernels, &mut pool, inputs[0])
+            }
 
             // --- Clip + Softmax -----------------------------------------
+            //
+            // ONNX opset 11+ moved min/max from attributes to optional inputs
+            // (inputs[1] and inputs[2]). A 0-element tensor means "absent" —
+            // placeholder kept by some exporters — so we fall back to the
+            // attribute value (or f32::MIN/MAX) in that case.
             "Clip" => {
-                let min = attrs.get_float("min").unwrap_or(f32::MIN);
-                let max = attrs.get_float("max").unwrap_or(f32::MAX);
+                let min = if inputs.len() > 1
+                    && inputs[1].shape().iter().product::<usize>() > 0
+                {
+                    inputs[1]
+                        .to_host_f32(&self.ctx)?
+                        .first()
+                        .copied()
+                        .unwrap_or(f32::MIN)
+                } else {
+                    attrs.get_float("min").unwrap_or(f32::MIN)
+                };
+                let max = if inputs.len() > 2
+                    && inputs[2].shape().iter().product::<usize>() > 0
+                {
+                    inputs[2]
+                        .to_host_f32(&self.ctx)?
+                        .first()
+                        .copied()
+                        .unwrap_or(f32::MAX)
+                } else {
+                    attrs.get_float("max").unwrap_or(f32::MAX)
+                };
                 gpu_clip(
                     &self.ctx,
                     &self.elementwise_kernels,

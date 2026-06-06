@@ -224,6 +224,48 @@ impl GpuGraphExecutor {
         Self::new_with_profiling(false)
     }
 
+    /// Build a `GpuGraphExecutor` directly from a parsed `OnnxModel`.
+    ///
+    /// Seeds inputs from `model.input_shapes()`, uploads every initializer via
+    /// `add_initializer`, and adds each `computation_graph()` node via `add_node`.
+    /// `GraphNode` carries no `name` field, so node names are synthesized as
+    /// `n{i}` over the graph's node order (names are internal — only input/output
+    /// tensor names participate in dataflow).
+    ///
+    /// Does NOT call `validate_*`; callers wanting a fail-fast op-name pre-flight
+    /// should call `validate::validate_parsed_model(&model)` first (op-NAME only,
+    /// not a runnability guarantee).
+    ///
+    /// # Note on `clippy::result_large_err`
+    ///
+    /// `crate::Result<T>` = `Result<T, IconnxError>`. `IconnxError` is intentionally
+    /// large: it stores every leaf error inline (by value, not boxed), which is what
+    /// trips the lint. The allow attribute is the established pattern across this
+    /// crate; see `validate::validate_parsed_model`.
+    #[allow(clippy::result_large_err)]
+    pub fn from_model(model: &crate::onnx_parser::OnnxModel) -> crate::Result<Self> {
+        let mut exec = Self::new()?;
+        for (name, shape) in model.input_shapes() {
+            exec.add_input(name, shape);
+        }
+        let weights = model.extract_weights()?;
+        for (name, tensor) in weights {
+            exec.add_initializer(name, &tensor)?;
+        }
+        let graph = model.computation_graph()?;
+        for (i, node) in graph.nodes().iter().enumerate() {
+            let synth = format!("n{i}");
+            exec.add_node(
+                &synth,
+                &node.op_type,
+                node.inputs.iter().map(|s| s.as_str()).collect(),
+                node.outputs.iter().map(|s| s.as_str()).collect(),
+                node.attributes.clone(),
+            );
+        }
+        Ok(exec)
+    }
+
     /// Create a new GPU graph executor with optional profiling output
     /// during initialization.
     pub fn new_with_profiling(profile: bool) -> Result<Self, CudaError> {
@@ -389,6 +431,33 @@ impl GpuGraphExecutor {
         output_names: Vec<&str>,
     ) -> Result<HashMap<String, Tensor>, CudaError> {
         self.ensure_compiled_with_outputs(&output_names)?;
+        // WS-6 M6.2 Task 5: always-on guard — compare each runtime input
+        // shape to the dims the compiled plan was lowered against.
+        //
+        // Must run BEFORE any GPU work so no partial execution occurs on
+        // a mismatched shape. We scope the borrow explicitly and drop it
+        // before calling `executor.run`, which needs its own borrow-free
+        // access to the plan.
+        {
+            let plan = self.compiled_plan.borrow();
+            let plan = plan.as_ref().expect("plan ensured above");
+            for gi in &plan.graph_inputs {
+                if let Some(rt) = inputs.get(&gi.name) {
+                    let actual = rt.shape();
+                    let mismatch = gi.shape.len() != actual.len()
+                        || gi.shape.iter().zip(actual.iter()).any(|(p, &a)| {
+                            matches!(p, Some(d) if *d != a)
+                        });
+                    if mismatch {
+                        return Err(CudaError::InputShapeMismatch {
+                            input: gi.name.clone(),
+                            expected: gi.shape.clone(),
+                            actual: actual.to_vec(),
+                        });
+                    }
+                }
+            }
+        } // borrow dropped here — safe to re-borrow below
         let plan = self.compiled_plan.borrow();
         self.executor
             .run(plan.as_ref().unwrap(), inputs, &output_names)

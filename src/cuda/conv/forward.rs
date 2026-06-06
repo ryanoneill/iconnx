@@ -584,6 +584,7 @@ mod tests {
             stride_w: 1,
             pad_h: 0,
             pad_w: 0,
+            ..Default::default()
         };
 
         let output =
@@ -621,6 +622,7 @@ mod tests {
             stride_w: 1,
             pad_h: 0,
             pad_w: 0,
+            ..Default::default()
         };
 
         let output = gpu_conv2d(
@@ -739,6 +741,7 @@ mod tests {
             stride_w: 1,
             pad_h: 0,
             pad_w: 0,
+            ..Default::default()
         };
 
         let output =

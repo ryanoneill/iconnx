@@ -26,9 +26,10 @@ use crate::cuda::ops::{
     gpu_cumsum, gpu_dequantize_linear, gpu_expand, gpu_gather_from_gpu, gpu_matmul_integer,
     gpu_max_pool_2d,
     gpu_nonzero, gpu_pad, gpu_range, gpu_range_i64, gpu_resize, gpu_scatter_nd, gpu_shape,
-    gpu_slice_nd, gpu_transpose_2d, gpu_transpose_nd, gpu_where, ResizeCoordMode, ResizeMode,
-    ResizeNearestMode,
+    gpu_slice_nd, gpu_tile, gpu_transpose_2d, gpu_transpose_nd, gpu_where, ResizeCoordMode,
+    ResizeMode, ResizeNearestMode,
 };
+use crate::cuda::kernels::gpu_batchnorm_affine;
 use crate::cuda::tensor::DType;
 use crate::cuda::{CudaError, GpuTensor};
 use crate::ir::{ExecutionPlan, PlannedOp};
@@ -681,6 +682,24 @@ impl Executor {
                 gpu_expand(&self.ctx, &self.ops_kernels, &mut pool, inputs[0], out_shape)
             }
 
+            // --- Tile: repeat tensor along each axis by repeats[d] -------
+            //
+            // ONNX Tile semantics: out_shape[d] = in_shape[d] * repeats[d].
+            // `repeats` is an INT64 input tensor read at execute time using
+            // the same get_or_fetch_i64 accessor as Expand/Pad/Slice.
+            // The kernel maps each output linear index back to an input
+            // index via modulo addressing (np.tile semantics).
+            "Tile" => {
+                if inputs.len() < 2 {
+                    return Err(CudaError::Kernel(
+                        "Tile requires 2 inputs: data and repeats".into(),
+                    ));
+                }
+                let repeats_name = input_names.get(1).map(|s| s.as_str()).unwrap_or("");
+                let repeats = self.get_or_fetch_i64(repeats_name, inputs[1], plan)?;
+                gpu_tile(&self.ctx, &self.ops_kernels, &mut pool, inputs[0], &repeats)
+            }
+
             // --- Pad with constant/reflect/edge modes --------------------
             "Pad" => {
                 let pads: Vec<i64> = if let Some(attr_pads) = attributes.get_ints("pads") {
@@ -1075,6 +1094,49 @@ impl Executor {
                         a_ndim, b_ndim
                     ))),
                 }
+            }
+
+            // --- BatchNormalization (inference, NCHW) --------------------
+            //
+            // Inference BN ignores momentum and training-mode attrs.
+            // Per-channel affine coefficients are precomputed on the host
+            // from the 5 model inputs (x, scale, B, mean, var) + epsilon,
+            // uploaded as 1-D GPU tensors, and applied via a fresh standalone
+            // NVRTC kernel (NOT the [1,C,T]-gated fused path in
+            // gpu_fused_add_mul_add, which is a different shape contract).
+            //
+            //   a[c] = scale[c] / sqrt(var[c] + eps)
+            //   b[c] = B[c] - mean[c] * a[c]
+            //   y[i] = a[ch] * x[i] + b[ch],  ch = (i / spatial) % C
+            "BatchNormalization" => {
+                let eps = attributes.get_float("epsilon").unwrap_or(1e-5);
+                let x = inputs[0];
+                let xs = x.shape();
+                if xs.len() != 4 {
+                    return Err(CudaError::Kernel(format!(
+                        "BatchNormalization expects 4D NCHW, got {:?}",
+                        xs
+                    )));
+                }
+                let c = xs[1];
+                let scale = inputs[1].to_host_f32(&self.ctx)?;
+                let beta = inputs[2].to_host_f32(&self.ctx)?;
+                let mean = inputs[3].to_host_f32(&self.ctx)?;
+                let var = inputs[4].to_host_f32(&self.ctx)?;
+                let a_host: Vec<f32> =
+                    (0..c).map(|k| scale[k] / (var[k] + eps).sqrt()).collect();
+                let b_host: Vec<f32> =
+                    (0..c).map(|k| beta[k] - mean[k] * a_host[k]).collect();
+                let a_dev = GpuTensor::from_host_f32(&self.ctx, &a_host, vec![c])?;
+                let b_dev = GpuTensor::from_host_f32(&self.ctx, &b_host, vec![c])?;
+                gpu_batchnorm_affine(
+                    &self.ctx,
+                    &self.elementwise_kernels,
+                    &mut pool,
+                    x,
+                    &a_dev,
+                    &b_dev,
+                )
             }
 
             other => Err(CudaError::Kernel(format!(

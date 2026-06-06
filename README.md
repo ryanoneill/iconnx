@@ -4,44 +4,24 @@ High-performance ONNX inference engine with CUDA GPU acceleration, written in pu
 
 ## Features
 
-- **ONNX Opset 17+ support** - Modern operators for transformer models
-- **CUDA GPU acceleration** - Native cuBLAS/cuDNN integration via cudarc
-- **Concurrent inference** - Multiple streams share weights for optimal GPU utilization
-- **CPU fallback** - Full CPU implementation for testing and portability
+- **ONNX opset 11–20 support** - Modern operators for transformer models
+- **CUDA GPU acceleration** - Native cuBLAS/cuDNN integration via **garboard**
 - **Pure Rust** - No C++ dependencies, just Rust + CUDA
+
+`GpuGraphExecutor` is `!Sync` — use one executor per thread.
 
 ## Quick Start
 
 ```rust
+use std::collections::HashMap;
 use iconnx::{OnnxParser, GpuGraphExecutor, Tensor};
 
-// Load ONNX model
 let model = OnnxParser::parse_file("model.onnx")?;
+let executor = GpuGraphExecutor::from_model(&model)?; // !Sync: one executor per thread
 
-// Create GPU executor
-let mut executor = GpuGraphExecutor::new()?;
-
-// Add model weights
-for (name, tensor) in model.extract_weights() {
-    executor.add_initializer(name, &tensor)?;
-}
-
-// Build computation graph
-for node in model.computation_graph().nodes() {
-    executor.add_node(
-        node.name(),
-        node.op_type(),
-        node.inputs(),
-        node.outputs(),
-        node.attributes().clone(),
-    );
-}
-
-// Run inference
-let inputs = HashMap::from([
-    ("input".to_string(), Tensor::from_vec_f32(vec![1.0, 2.0, 3.0], vec![1, 3])),
-]);
-let outputs = executor.run(inputs, &["output"])?;
+let mut inputs = HashMap::new();
+inputs.insert("input".to_string(), Tensor::from_vec_f32(vec![1.0, 2.0, 3.0], vec![1, 3]));
+let outputs = executor.run(inputs, vec!["output"])?;
 ```
 
 ## Installation
@@ -69,7 +49,7 @@ iconnx = { version = "0.1", default-features = false }
 
 ## Supported Operators
 
-iconnx supports ONNX Opset 17+ operators including:
+iconnx supports ONNX opset 11–20 operators including:
 
 ### Arithmetic
 - Add, Sub, Mul, Div, Pow, Sqrt, Exp
@@ -115,16 +95,10 @@ iconnx supports ONNX Opset 17+ operators including:
                  │
 ┌────────────────▼────────────────────────┐
 │       GpuGraphExecutor (CUDA)           │  ← GPU inference
-│  - Shared weights via Arc               │
+│  - Weights loaded via from_model()      │
 │  - Per-inference CUDA streams           │
-│  - cuBLAS for matrix operations         │
+│  - cuBLAS/cuDNN via garboard            │
 │  - Custom CUDA kernels                  │
-└────────────────┬────────────────────────┘
-                 │
-┌────────────────▼────────────────────────┐
-│       GraphExecutor (CPU)               │  ← CPU fallback
-│  - Pure ndarray implementation          │
-│  - Used for testing/validation          │
 └─────────────────────────────────────────┘
 ```
 
@@ -135,7 +109,6 @@ iconnx is designed for high-throughput inference:
 - **Memory pooling** - Avoid allocation fragmentation
 - **Kernel caching** - Compiled CUDA kernels are reused
 - **Kernel fusion** - MulAdd, DivMul patterns fused
-- **Concurrent streams** - Multiple inferences share weights
 
 ## Testing
 

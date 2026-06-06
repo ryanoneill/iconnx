@@ -40,18 +40,18 @@ fftw = "0.8"
 # cuDNN conv/RNN all go through garboard.
 [dependencies.garboard]
 git = "https://github.com/ryanoneill/garboard.git"
-branch = "main"
+rev = "75a1f66071a700c97e60070c39d89d6d04e15e90"
 features = ["cuda"]
 optional = true
 
 # garboard-sys — raw CUDA Driver FFI bindings. Needed for the
 # init-time LSTM weight-pack D2D copies (`cuMemcpyDtoD_v2`) in
 # `cuda/cudnn/rnn.rs`, until garboard exposes a sub-slice /
-# stream-scoped D2D API. Pinned to the same git source + branch as
-# `garboard` to keep the CUDA-header version in lockstep.
+# stream-scoped D2D API. Pinned to the same git rev as `garboard` to
+# keep the CUDA-header version in lockstep.
 [dependencies.garboard-sys]
 git = "https://github.com/ryanoneill/garboard.git"
-branch = "main"
+rev = "75a1f66071a700c97e60070c39d89d6d04e15e90"
 optional = true
 
 # bytemuck — garboard's DeviceSlice<T> requires T: bytemuck::Pod. Used by
@@ -101,6 +101,9 @@ regex = "1"
 # TOML — used by `tests/onnx_conformance.rs` to parse the known-failures
 # allowlist (WS-5 M5.3 conformance harness).
 toml = "0.8"
+# SHA-256 — used by `tests/common/npy.rs` to verify fixture integrity
+# (O-6: do NOT hand-roll crypto).
+sha2 = "0.10"
 
 [package.metadata.docs.rs]
 # Build docs.rs without CUDA (since their build server likely doesn't have it)
