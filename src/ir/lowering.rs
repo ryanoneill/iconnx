@@ -12,7 +12,7 @@ use crate::cuda::cudnn::pack_lstm_weights_for_cudnn;
 use crate::cuda::{CudaError, GpuTensor, IconnxCudaContext};
 use crate::ir::graph::OptimizableGraph;
 use crate::ir::passes::{
-    constant_folding_pass, dead_code_elimination, detect_fusion,
+    constant_folding_pass, constant_promotion_pass, dead_code_elimination, detect_fusion,
     elementwise_fusion_pass, fusion_annotations_from_graph, gate_fusion_to_float32,
     memory_planner, precompute_params, shape_extraction_folding, shape_inference,
     tensor_shapes_from_graph, topo_sort, FusionAnnotations,
@@ -34,6 +34,26 @@ pub fn lower(
 ) -> Result<ExecutionPlan, CudaError> {
     // 1. Topological sort.
     let graph = topo_sort(graph)?;
+
+    // 1b. Constant-node promotion — promote every single-output
+    // `Constant` *node* (with a resolvable static `value`) into
+    // `graph.initializers`, then drop the node. Constant-vs-initializer
+    // is a serialization artifact in ONNX — ORT treats the two as
+    // interchangeable. Promoting them lets the standard constant
+    // folding pass below collapse chains rooted at Constants (the
+    // folding dispatcher intentionally excludes `Constant` itself
+    // because Constant has zero inputs and its value lives on the
+    // node attribute, not on any input).
+    //
+    // Critical for paddle2onnx exports (notably the `_rapidai` rec
+    // model) which emit every LSTM weight as a runtime
+    // `Constant → Unsqueeze → Concat → Slice → Concat` chain with
+    // zero graph initializers. Without promotion, the folding pass
+    // can't see the leaves, the chain never folds, and
+    // `pack_lstm_weights_eagerly` fails because the LSTM W/R/B inputs
+    // aren't initializers. See `ir/passes/constant_promotion.rs` for
+    // the full rationale.
+    let graph = constant_promotion_pass(graph);
 
     // 2. Constant folding — evaluate all-static subgraphs on CPU and promote
     // their results to initializers. Runs BEFORE DCE so the DCE sweep can
